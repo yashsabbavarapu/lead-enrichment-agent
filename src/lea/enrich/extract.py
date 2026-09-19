@@ -657,6 +657,7 @@ _COMPANY_CONTEXT = (
     "launch", "hiring", "team", "app", "acquires", "acquired", "headquarters",
     "teams", "customers", "products", "founders", "employees", "pricing",
     "integrations", "enterprise", "workspace", "dashboard", "subscription",
+    "roles", "job", "jobs", "careers", "openings", "recruiting", "board",
 )
 
 
@@ -763,6 +764,20 @@ def _branded_mentions(text: str, name: str) -> int:
     return sum(1 for st in _mentions(text, name) if st == "strong")
 
 
+def _is_ats_board_for(url: str, names: list[str]) -> bool:
+    """A known applicant-tracking host whose path carries the company slug."""
+    low = (url or "").lower()
+    if not any(fragment in low for fragment, _n in _ATS_HOST_NAMES):
+        return False
+    path = low.split("://", 1)[-1]
+    path = path[path.find("/"):] if "/" in path else ""
+    for n in names:
+        slug = _SLUG_RE.sub("", n.lower())
+        if len(slug) >= 3 and slug in _SLUG_RE.sub("", path):
+            return True
+    return False
+
+
 def is_relevant_source(
     url: str,
     text: str,
@@ -778,6 +793,12 @@ def is_relevant_source(
 
     body = text or ""
     names = _name_variants(company_name, target)
+
+    # A public ATS board is hosted on the ATS's domain, not the company's, but
+    # `fetch_jobs` resolved it FOR this company and the slug is in the path.
+    # jobs.ashbyhq.com/vanta is as genuine a source as vanta.com/careers.
+    if _is_ats_board_for(url, names):
+        return True
 
     # The company's domain named anywhere in the page or the URL is decisive.
     own = normalize_domain(domain) if domain else None

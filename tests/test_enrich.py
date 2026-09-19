@@ -2270,3 +2270,118 @@ def test_a_mostly_irrelevant_run_is_reported_as_poor_research(settings):
                       _stub_like_llm(), settings)
     assert "Research quality was poor" not in clean.summary
     assert fit.confidence < clean.confidence
+
+
+# --------------------------------------------------------------------------
+# Common-word brand names vs sentence-initial capitalisation
+#
+# Case-sensitivity alone is not enough: "Linear algebra is the branch of
+# mathematics..." capitalises Linear for grammatical reasons, not because it is
+# a proper noun. Wikipedia, docs and academic pages start sentences with the
+# word constantly, and those are exactly what ranks for a bare common-word
+# query. Position and the right-hand neighbour decide, not case alone.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,body,name,domain",
+    [
+        # the reported failure
+        ("https://en.wikipedia.org/wiki/Linear_algebra",
+         "Linear algebra is the branch of mathematics concerning linear equations.",
+         "Linear", "linear.app"),
+        # siblings, all realistic for names in examples/companies.csv
+        ("https://stats.example/lr",
+         "Linear regression is a statistical method for modelling relationships.",
+         "Linear", "linear.app"),
+        ("https://math.example/sets",
+         "Notion of a set is fundamental in mathematics and logic.",
+         "Notion", "notion.so"),
+        ("https://traffic.gov/ramp",
+         "Ramp metering is a traffic management technique used on motorways.",
+         "Ramp", "ramp.com"),
+        ("https://en.wikipedia.org/wiki/Figma_(disambiguation)",
+         "Figma may also refer to a place name in northern Italy.",
+         "Figma", "figma.com"),
+        # title-cased phrase, mid-sentence: the adjective reading
+        ("https://uni.example/course",
+         "Introduction to Linear Algebra, a first course in mathematics.",
+         "Linear", "linear.app"),
+    ],
+)
+def test_a_common_word_at_a_sentence_boundary_is_not_a_brand_mention(url, body, name, domain):
+    from lea.enrich.extract import is_relevant_source
+
+    assert not is_relevant_source(url, body, name, name, domain)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Linear has raised a Series C led by Accel.",             # subject + verb
+        "Linear, the issue tracking startup, announced a tier.",  # appositive
+        "Linear's roadmap for 2026 includes agents.",             # possessive
+        "The roundup mentions Linear among fast-growing tools.",  # mid-sentence capital
+        "Linear customers include Vercel and Ramp.",              # weak, but corroborated
+        "Teams use Linear for planning and building products.",   # mid-sentence capital
+    ],
+)
+def test_a_genuine_brand_mention_is_still_recognised(body):
+    from lea.enrich.extract import is_relevant_source
+
+    assert is_relevant_source("https://news.example/a", body, "Linear", "Linear", "linear.app")
+
+
+def test_a_name_in_the_url_alone_does_not_make_a_page_relevant():
+    """wikipedia.org/wiki/Linear_algebra carries the slug and is still junk."""
+    from lea.enrich.extract import is_relevant_source
+
+    assert not is_relevant_source(
+        "https://en.wikipedia.org/wiki/Linear_algebra",
+        "The branch of mathematics concerning systems of equations and matrices.",
+        "Linear", "Linear", "linear.app")
+    # but it is enough when the body is too short to judge at all
+    assert is_relevant_source(
+        "https://techcrunch.com/2024/07/23/vanta-series-c-funding/", "",
+        "Vanta", "Vanta", "vanta.com")
+
+
+def test_mention_strength_classification():
+    from lea.enrich.extract import _mentions
+
+    assert _mentions("Linear is a tool.", "Linear") == ["strong"]
+    assert _mentions("Linear algebra is hard.", "Linear") == ["weak"]
+    assert _mentions("We use Linear daily.", "Linear") == ["strong"]
+    assert _mentions("Introduction to Linear Algebra", "Linear") == ["weak"]
+    assert _mentions("linear-gradient is a CSS function.", "Linear") == []
+
+
+@pytest.mark.parametrize(
+    "url,name,domain,expected",
+    [
+        # A public ATS board is hosted on the ATS's domain, not the company's,
+        # but fetch_jobs resolved it FOR this company. It is as genuine a source
+        # as the company's own /careers page.
+        ("https://jobs.ashbyhq.com/vanta", "Vanta", "vanta.com", True),
+        ("https://boards.greenhouse.io/figma", "Figma", "figma.com", True),
+        ("https://jobs.lever.co/ramp", "Ramp", "ramp.com", True),
+        ("https://apply.workable.com/linear/", "Linear", "linear.app", True),
+        # ...but only for THIS company
+        ("https://jobs.ashbyhq.com/someone-else", "Vanta", "vanta.com", False),
+        ("https://boards.greenhouse.io/competitor", "Figma", "figma.com", False),
+    ],
+)
+def test_ats_boards_are_relevant_only_for_their_own_company(url, name, domain, expected):
+    from lea.enrich.extract import is_relevant_source
+
+    assert is_relevant_source(url, "12 open roles", name, name, domain) is expected
+
+
+def test_agent_a_real_job_board_summary_survives_the_gate():
+    """The exact string fetch_jobs emits: name is sentence-initial before an em dash."""
+    from lea.enrich.extract import is_relevant_source
+
+    summary = ("Vanta — 93 open roles on Ashby across Revenue (36), Software Engineering "
+               "(27), Security (6). Board: https://jobs.ashbyhq.com/vanta")
+    assert is_relevant_source("https://jobs.ashbyhq.com/vanta", summary,
+                              "Vanta", "Vanta", "vanta.com")
