@@ -42,6 +42,14 @@ __all__ = [
 ]
 
 TIER_THRESHOLDS: list[tuple[str, float]] = [("A", 80.0), ("B", 60.0), ("C", 40.0)]
+#: A criterion graded without a citation cannot score above this. You may be
+#: right, but "10/10, source: none" is an assertion, not an assessment.
+UNCITED_CRITERION_CAP = 7.0
+#: The whole score is capped by how much of it was evidenced. At confidence 0.4
+#: the ceiling is 64, so an uncited record cannot present as tier A. Reaching
+#: A (>=80) needs roughly two thirds of the criteria actually cited.
+SCORE_FLOOR_AT_ZERO_CONFIDENCE = 40.0
+SCORE_CONFIDENCE_SPAN = 60.0
 DISQUALIFIED_SCORE_CAP = 25.0
 MIN_CRITERIA = 4
 
@@ -385,6 +393,22 @@ def is_unresearched(record: CompanyRecord, evidence: list[tuple[str, str]]) -> b
     return bool(record_empty or no_evidence)
 
 
+def _url_key(url: str) -> str:
+    """Compare citations forgivingly: scheme/case/trailing slash are not meaning.
+
+    Exact string matching was silently emptying every citation list, because a
+    model naturally writes "https://ramp.com" while the fetched URL was stored
+    as "https://ramp.com/". That depressed confidence AND hid real citations,
+    so the filter looked like the model was citing nothing at all.
+    """
+    u = (url or "").strip().lower()
+    u = re.sub(r"^https?://", "", u)
+    u = u.split("#", 1)[0]
+    if u.startswith("www."):
+        u = u[4:]
+    return u.rstrip("/")
+
+
 def _freshest_signal_phrase(record: CompanyRecord, today: Optional[datetime] = None) -> str:
     """The single most actionable recent signal, for the summary line.
 
@@ -612,9 +636,22 @@ def _sc_gtm_segment(f: _Facts) -> tuple[float, str, list[str]]:
     if ats:
         score += 1.0
         parts.append(f"runs an applicant tracking system ({_join_names(ats)}), indicating structured hiring")
-    if hiring:
+    jobs = f.jobs
+    if jobs is not None and jobs.gtm_roles > 0:
+        # Department mix beats a raw total: 63 of 148 roles in Sales is a far
+        # louder statement about where the money is going than "148 open roles".
+        share = jobs.gtm_roles / max(1, jobs.open_roles)
+        score += min(3.5, 0.35 * jobs.gtm_roles + 2.0 * share)
+        mix = ", ".join(f"{n} in {d}" for d, n in jobs.gtm_breakdown(2))
+        parts.append(
+            f"has {jobs.gtm_roles} of {jobs.open_roles} open roles in go-to-market "
+            f"functions ({mix}) - {share:.0%} of current hiring"
+        )
+        if jobs.posted_recently:
+            parts.append(f"posted {jobs.posted_recently} of them in the last 30 days")
+    elif hiring:
         score += 1.0
-        parts.append(f'is actively hiring — "{hiring[0].headline[:70]}"')
+        parts.append(f'is actively hiring - "{hiring[0].headline[:70]}"')
     if not parts:
         return (
             5.0,
@@ -724,7 +761,9 @@ def _sc_growth_signals(f: _Facts) -> tuple[float, str, list[str]]:
     contribution is now multiplied by `recency_weight(age)`, and the reasoning
     names which signals drove the score and how old they were.
     """
-    from lea.enrich.extract import describe_age, recency_weight, signal_age_days
+    from lea.enrich.extract import (
+        describe_age, is_secondary_funding, recency_weight, signal_age_days,
+    )
 
     base_points = {"funding": 5.0, "hiring": 2.5, "product": 1.0,
                    "leadership": 0.5, "partnership": 0.5, "news": 0.5}
@@ -739,6 +778,13 @@ def _sc_growth_signals(f: _Facts) -> tuple[float, str, list[str]]:
         if pts is None:
             continue
         age = signal_age_days(sig, f.today)
+        label_extra = ""
+        if sig.kind == "funding" and is_secondary_funding(sig):
+            # A secondary sale is real momentum and a real valuation mark, but
+            # no new capital reached the company, so it creates less new budget
+            # than a primary round of the same size. Discounted, not ignored.
+            pts *= 0.8
+            label_extra = ", secondary"
         weighted = pts * recency_weight(age)
         cap = caps.get(sig.kind)
         if cap is not None:
@@ -752,7 +798,9 @@ def _sc_growth_signals(f: _Facts) -> tuple[float, str, list[str]]:
         if weighted <= 0:
             continue
         score += weighted
-        scored.append((weighted, f'{sig.kind}: "{(sig.headline or "")[:70]}"', age))
+        scored.append(
+            (weighted, f'{sig.kind}{label_extra}: "{(sig.headline or "")[:70]}"', age)
+        )
 
     if not scored:
         return (
@@ -959,7 +1007,18 @@ def _align_scores(
         except (TypeError, ValueError):
             score = 5.0
         score = max(0.0, min(10.0, score))
-        urls = [u for u in (got.evidence_urls or []) if u in allowed_urls]
+        allowed_by_key = {_url_key(a): a for a in allowed_urls}
+        urls, seen_u = [], set()
+        for u in (got.evidence_urls or []):
+            canon = allowed_by_key.get(_url_key(u))
+            if canon and canon not in seen_u:
+                seen_u.add(canon)
+                urls.append(canon)      # store the URL we actually fetched
+        if not urls and score > UNCITED_CRITERION_CAP:
+            # Graded high with nothing to point at. Live models did this while
+            # asserting facts the evidence never contained, so the ceiling is
+            # mechanical rather than a matter of trusting the reasoning.
+            score = UNCITED_CRITERION_CAP
         # Narrow override: the model punted to the neutral 5/10 with nothing to
         # cite, while the rubric scorer has an actual citation. Observed live as
         # "Employee range is unknown... using the fallback unknown score of 5",
@@ -1100,13 +1159,22 @@ def score_icp(
         if matched and matched not in hits:
             hits.append(matched)
 
+    confidence = _compute_confidence(scored, record)
+
+    # Reconcile the score with how much of it was actually evidenced. A 96.8
+    # carrying confidence 0.40 is self-contradictory: it claims near-certainty
+    # about a company we could barely establish facts for. The ceiling makes the
+    # two numbers tell the same story.
+    ceiling = SCORE_FLOOR_AT_ZERO_CONFIDENCE + SCORE_CONFIDENCE_SPAN * confidence
+    capped_by_confidence = score > ceiling
+    if capped_by_confidence:
+        score = round(ceiling, 1)
+
     if hits:
         score = min(score, DISQUALIFIED_SCORE_CAP)
         tier = "D"
     else:
         tier = tier_for(score)
-
-    confidence = _compute_confidence(scored, record)
 
     summary = model_summary
     if not summary:
@@ -1128,6 +1196,12 @@ def score_icp(
                 " Graded by the deterministic rubric (no LLM judgement available) — "
                 "set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
             )
+    if capped_by_confidence:
+        summary += (
+            f" Score capped at {score:.0f} by confidence {confidence:.2f}: most criteria "
+            f"were graded without a cited source, so a higher score would overstate what "
+            f"the evidence supports."
+        )
     if hits:
         summary = f"DISQUALIFIED — {hits[0]} " + summary
     if confidence < 0.4:

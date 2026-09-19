@@ -2470,6 +2470,13 @@ def test_a_persistently_empty_model_is_swapped_out():
     assert json.loads(route.calls[2].request.content)["model"] == "gemini-3.5-flash"
     assert models.call_count == 1
 
+    # The broken model must be remembered, or the resolver walks back into it.
+    from lea.llm.openai_compat import is_model_usable
+
+    base = "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert not is_model_usable(base, "gemini-3.6-flash")
+    assert is_model_usable(base, "gemini-3.5-flash")
+
 
 @respx.mock
 def test_an_empty_model_with_no_alternative_degrades_with_the_doctor_hint():

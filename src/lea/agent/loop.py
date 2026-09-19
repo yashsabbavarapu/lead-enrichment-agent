@@ -699,14 +699,29 @@ def run_agent(
             if src and not src.startswith("search:") and src not in record.sources:
                 record.sources.append(src)
 
+    # Synthesis deliberately runs OUTSIDE the loop's deadline: extraction, scoring
+    # and hooks are the deliverable, and truncating them to hit a soft default
+    # produces a worse artifact than finishing late. But a run that reports
+    # "time budget (180s)" next to a 247s wall clock looks like it ignored its own
+    # limit, so the overrun is stated rather than hidden.
+    wall_ms = int((time.monotonic() - t0) * 1000)
+    reason = stop_reason or f"{STOP_COMPLETE}: run finished"
+    limit = budget.total_timeout_s
+    if limit > 0 and wall_ms / 1000.0 > limit:
+        over = wall_ms / 1000.0 - limit
+        reason += (
+            f"; synthesis then ran a further {over:.0f}s past the {limit:.0f}s budget "
+            "(extraction, scoring and hooks are not time-boxed)"
+        )
+
     stats = RunStats(
         steps=len(trace),
         searches=budget.searches,
         fetches=budget.fetches,
         tokens_in=sum(s.tokens_in for s in trace),
         tokens_out=sum(s.tokens_out for s in trace),
-        wall_ms=int((time.monotonic() - t0) * 1000),
-        stop_reason=stop_reason or f"{STOP_COMPLETE}: run finished",
+        wall_ms=wall_ms,
+        stop_reason=reason,
         llm_provider=provider_label(llm, settings),
         search_provider=settings.resolved_search(),
     )

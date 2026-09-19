@@ -29,6 +29,12 @@ __all__ = [
     "is_aggregator",
     "registrable_label",
     "citable_urls",
+    "verify_record",
+    "VERIFIED_FIELDS",
+    "classify_funding",
+    "reclassify_signals",
+    "is_secondary_funding",
+    "SECONDARY_NOTE",
     "parse_jobs_evidence",
     "jobs_from_record",
     "jobs_signal",
@@ -529,16 +535,19 @@ def jobs_from_record(record: CompanyRecord) -> Optional[JobsData]:
     for s in record.signals or []:
         if s.kind != "hiring":
             continue
-        blob = f"{s.headline or ''} {s.detail or ''}"
+        blob = f"{s.headline or ''} {s.detail or ''} {s.recency_note or ''}"
         m = _READBACK_TOTAL_RE.search(blob)
         if not m:
             continue
         depts: dict[str, int] = {}
         for n, name in _READBACK_DEPT_RE.findall(blob):
             depts.setdefault(name.strip(), int(n))
+        recent = _POSTED_30D_RE.search(blob)
         return JobsData(open_roles=int(m.group(1)), departments=depts,
                         ats=_ats_name(blob, s.source_url or ""),
-                        board_url=s.source_url or "")
+                        board_url=s.source_url or "",
+                        latest_posted=s.date or "",
+                        posted_recently=int(recent.group(1)) if recent else 0)
     return None
 
 
@@ -619,6 +628,288 @@ def describe_age(age_days: Optional[int]) -> str:
     if age_days <= 400:
         return f"{max(1, round(age_days / 30))} months old"
     return f"{age_days / 365:.1f} years old"
+
+
+# --------------------------------------------------------------------------
+# Provenance verification
+#
+# Normalization checks that a value is well FORMED. This checks that somebody
+# actually SAID it. A live model returned employee_range="201-500" for a company
+# whose evidence contains no headcount anywhere, wrote reasoning claiming it was
+# "stated", and the pipeline published it with an empty `unknowns` list.
+#
+# Prompting a model not to invent is a hope. Checking is a guarantee, and the
+# guarantee is the product. Every scalar below must be traceable to a string in
+# the gathered evidence or it is dropped and recorded as unknown.
+# --------------------------------------------------------------------------
+
+VERIFIED_FIELDS = (
+    "employee_range", "employee_estimate", "hq_city", "hq_country", "founded_year",
+)
+
+_COUNTRY_ALIASES = {
+    "united states": {"united states", "usa", "u.s.", "u.s.a.", "us", "america"},
+    "usa": {"united states", "usa", "u.s.", "u.s.a.", "us", "america"},
+    "united kingdom": {"united kingdom", "uk", "u.k.", "britain", "england", "scotland"},
+    "uk": {"united kingdom", "uk", "u.k.", "britain", "england", "scotland"},
+    "netherlands": {"netherlands", "holland", "the netherlands"},
+    "germany": {"germany", "deutschland"},
+}
+
+
+def _blob(evidence: list[tuple[str, str]]) -> str:
+    return " \n ".join((t or "") for _u, t in (evidence or [])).lower()
+
+
+def _verify_year(year: Optional[int], blob: str) -> bool:
+    return bool(year) and str(year) in blob
+
+
+def _verify_place(name: Optional[str], blob: str) -> bool:
+    if not name:
+        return False
+    n = name.strip().lower()
+    if not n:
+        return False
+    if n in blob:
+        return True
+    for alias_set in (_COUNTRY_ALIASES.get(n),):
+        if alias_set and any(a in blob for a in alias_set):
+            return True
+    return False
+
+
+def _verify_employee_range(bucket: Optional[str], blob: str) -> bool:
+    """The band itself, or any headcount that falls inside it, must appear."""
+    if not bucket:
+        return False
+    # Verification runs before normalization, so the incoming value may still be
+    # raw ("~250 employees"). Canonicalise first, then check provenance.
+    b = normalize_employee_range(bucket) or ""
+    if not b or _BUCKET_MIDPOINTS.get(b) is None:
+        return False
+    bounds = next(((lo, hi) for name, lo, hi in _BUCKET_BOUNDS if name == b), None)
+    if bounds is None:
+        return False
+    lo, hi = bounds
+
+    # the band written out, in the ways people write it
+    digits = re.findall(r"\d+", b)
+    if len(digits) >= 2:
+        a, z = digits[0], digits[1]
+        for sep in ("-", "\u2013", "\u2014", " to ", " - ", "-"):
+            if f"{a}{sep}{z}".lower() in blob:
+                return True
+        if re.search(rf"\b{a}\s*(?:-|\u2013|to)\s*{z}\b", blob):
+            return True
+    elif b.endswith("+") and re.search(rf"\b{digits[0]}\s*\+", blob):
+        return True
+
+    # or a concrete headcount inside the band, stated as a headcount
+    for m in re.finditer(
+        r"(\d[\d,]{0,8})\s*(\+?)\s*(?:employees|people|staff|team members|headcount)", blob
+    ):
+        try:
+            n = int(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if m.group(2) == "+":
+            # "500+ employees" means AT LEAST 500, so a band that tops out at
+            # 500 is not supported by it - only a band reaching beyond is.
+            if lo >= n or hi > n:
+                return True
+            continue
+        if lo <= n <= hi:
+            return True
+    for m in re.finditer(r"(?:team|company|workforce)\s+of\s+(?:about\s+|around\s+|~)?(\d[\d,]{0,8})", blob):
+        try:
+            n = int(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if lo <= n <= hi:
+            return True
+    return False
+
+
+def _verify_headcount_number(n: Optional[int], blob: str) -> bool:
+    if not n:
+        return False
+    return bool(re.search(rf"\b{n:,}\b".replace(",", "[,]?"), blob)) or str(n) in blob
+
+
+def _signal_is_supported(sig: Signal, blob: str) -> bool:
+    """Is this signal's headline actually rooted in the evidence text?
+
+    Token overlap rather than exact match: extractors legitimately rephrase, but
+    a wholly invented event shares almost nothing with the source.
+    """
+    words = {w for w in re.findall(r"[a-z0-9$][a-z0-9$.%-]{2,}", (sig.headline or "").lower())}
+    words -= {
+        "the", "and", "for", "with", "its", "has", "have", "from", "that", "this",
+        "their", "our", "new", "now", "are", "was", "will", "company", "announced",
+    }
+    if not words:
+        return False
+    hits = sum(1 for w in words if w in blob)
+    return (hits / len(words)) >= 0.6
+
+
+def verify_record(
+    rec: CompanyRecord, evidence: list[tuple[str, str]]
+) -> tuple[CompanyRecord, list[str]]:
+    """Drop every scalar the evidence does not actually support.
+
+    Returns the cleaned record and the list of dropped field names. Signals that
+    cannot be traced to the evidence are dropped too - an invented funding round
+    is the single most damaging thing this tool could emit.
+    """
+    out = rec.model_copy(deep=True)
+    blob = _blob(evidence)
+    dropped: list[str] = []
+    if not blob.strip():
+        # No evidence text at all: nothing here can be verified, so nothing is
+        # claimed. This is the honest reading, not a degenerate one.
+        for f in VERIFIED_FIELDS:
+            if _is_set(getattr(out, f, None)):
+                setattr(out, f, None)
+                dropped.append(f)
+        if out.signals:
+            dropped.append("signals")
+            out.signals = []
+        return out, dropped
+
+    if out.employee_range and not _verify_employee_range(out.employee_range, blob):
+        dropped.append("employee_range")
+        out.employee_range = None
+
+    # An estimate is only as good as its source: either the exact number appears,
+    # or it is re-derived from a band that did. Never the model's own arithmetic
+    # (which returned 500 as the midpoint of 201-500).
+    if out.employee_estimate is not None:
+        if not _verify_headcount_number(out.employee_estimate, blob):
+            derived = bucket_midpoint(out.employee_range)
+            if derived is None:
+                dropped.append("employee_estimate")
+            out.employee_estimate = derived
+
+    if out.hq_city and not _verify_place(out.hq_city, blob):
+        dropped.append("hq_city")
+        out.hq_city = None
+    if out.hq_country and not _verify_place(out.hq_country, blob):
+        dropped.append("hq_country")
+        out.hq_country = None
+    if out.founded_year and not _verify_year(out.founded_year, blob):
+        dropped.append("founded_year")
+        out.founded_year = None
+
+    kept = [s for s in (out.signals or []) if _signal_is_supported(s, blob)]
+    if len(kept) != len(out.signals or []):
+        dropped.append("unsupported_signals")
+    out.signals = kept
+    return out, dropped
+
+
+# --------------------------------------------------------------------------
+# Funding re-classification
+#
+# Whoever produced the record - the stub's keyword classifier or a real model -
+# can file a capital event under the wrong kind. Real headlines rarely say
+# "raised": the genuine Ramp article reads "nearly doubles valuation to $32B in
+# secondary share sale", which has no raise verb at all and was landing as a
+# `product` signal. Since this module is the last pass before the record is
+# rendered, correcting the kind belongs here rather than in any one producer.
+# --------------------------------------------------------------------------
+
+_FUND_AMOUNT_RE = re.compile(
+    r"\$\s?\d[\d,.]*\s*(?:[MBK]\b|million|billion|bn\b)", re.I)
+_FUND_ROUND_RE = re.compile(
+    r"\b(?:pre-seed|seed|series\s+[a-j]|bridge|growth|mezzanine)\s*(?:round|financing)?\b", re.I)
+_FUND_SECONDARY_RE = re.compile(
+    r"\b(secondary\s+(?:share\s+)?sale|share\s+sale|tender\s+offer|"
+    r"employee\s+tender|secondary\s+transaction|secondary\s+market\s+sale)\b", re.I)
+_FUND_VALUATION_RE = re.compile(
+    r"\b(valuation|valued\s+at|post-money|pre-money|worth)\b", re.I)
+_FUND_VERB_RE = re.compile(
+    r"\b(rais(?:e|es|ed|ing)|clos(?:e|es|ed|ing)|land(?:s|ed)?|secur(?:e|es|ed)|"
+    r"bank(?:s|ed)?|net(?:s|ted)?|pull(?:s|ed)?\s+in|pick(?:s|ed)?\s+up|"
+    r"scoop(?:s|ed)?\s+up|nab(?:s|bed)?|receiv(?:e|es|ed))\b", re.I)
+_FUND_INVESTOR_RE = re.compile(
+    r"\b(led\s+by|co-led\s+by|backed\s+by|investment\s+from|participation\s+from|"
+    r"funding\s+from|investors?\s+includ)", re.I)
+_FUND_WORD_RE = re.compile(r"\b(funding|financing|investment|round|capital)\b", re.I)
+
+#: Marker appended to `detail`, and read back by the scorer and hook writer.
+SECONDARY_NOTE = (
+    "Secondary share sale: existing shareholders selling, so this is a liquidity "
+    "and valuation event rather than new primary capital for the company."
+)
+
+
+def classify_funding(text: str) -> Optional[str]:
+    """Is this text a capital event, and of what sort?
+
+    Returns "secondary", "valuation" or "primary", else None. Requires a money
+    amount or a named round for every path, so "we shipped three products" and
+    "$13B market opportunity" do not trip it.
+    """
+    t = text or ""
+    # "tender offer" / "secondary share sale" are unambiguous on their own, so
+    # they are checked before the amount gate.
+    if _FUND_SECONDARY_RE.search(t):
+        return "secondary"
+
+    has_amount = bool(_FUND_AMOUNT_RE.search(t))
+    has_round = bool(_FUND_ROUND_RE.search(t))
+    if not (has_amount or has_round):
+        return None
+    if _FUND_VALUATION_RE.search(t) and has_amount:
+        # "nearly doubles its valuation to $32B" - no raise verb anywhere.
+        return "valuation"
+    if _FUND_VERB_RE.search(t) and (has_amount or has_round) and (
+        _FUND_WORD_RE.search(t) or has_round or _FUND_INVESTOR_RE.search(t)
+    ):
+        return "primary"
+    if _FUND_INVESTOR_RE.search(t):
+        return "primary"
+    if has_round and _FUND_WORD_RE.search(t):
+        return "primary"
+    return None
+
+
+def reclassify_signals(signals: list[Signal]) -> list[Signal]:
+    """Promote misfiled capital events to `funding`, recording the distinction.
+
+    A secondary sale stays `kind="funding"` - it belongs in the same bucket for
+    scoring and it is unambiguously a momentum signal - but `detail` says plainly
+    that no new primary capital changed hands, so neither the scorer nor a hook
+    can imply the company just banked the money.
+    """
+    out: list[Signal] = []
+    for sig in signals or []:
+        if sig is None:
+            continue
+        kind = classify_funding(f"{sig.headline or ''} {sig.detail or ''}")
+        if kind is None or sig.kind in ("funding", "hiring"):
+            # Never reclassify hiring: a job board mentioning compensation
+            # bands is not a funding round.
+            if kind == "secondary" and sig.kind == "funding" and SECONDARY_NOTE not in (sig.detail or ""):
+                sig = sig.model_copy(deep=True)
+                sig.detail = ((sig.detail or "").strip() + " " + SECONDARY_NOTE).strip()
+            out.append(sig)
+            continue
+        fixed = sig.model_copy(deep=True)
+        fixed.kind = "funding"
+        note = SECONDARY_NOTE if kind == "secondary" else ""
+        if note and note not in (fixed.detail or ""):
+            fixed.detail = ((fixed.detail or "").strip() + " " + note).strip()
+        out.append(fixed)
+    return out
+
+
+def is_secondary_funding(signal: Signal) -> bool:
+    """Was this capital event a secondary sale rather than a primary raise?"""
+    blob = f"{signal.headline or ''} {signal.detail or ''}"
+    return SECONDARY_NOTE in blob or bool(_FUND_SECONDARY_RE.search(blob))
 
 
 def _tech_tokens(name: str) -> list[str]:
@@ -1066,7 +1357,7 @@ def normalize_record(
             setattr(rec, field, v.strip() or None)
     rec.description = (rec.description or "").strip()
 
-    rec.signals = _sort_signals(_dedupe_signals(rec.signals))
+    rec.signals = _sort_signals(_dedupe_signals(reclassify_signals(rec.signals)))
     rec.tech_stack = _dedupe_tech(rec.tech_stack)
 
     if evidence_urls is not None:
@@ -1139,6 +1430,11 @@ def extract_record(
     # Only evidence we actually read is citable — a robots-blocked or 404'd fetch
     # still appears in the list and must not end up in `sources`.
     evidence_urls = citable_urls(evidence)
+
+    # Provenance gate, before normalization so `unknowns` is derived from what
+    # survived it. A value the evidence does not support is not a value.
+    rec, _dropped = verify_record(rec, evidence)
+
     rec = normalize_record(rec, target, evidence_urls=evidence_urls)
 
     if base is not None:

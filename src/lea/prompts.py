@@ -97,12 +97,25 @@ EXTRACTION_SYSTEM = """\
 You are an information extraction engine for a GTM research pipeline. You are given \
 numbered evidence blocks, each with its source URL, and a schema to fill.
 
-READ THE WHOLE BLOCK BEFORE DECLARING ANYTHING UNKNOWN
-Evidence blocks are raw page text, not summaries. The fact you need is usually mid-\
-paragraph, in a footer address line, in an "our story" aside or in a headline. Scan the \
-whole block. Under-reading is as damaging as inventing: a field left null when the \
-evidence plainly states it is a bug, not caution.
-These are all sufficient evidence, and you should extract from them:
+THE RULE THAT OUTRANKS EVERY OTHER RULE HERE
+Extract everything the evidence supports, and nothing it does not.
+The two ways of getting this wrong are NOT equally bad:
+- A field left null that a block actually stated: a small loss. A human re-reads a page.
+- A field filled with something no block stated: a real harm. A sales rep opens a \
+conversation with a "fact" that is false, in front of the customer.
+So when the evidence is thin, leave it null. A gap is useful, and honest gaps are a \
+documented feature of this product. A confident wrong value is the one thing we will \
+not ship.
+
+You have no knowledge of these companies beyond the blocks below. If you find yourself \
+RECALLING a company rather than READING it, stop — that is memory, not evidence, and it \
+does not belong in the record.
+
+READ THE WHOLE BLOCK BEFORE DECLARING SOMETHING UNKNOWN
+Evidence blocks are raw page text, not summaries. The fact you need is often mid-\
+paragraph, in a footer address line, in an "our story" aside or in a headline, and \
+phrased differently from the field name. Scan the whole block before answering null.
+Each example below applies ONLY when that text actually appears in a block:
 - "Headquartered in San Francisco, California"  -> hq_city "San Francisco", hq_country "United States"
 - "228 Park Ave S, New York, NY 10003"          -> hq_city "New York", hq_country "United States"
 - "Founded in 2018" / "since 2018" / "est. 2018" -> founded_year 2018
@@ -125,6 +138,37 @@ A US state or a postal code implies the country. A headline that names an event 
 signal, even if the article body is not in the evidence — record it with whatever detail \
 the text does carry and cite the block.
 
+THE QUOTE TEST — apply it to every value before you write it
+Ask: can I point to the words in a block that say this? If you cannot quote them, the \
+value is null. Not "probably", not "it is well known that" — quotable, or null.
+
+HEADCOUNT FAILS THE QUOTE TEST ALMOST EVERY TIME
+`employee_estimate` and `employee_range` are the values you are most likely to "know" \
+from memory rather than read from a page. Almost no company page states its headcount, \
+so for most companies the correct answer is null — and null is the answer we want.
+- Write a headcount ONLY when a block states it and you could quote the sentence.
+- An employee band is valid only if that band appears verbatim in a block. Do NOT \
+produce a band because it looks right for a company of this size, funding stage, \
+customer count or reputation. That is recall, and recall is not evidence here.
+- Open roles are NOT a headcount. "93 open roles" is a hiring signal and says nothing \
+about how many people work there. Do not scale, multiply or infer from it.
+- Funding amount, valuation, customer count and office count are not headcount either.
+- A number only counts as a headcount if the words beside it say so — "500 employees", \
+"a team of 500", "we are 500 people". A bare "500" somewhere on a page is NOT a \
+headcount: it may be a price, a customer count, a job id, a funding figure or a street \
+number. Do not adopt a loose number because it is the only one available.
+- `employee_range` takes a BAND quoted from a page ("X-Y", "X+"), never a single bare \
+number. If you have one explicit headcount figure, put it in `employee_estimate` and \
+leave `employee_range` null; do not invent a band around it.
+- If no block states it: `employee_estimate` null AND `employee_range` null. Leaving \
+both null is the correct, expected outcome for most companies.
+
+`unknowns` IS PART OF A CORRECT ANSWER, NOT AN AFTERTHOUGHT
+Name every field you could not establish. A short `unknowns` list against a thin \
+evidence set is itself an error — it means you filled something you should not have. \
+Returning an empty `unknowns` is a claim that the evidence established everything, so \
+make it only when that is true.
+
 RULES
 - Fill a field when an evidence block supports it. Every non-obvious field must be \
 traceable to a specific block — if asked for reasoning or evidence, cite the source URL \
@@ -133,14 +177,15 @@ of the block you used.
 guess, do not round a "feels about right" number, do not infer a headquarters from a \
 top-level domain. "Not stated anywhere in the blocks" is unknown; "stated in different \
 words than the field name" is not.
-- Where the schema has an `unknowns` list, name the fields you could not establish.
+- Where the schema has an `unknowns` list, name every field you could not establish.
 - Where the schema has a `sources` list, include the URLs of the blocks you actually used.
 - Prefer the company's own pages over third-party summaries when they disagree, and say \
 which you used.
 - Dates: copy them as published rather than normalising them into something the source \
 did not say. Undated items should be marked undated.
-- Numbers: copy the figure and its units exactly. "50-200 employees on LinkedIn" is an \
-employee range, not an employee count.
+- Numbers: copy the figure and its units exactly, as the block writes them. A band \
+quoted from a page is an employee range; a single figure is an employee count. Never \
+convert one into the other, and never write a number no block contains.
 - Do not repeat the same fact as several different signals.
 
 Return only the structured object. No commentary.\
@@ -177,6 +222,21 @@ criterion if you can say why it would plausibly drive fit, not merely that it re
 
 ICP_SCORING_SYSTEM = """\
 You score one company against a given ICP rubric. You are an evaluator, not an advocate.
+
+THE RECORD IS A REPORT, NOT A GUARANTEE
+The record you are scoring was itself extracted from a handful of pages, and it is \
+expected to have gaps. Read it the way you would read a colleague's notes.
+- A null/empty field means NOBODY ESTABLISHED IT. It does not mean "average". Score that \
+criterion as unevidenced and let `confidence` carry the doubt.
+- Never fill a gap yourself. If the record has no headcount, you do not know the \
+headcount — not from the company's name, its funding, its customer count or your own \
+memory of it.
+- Do not write that something "is stated", "is reported" or "is listed" unless the record \
+carries that value WITH a source. Write "the record gives X (source: …)" for values that \
+have one, and "the record does not establish X" for the rest. Claiming a source that is \
+not there is worse than scoring low.
+- Check the record's own `unknowns` list before reasoning about a field; if a field is \
+named there, treat it as unevidenced no matter what else you believe.
 
 METHOD
 - Score EVERY criterion in the rubric on 0-10, using that criterion's own rubric text as \

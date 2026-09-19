@@ -243,7 +243,9 @@ _ROUND_RE = re.compile(r"\b(pre-seed|seed|series\s+[a-j])\b", re.I)
 _INVESTOR_RE = re.compile(
     r"\bled by\s+([A-Z][\w&.'\-]*(?:\s+[A-Z][\w&.'\-]*){0,3})", re.U
 )
-_VALUATION_RE = re.compile(r"\bat\s+a\s+(\$\s?\d[\d,.]*\s*(?:[MB]\b|billion|million))", re.I)
+_VALUATION_RE = re.compile(
+    r"\bvalu(?:ation|ed)\b[^.$]{0,30}?(\$\s?\d[\d,.]*\s*(?:[MB]\b|billion|million))"
+    r"|\bat\s+a\s+(\$\s?\d[\d,.]*\s*(?:[MB]\b|billion|million))", re.I)
 _ROLE_COUNT_RE = re.compile(r"\b(\d{1,4})\s+(?:new\s+|open\s+)?(?:roles?|positions?|jobs?|hires?)\b", re.I)
 _LAUNCH_RE = re.compile(
     r"\b(?:introducing|launch(?:es|ed|ing)?|announc(?:es|ed|ing)|unveil(?:s|ed)?)\s+"
@@ -272,7 +274,9 @@ def _specifics(s: Signal) -> dict[str, str]:
     ):
         m = rx.search(blob)
         if m:
-            spec[key] = _tidy(m.group(1) if m.groups() else m.group(0))
+            got = next((g for g in (m.groups() or ()) if g), None) if m.groups() else m.group(0)
+            if got:
+                spec[key] = _tidy(got)
     roles = [w for w in _ROLE_WORDS if re.search(rf"\b{re.escape(w)}\b", blob, re.I)]
     if roles:
         spec["roles"] = _join_human(roles[:3])
@@ -304,12 +308,29 @@ def _join_human(items: list[str]) -> str:
 
 
 def _h_funding(name: str, s: Signal) -> Optional[tuple[str, str, str, Optional[str]]]:
+    from lea.enrich.extract import is_secondary_funding
+
     sp = _specifics(s)
     amount, rnd, inv = sp.get("amount"), sp.get("round"), sp.get("investor")
+    valuation = sp.get("valuation")
+    when = f" in {sp['month']}" if sp.get("month") else ""
+
+    # A secondary sale is not a raise. Congratulating them on money they never
+    # received is exactly the kind of wrong detail that costs the reply.
+    if is_secondary_funding(s):
+        mark = valuation or amount
+        if not mark:
+            return None
+        text = (
+            f"A {mark} valuation on a secondary{when} says more about conviction than a "
+            f"primary round does - someone modelled that number. Usually the GTM targets "
+            f"behind it get revised the same quarter."
+        )
+        return (f"{mark} secondary", text, s.headline, s.source_url)
+
     if not (amount or rnd):
         return None
     raised = " ".join(x for x in [amount, rnd.title() if rnd else None] if x)
-    when = f" in {sp['month']}" if sp.get("month") else ""
 
     if inv:
         text = (

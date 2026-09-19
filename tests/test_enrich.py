@@ -112,8 +112,12 @@ def _messy_record() -> CompanyRecord:
     )
 
 
+# The evidence must actually support the record: extract_record verifies every
+# scalar and signal against this text, so a fixture with placeholder text would
+# (correctly) have its fields stripped.
 EVIDENCE = [
-    ("https://ramp.com", "Ramp is a corporate card company."),
+    ("https://ramp.com", "Ramp is a corporate card company with ~250 employees. "
+                         "Launched procurement module. Hiring 12 enterprise AEs."),
     ("https://techcrunch.com/ramp", "Ramp raised $150M Series D."),
     ("https://ramp.com", "duplicate url block"),
 ]
@@ -295,7 +299,7 @@ def test_extract_record_populates_unknowns_and_sources(settings):
     assert "founded_year" in rec.unknowns
     # things we DO know must not be listed as gaps
     assert "domain" not in rec.unknowns
-    assert "employee_range" not in rec.unknowns
+    assert "employee_range" not in rec.unknowns   # "~250 employees" is in the evidence
     # sources are the unique evidence URLs actually present
     assert rec.sources == ["https://ramp.com", "https://techcrunch.com/ramp"]
 
@@ -720,10 +724,13 @@ def test_partial_record_still_scores_normally_with_low_confidence(settings):
     )})
     fit = score_icp(partial, _icp_4(), [("https://ramp.com", "some text")], llm, settings)
 
-    assert fit.score == 80.0          # the arithmetic still runs
-    assert fit.tier == "A"
-    assert fit.confidence < 0.4       # but the caveat is loud
+    # The arithmetic still runs, but an uncited grade is capped: each criterion
+    # at 7/10, then the total by confidence. A record we barely established must
+    # not present as tier A.
+    assert fit.confidence < 0.4
+    assert fit.score < 80.0
     assert "Low confidence" in fit.summary
+    assert "capped" in fit.summary
 
 
 def test_evidence_urls_are_filtered_to_urls_actually_gathered(settings):
@@ -829,6 +836,23 @@ def _consumer_like() -> CompanyRecord:
         tech_stack=[TechStack(category="analytics", name="GA4")],
         sources=["https://duolingo.com"],
     )
+
+
+def _supporting(rec: CompanyRecord, extra: str = "") -> list[tuple[str, str]]:
+    """Evidence text that genuinely contains this record's signals and fields.
+
+    extract_record verifies provenance, so a fixture asserting on signals has to
+    supply the text those signals came from - which is what a real run does.
+    """
+    text = " ".join(
+        [s.headline or "" for s in rec.signals or []]
+        + [s.detail or "" for s in rec.signals or []]
+        + [str(x) for x in (rec.hq_city, rec.hq_country, rec.founded_year,
+                            rec.employee_range) if x]
+        + [extra]
+    )
+    urls = rec.sources or ["https://example.com"]
+    return [(u, text) for u in urls]
 
 
 def _stub_like_llm() -> "FakeLLM":
@@ -1582,7 +1606,8 @@ def test_signals_are_sorted_freshest_first(settings):
         ],
     )
     llm = FakeLLM({CompanyRecord: rec})
-    out = extract_record("Linear", [("https://linear.app", "t")], llm, settings)
+    out = extract_record("Linear", [("https://linear.app", "Oldest Newest Undated Middle")],
+                         llm, settings)
     assert [s.headline for s in out.signals] == ["Newest", "Middle", "Oldest", "Undated"]
 
 
@@ -1614,7 +1639,11 @@ def test_counted_board_also_absorbs_the_models_restatement(settings):
         ],
     )
     llm = FakeLLM({CompanyRecord: dup})
-    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+    ev = [("https://jobs.ashbyhq.com/vanta", JOBS_JSON),
+          ("https://vanta.com/careers",
+           "Vanta has 47 open roles on Ashby. See open positions. "
+           "Hiring 3 principal engineers in Dublin.")]
+    rec = extract_record("Vanta", ev, llm, settings)
 
     hiring = [s.headline for s in rec.signals if s.kind == "hiring"]
     assert len(hiring) == 2
@@ -1638,3 +1667,353 @@ def test_scoring_context_hands_the_model_the_date_and_signal_ages():
     assert "do not recalculate" in ctx
     assert "Ramp valued at $13B" in ctx
     assert "months old" in ctx or "years old" in ctx
+
+
+# --------------------------------------------------------------------------
+# Funding re-classification: real headlines rarely say "raised"
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "headline,expected",
+    [
+        # the genuine TechCrunch headline that was landing as a product signal
+        ("Ramp nearly doubles valuation to $32B in secondary share sale", "secondary"),
+        ("Acme announces a tender offer for employees", "secondary"),
+        ("Stripe employees sell shares in a $6.5B secondary sale", "secondary"),
+        # valuation phrasing with no raise verb anywhere
+        ("Figma valued at $12.5 billion after investor round", "valuation"),
+        ("Anthropic's valuation hits $60B post-money", "valuation"),
+        # primary capital, in the many ways it gets written
+        ("Vanta raises $150M Series C led by Sequoia", "primary"),
+        ("Acme closes $40M Series B", "primary"),
+        ("Acme secures $12M led by Index Ventures", "primary"),
+        ("Startup lands $5M seed round", "primary"),
+        ("Acme banks $30M in growth financing", "primary"),
+        ("Acme nets $8M investment from Accel", "primary"),
+        ("Deel picks up $50M in Series D funding", "primary"),
+        # and the things that must NOT trip it
+        ("Introducing Stack by Ramp.", None),
+        ("Cleared 50+ products for launch last year", None),
+        ("We serve a $13B market opportunity", None),
+        ("Hiring 12 account executives", None),
+        ("Launched our first International market", None),
+        ("Our platform saved customers $200 million last year", None),
+    ],
+)
+def test_classify_funding_covers_real_world_phrasing(headline, expected):
+    from lea.enrich.extract import classify_funding
+
+    assert classify_funding(headline) == expected
+
+
+def test_valuation_headline_is_reclassified_from_product_to_funding(settings):
+    """The exact regression: a $32B valuation event filed as a product launch."""
+    rec = CompanyRecord(
+        input="Ramp", company_name="Ramp",
+        signals=[
+            Signal(kind="product",
+                   headline="Ramp nearly doubles valuation to $32B in secondary share sale",
+                   source_url="https://techcrunch.com/ramp"),
+            Signal(kind="product", headline="Introducing Stack by Ramp.",
+                   source_url="https://ramp.com/blog"),
+        ],
+    )
+    llm = FakeLLM({CompanyRecord: rec})
+    out = extract_record("Ramp", _supporting(rec), llm, settings)
+
+    by_head = {s.headline: s for s in out.signals}
+    assert by_head["Ramp nearly doubles valuation to $32B in secondary share sale"].kind == "funding"
+    # a genuine product launch is left alone
+    assert by_head["Introducing Stack by Ramp."].kind == "product"
+
+
+def test_secondary_sale_is_labelled_as_a_liquidity_event(settings):
+    """Honest taxonomy: it scores as funding but says no new capital arrived."""
+    from lea.enrich.extract import SECONDARY_NOTE, is_secondary_funding
+
+    rec = CompanyRecord(
+        input="Ramp", company_name="Ramp",
+        signals=[Signal(kind="product",
+                        headline="Ramp nearly doubles valuation to $32B in secondary share sale",
+                        source_url="https://techcrunch.com/ramp")],
+    )
+    llm = FakeLLM({CompanyRecord: rec})
+    out = extract_record("Ramp", _supporting(rec), llm, settings)
+    sig = out.signals[0]
+
+    assert sig.kind == "funding"
+    assert SECONDARY_NOTE in sig.detail
+    assert "rather than new primary capital" in sig.detail
+    assert is_secondary_funding(sig)
+
+
+def test_secondary_scores_below_an_equivalent_primary_round(settings):
+    """No new capital reached the company, so it creates less new budget."""
+    def fit_for(headline: str) -> float:
+        rec = CompanyRecord(
+            input="Co", company_name="Co", domain="co.com", industry="SaaS",
+            sources=["https://news.example"],
+            signals=[Signal(kind="funding", headline=headline, date="2026-09-10",
+                            source_url="https://news.example")],
+        )
+        from lea.enrich.extract import reclassify_signals
+        rec.signals = reclassify_signals(rec.signals)
+        fit = score_icp(rec, DEFAULT_ICP, [("https://news.example", "t")],
+                        _stub_like_llm(), settings)
+        return next(c.score for c in fit.criteria if c.key == "growth_signals")
+
+    primary = fit_for("Co raises $150M Series C led by Sequoia")
+    secondary = fit_for("Co nearly doubles valuation to $32B in secondary share sale")
+    assert secondary < primary
+    assert secondary > 2.0, "still a real momentum signal, not discarded"
+
+
+def test_a_secondary_hook_does_not_congratulate_them_on_a_raise(settings):
+    """Saying 'you raised' about money they never received costs the reply."""
+    rec = CompanyRecord(
+        input="Ramp", company_name="Ramp", domain="ramp.com",
+        sources=["https://techcrunch.com/ramp"],
+        signals=[Signal(kind="funding", date="2026-09-10",
+                        headline="Ramp nearly doubles valuation to $32B in secondary share sale",
+                        source_url="https://techcrunch.com/ramp")],
+    )
+    from lea.enrich.extract import reclassify_signals
+    rec.signals = reclassify_signals(rec.signals)
+
+    hooks = generate_hooks(rec, None, [], _stub_like_llm(), settings)
+    joined = " ".join(h.hook.lower() for h in hooks)
+    assert "you raised" not in joined
+    assert "raised" not in joined
+    assert "secondary" in joined
+    assert "$32b" in joined
+
+
+def test_hiring_signals_are_never_reclassified_as_funding():
+    """A job board quoting salary bands is not a funding round."""
+    from lea.enrich.extract import reclassify_signals
+
+    sigs = reclassify_signals([
+        Signal(kind="hiring", headline="47 open roles",
+               detail="Comp band $150,000 to $200,000 for Series C stage."),
+    ])
+    assert sigs[0].kind == "hiring"
+
+
+# --------------------------------------------------------------------------
+# Department mix -> gtm_segment
+# --------------------------------------------------------------------------
+
+
+def _record_with_board(total: int, departments: dict) -> CompanyRecord:
+    import json as _json
+    from lea.enrich.extract import jobs_signal, parse_jobs_evidence
+
+    payload = _json.dumps({"open_roles": total, "departments": departments,
+                           "ats": "ashby", "board_url": "https://jobs.ashbyhq.com/co",
+                           "posted_last_30d": 12, "latest_posted": "2026-09-15"})
+    jobs = parse_jobs_evidence([("https://jobs.ashbyhq.com/co", payload)])
+    return CompanyRecord(
+        input="Co", company_name="Co", domain="co.com", industry="SaaS",
+        sources=["https://jobs.ashbyhq.com/co"], signals=[jobs_signal(jobs)],
+    )
+
+
+def test_gtm_heavy_hiring_scores_above_the_same_total_in_engineering(settings):
+    """63 of 148 roles in Sales is a far louder GTM signal than 148 roles."""
+    ev = [("https://jobs.ashbyhq.com/co", "t")]
+    sales_heavy = _record_with_board(148, {"Sales": 63, "Engineering": 85})
+    eng_only = _record_with_board(148, {"Engineering": 148})
+
+    def gtm(rec):
+        fit = score_icp(rec, DEFAULT_ICP, ev, _stub_like_llm(), settings)
+        return next(c for c in fit.criteria if c.key == "gtm_segment")
+
+    a, b = gtm(sales_heavy), gtm(eng_only)
+    assert a.score > b.score
+    assert "63 of 148 open roles in go-to-market" in a.reasoning
+    assert "43%" in a.reasoning                       # the share, not just the count
+    assert "last 30 days" in a.reasoning              # posted_last_30d is used
+
+
+# --------------------------------------------------------------------------
+# Provenance verification — the anti-hallucination guarantee
+#
+# The blind spot these cover: the earlier tests asserted that WE never invent a
+# value. They never asserted that we reject a value the MODEL invents, which is
+# the path a live model actually took (employee_range "201-500" appearing in no
+# fixture, reasoning claiming it was "stated", unknowns published empty).
+# --------------------------------------------------------------------------
+
+THIN_EVIDENCE = [("https://vanta.com", "Vanta automates compliance. We are hiring.")]
+
+FABRICATED = dict(
+    employee_range="201-500", employee_estimate=500, hq_city="San Francisco",
+    hq_country="United States", founded_year=2018,
+)
+
+
+def _fabricating_llm(**overrides):
+    rec = CompanyRecord(input="Vanta", company_name="Vanta", domain="vanta.com",
+                        **{**FABRICATED, **overrides})
+    return FakeLLM({CompanyRecord: rec})
+
+
+@pytest.mark.parametrize("field", ["employee_range", "employee_estimate", "hq_city",
+                                   "hq_country", "founded_year"])
+def test_a_value_absent_from_the_evidence_is_dropped_not_published(settings, field):
+    rec = extract_record("Vanta", THIN_EVIDENCE, _fabricating_llm(), settings)
+    assert getattr(rec, field) is None, f"{field} was invented and survived"
+
+
+def test_unknowns_reflect_post_verification_state_not_what_the_model_filled_in(settings):
+    """Regression: unknowns came back empty because the model filled everything."""
+    rec = extract_record("Vanta", THIN_EVIDENCE, _fabricating_llm(), settings)
+
+    assert rec.unknowns, "unknowns must never be empty just because the model answered"
+    for f in ("employee_range", "hq_city", "hq_country", "founded_year"):
+        assert f in rec.unknowns
+
+
+def test_values_the_evidence_does_support_are_kept(settings):
+    """The gate must not be so strict it throws away real findings."""
+    ev = [("https://vanta.com",
+           "Vanta was founded in 2018, is headquartered in San Francisco, United States, "
+           "and has around 350 employees.")]
+    rec = extract_record("Vanta", ev, _fabricating_llm(), settings)
+
+    assert rec.employee_range == "201-500"
+    assert rec.hq_city == "San Francisco"
+    assert rec.hq_country == "United States"
+    assert rec.founded_year == 2018
+    assert "employee_range" not in rec.unknowns
+
+
+def test_employee_estimate_is_the_band_midpoint_not_the_models_arithmetic(settings):
+    """Regression: the model returned 500 as the midpoint of 201-500."""
+    ev = [("https://vanta.com", "Vanta has around 350 employees.")]
+    rec = extract_record("Vanta", ev, _fabricating_llm(), settings)
+
+    assert rec.employee_range == "201-500"
+    assert rec.employee_estimate == 350, "midpoint of 201-500 is 350, not the model's 500"
+
+
+def test_country_aliases_are_accepted(settings):
+    ev = [("https://vanta.com", "Vanta is based in San Francisco, USA.")]
+    rec = extract_record("Vanta", ev, _fabricating_llm(), settings)
+    assert rec.hq_country == "United States"      # evidence said "USA"
+
+
+def test_an_invented_signal_is_dropped(settings):
+    """The most damaging possible output: a funding round that never happened."""
+    llm = _fabricating_llm(signals=[
+        Signal(kind="funding", headline="Vanta raises $500M Series Z from SoftBank",
+               source_url="https://vanta.com"),
+        Signal(kind="hiring", headline="Vanta automates compliance and is hiring",
+               source_url="https://vanta.com"),
+    ])
+    rec = extract_record("Vanta", THIN_EVIDENCE, llm, settings)
+
+    headlines = [s.headline for s in rec.signals]
+    assert not any("Series Z" in h for h in headlines), "invented funding round survived"
+    assert any("hiring" in h for h in headlines), "a supported signal was wrongly dropped"
+
+
+def test_no_evidence_at_all_means_nothing_is_claimed(settings):
+    rec = extract_record("Vanta", [], _fabricating_llm(), settings)
+    for f in ("employee_range", "hq_city", "hq_country", "founded_year"):
+        assert getattr(rec, f) is None
+    assert rec.signals == []
+
+
+def test_the_scorer_cannot_grade_a_criterion_on_a_dropped_value(settings):
+    """The model scored company_size 10/10 on a headcount it invented."""
+    rec = extract_record("Vanta", THIN_EVIDENCE, _fabricating_llm(), settings)
+    assert rec.employee_range is None
+
+    inflated = ICPFit(
+        score=96.8, tier="A", summary="",
+        criteria=[CriterionScore(
+            key=c.key, score=10.0, weight=c.weight, evidence_urls=[],
+            reasoning="Headcount is stated as 201-500 employees on the company record.")
+            for c in DEFAULT_ICP.criteria],
+    )
+    fit = score_icp(rec, DEFAULT_ICP, THIN_EVIDENCE, FakeLLM({ICPFit: inflated}), settings)
+
+    assert fit.score < 80.0, "an uncited, fabricated basis must not present as tier A"
+    assert fit.tier != "A"
+    assert all(c.score <= 7.0 for c in fit.criteria), "uncited criteria are capped"
+
+
+def test_score_and_confidence_cannot_contradict_each_other(settings):
+    """Regression: 96.8 alongside confidence 0.40."""
+    rec = extract_record("Vanta", THIN_EVIDENCE, _fabricating_llm(), settings)
+    inflated = ICPFit(
+        score=96.8, tier="A", summary="",
+        # distinct reasoning per criterion, so this is a real (if uncited)
+        # model judgement rather than a degenerate default-filled response
+        criteria=[CriterionScore(key=c.key, score=10.0, weight=c.weight, evidence_urls=[],
+                                 reasoning=f"Excellent fit on {c.key}, a perfect match.")
+                  for c in DEFAULT_ICP.criteria],
+    )
+    fit = score_icp(rec, DEFAULT_ICP, THIN_EVIDENCE, FakeLLM({ICPFit: inflated}), settings)
+
+    ceiling = 40.0 + 60.0 * fit.confidence
+    assert fit.score <= ceiling + 0.05, "score must not outrun the evidence behind it"
+    assert fit.confidence < 0.5
+    assert fit.score < 80.0
+    assert "capped" in fit.summary
+
+
+def test_a_well_evidenced_record_is_not_capped(settings):
+    """The ceiling must not punish a genuinely well-sourced assessment."""
+    ev = [("https://vanta.com",
+           "Vanta was founded in 2018 in San Francisco, United States, has around "
+           "350 employees, uses HubSpot, and raised $150M Series C led by Sequoia.")]
+    rec = extract_record("Vanta", ev, _fabricating_llm(
+        industry="Compliance",
+        signals=[Signal(kind="funding", headline="Vanta raised $150M Series C led by Sequoia",
+                        date="2026-09-01", source_url="https://vanta.com")],
+        tech_stack=[TechStack(category="crm", name="HubSpot")],
+    ), settings)
+
+    cited = ICPFit(
+        score=0, tier="C", summary="",
+        criteria=[CriterionScore(key=c.key, score=9.0, weight=c.weight,
+                                 evidence_urls=["https://vanta.com"],
+                                 reasoning=f"Strong on {c.key}, per the cited source.")
+                  for c in DEFAULT_ICP.criteria],
+    )
+    fit = score_icp(rec, DEFAULT_ICP, ev, FakeLLM({ICPFit: cited}), settings)
+
+    assert fit.score == 90.0          # 9.0/10 across the board, uncapped
+    assert fit.tier == "A"
+    assert "capped" not in fit.summary
+
+
+@pytest.mark.parametrize(
+    "evidence_text,claimed,ok",
+    [
+        ("Vanta currently has 500 employees",  "201-500",   True),   # exact, in band
+        ("a team of 350 people",               "201-500",   True),
+        ("We are 5,000+ employees",            "5000+",     True),   # open-ended, correct band
+        ("We are 5,000+ employees",            "1001-5000", False),  # ">=5000" is not "<=5000"
+        ("We are 500+ employees",              "201-500",   False),  # ">=500" cannot mean "<=500"
+        ("We are 500+ employees",              "501-1000",  True),
+        ("Headcount is 51-200",                "51-200",    True),   # band written out
+        ("We serve 300 customers",             "201-500",   False),  # customers are not staff
+        ("Vanta automates compliance",         "201-500",   False),
+    ],
+)
+def test_headcount_verification_reads_the_evidence_precisely(evidence_text, claimed, ok):
+    from lea.enrich.extract import _verify_employee_range
+
+    assert _verify_employee_range(claimed, evidence_text.lower()) is ok
+
+
+def test_a_stated_headcount_beats_the_band_midpoint(settings):
+    """When the evidence gives a real number, use it rather than the midpoint."""
+    ev = [("https://vanta.com", "Vanta currently has 500 employees.")]
+    rec = extract_record("Vanta", ev, _fabricating_llm(), settings)
+    assert rec.employee_range == "201-500"
+    assert rec.employee_estimate == 500, "the stated figure, not the 350 midpoint"

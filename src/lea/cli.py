@@ -110,6 +110,27 @@ def slugify(text: str) -> str:
     return slug[:60] or "target"
 
 
+def warn_if_offline_but_live_llm(settings: Settings) -> None:
+    """`--offline` stubs HTTP, not the model. Say so.
+
+    The surprise is expensive rather than cosmetic: a free Gemini tier allows
+    ~20 requests/day/model and one run spends ~11, so a user doing "offline"
+    iteration can burn a day's quota without ever seeing a network call.
+    Semantics are left alone on purpose — recorded pages plus real reasoning is a
+    legitimate and much-used combination — so this only names the missing half.
+    """
+    if not settings.offline:
+        return
+    provider = settings.resolved_llm()
+    if provider == "stub":
+        return
+    err_console.print(
+        f"[yellow]note:[/yellow] --offline serves pages from fixtures, but the LLM "
+        f"([bold]{provider}[/bold]) is still live and will use quota. "
+        f"Add [cyan]--provider stub[/cyan] for a fully offline run."
+    )
+
+
 def _plausible_name(name: str) -> bool:
     """A filename guard, not a sanitizer. Rejects the obvious page-title shapes
     ("SOC 2, HIPAA, ISO 27001, PCI, and GDPR Compliance") so that a bad extraction
@@ -155,7 +176,11 @@ def enrich(
     out: Optional[Path] = typer.Option(None, "--out", help="Output directory (default ./out)."),
     json_out: bool = typer.Option(False, "--json", help="Print only the JSON record to stdout."),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the step budget."),
-    offline: bool = typer.Option(False, "--offline", help="Serve all HTTP from examples/fixtures."),
+    offline: bool = typer.Option(
+        False, "--offline",
+        help="Serve search and page fetches from examples/fixtures. The LLM still "
+             "makes live calls — add --provider stub for a fully offline run.",
+    ),
     provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | google | groq | openrouter | cerebras | ollama | stub."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the LLM provider."),
     quiet: bool = typer.Option(False, "--quiet", help="Suppress the live trace."),
@@ -168,6 +193,7 @@ def enrich(
     from lea import trace as trace_mod
     from lea.agent.loop import run_agent
 
+    warn_if_offline_but_live_llm(settings)
     profile = _load_icp(icp, settings) if icp else None
 
     live = not (quiet or json_out)
@@ -212,7 +238,11 @@ def batch(
     icp: Optional[Path] = typer.Option(None, "--icp", help="Path to an ICP yaml profile."),
     out: Optional[Path] = typer.Option(None, "--out", help="Output directory (default ./out)."),
     limit: Optional[int] = typer.Option(None, "--limit", help="Only process the first N targets."),
-    offline: bool = typer.Option(False, "--offline", help="Serve all HTTP from examples/fixtures."),
+    offline: bool = typer.Option(
+        False, "--offline",
+        help="Serve search and page fetches from examples/fixtures. The LLM still "
+             "makes live calls — add --provider stub for a fully offline run.",
+    ),
     provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | google | groq | openrouter | cerebras | ollama | stub."),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the step budget."),
 ) -> None:
@@ -225,6 +255,7 @@ def batch(
     from lea.agent.loop import run_agent
 
     settings = build_settings(out=out, offline=offline, provider=provider, max_steps=max_steps)
+    warn_if_offline_but_live_llm(settings)
 
     try:
         from lea.io_csv import read_targets
@@ -637,7 +668,11 @@ def doctor(
     else:
         t.add_row("model", settings.model)
     t.add_row("search provider", f"{settings.resolved_search()}  [dim](configured: {settings.search_provider})[/dim]")
-    t.add_row("offline mode", "ON — all HTTP served from fixtures" if settings.offline else "off")
+    t.add_row(
+        "offline mode",
+        "ON — pages from fixtures; the LLM is still live unless provider=stub"
+        if settings.offline else "off",
+    )
     t.add_row("out dir", str(settings.out_dir))
     console.print(t)
     console.print()

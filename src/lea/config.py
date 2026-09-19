@@ -61,7 +61,7 @@ OPENAI_COMPAT_PRESETS: dict[str, dict[str, str]] = {
     "google": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "env": "GOOGLE_API_KEY",
-        "model": "gemini-3.6-flash",
+        "model": "gemini-3.5-flash-lite",
         "label": "Google AI Studio (Gemini)",
     },
     "groq": {

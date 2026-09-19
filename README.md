@@ -82,6 +82,18 @@ The same instinct governs the two fields that head the report:
 - An aggregator host is never accepted as the company's own domain — Crunchbase, LinkedIn, Tracxn, PitchBook, ZoomInfo and the rest, editable as `AGGREGATOR_DOMAINS`. The denylist is overridden when the host really is the company, so GitHub still resolves to `github.com`. A host resembling neither the target nor the company name is left unknown rather than misattributed.
 - Only URLs that actually returned usable text are cited in `sources`. A 404 or robots-blocked fetch is evidence of nothing and is not a source.
 
+### Every value is checked against the evidence before it is published
+
+The strongest version of this guarantee is not a prompt asking the model not to invent things — it is a check. Before a record is written, `employee_range`, `employee_estimate`, `hq_city`, `hq_country`, `founded_year` and every signal must be traceable to a string in the gathered evidence. A value that is not gets dropped and moved to `unknowns`, however confidently it was asserted.
+
+This is not hypothetical. A live model returned `employee_range: "201-500"` for a company whose evidence contained no headcount anywhere, wrote reasoning claiming the figure was "stated", scored that criterion 10/10 on it, and published the record with an empty `unknowns` list. The check now drops it; the score falls to where the evidence puts it.
+
+Three related rules keep the numbers honest rather than merely plausible:
+
+- **`employee_estimate` comes from the evidence or the band midpoint, never the model's arithmetic** — it returned 500 as the midpoint of 201-500. A stated headcount is preferred over a midpoint, and "500+ employees" will not verify a band that tops out at 500.
+- **A criterion graded without a citation is capped at 7/10.** You may well be right, but "10/10, source: none" is an assertion, not an assessment.
+- **The total is capped by confidence** at `40 + 60 x confidence`. A score of 96.8 carrying confidence 0.40 is self-contradictory; reaching tier A now requires roughly two thirds of the criteria to actually cite a source.
+
 ## Example trace
 
 Real output from `./.venv/bin/lea enrich "Ramp" --offline`, trimmed for length — observation bodies shortened, `#` lines added as annotation. Run the command and you should get this shape.
@@ -136,7 +148,7 @@ researching Ramp   [llm=stub search=fixture offline]
       finish()
 
   8 * synth   ok  10ms   | resolved 4 core field(s); 5 signal(s), 4 tech entries.
-  9 * synth   ok   5ms   | tier B - 64/100 across 6 criteria.
+  9 * synth   ok   5ms   | tier B - 68/100 across 6 criteria.
  10 * synth   ok   6ms   | 2 hook(s) kept.
 
 10 steps - 2 searches - 4 pages - 0.2s - llm=stub search=fixture
@@ -162,15 +174,16 @@ The per-criterion scoring from that same run — this reasoning is generated fro
   tech_maturity      6.6   1.5   Detected 3 technologies across 3 categories;
                                  cloud-native infrastructure (Cloudflare and
                                  Vercel).
-  growth_signals     5.2   1.5   Trigger events - hiring: "See open
-                                 positions" (1.3 years old); product:
-                                 "Introducing Stack by Ramp." (undated).
+  growth_signals     7.7   1.5   Trigger events - funding, secondary:
+                                 "Ramp nearly doubles valuation to $13B in
+                                 secondary share sale" (18 months old);
+                                 hiring: "See open positions" (1.3 years old).
                                  Signals are weighted by age, so older
                                  events count for less.
   geo               10.0     1   Headquartered in New York, United States - a
                                  core market we sell into today.
 
-  -> tier B - 64.4/100 - confidence 0.85 - unknowns: employee_range
+  -> tier B - 68.4/100 - confidence 0.85 - unknowns: employee_range
 ```
 
 Two things to notice. `company_size` scores 5.0 with the reason stated rather than 0 — an unknown is not a negative, and `confidence` is where missing evidence is accounted for. And `growth_signals` is **weighted by age**: the hiring line here is 1.3 years old, so it contributes a fraction of what a signal from last week would. A two-year-old funding round is history; a nine-day-old launch is a reason to call this week, and the score says so.
@@ -217,10 +230,10 @@ The record from that same `--offline` run (`out/ramp.json`, trimmed):
     { "category": "infra",     "name": "Cloudflare", "evidence": "header 'server: cloudflare'", "confidence": 0.95 }
   ],
   "icp_fit": {
-    "score": 64.4,
+    "score": 68.4,
     "tier": "B",
     "confidence": 0.85,
-    "summary": "Tier B (64/100). Strongest: company_type 8/10, gtm_segment 5/10. Graded by the deterministic rubric (no LLM judgement available) - set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
+    "summary": "Tier B (68/100). Strongest: company_type 8/10, growth_signals 8/10. Graded by the deterministic rubric (no LLM judgement available) - set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
   },
   "hooks": [
     {

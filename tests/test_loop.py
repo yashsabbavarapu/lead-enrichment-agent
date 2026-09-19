@@ -15,6 +15,7 @@ from lea.agent.policy import (
     Budget,
     allowed_tools,
     derive_gaps,
+    gap_labels,
     is_redundant,
     learned_anything,
     normalize_url,
@@ -92,14 +93,18 @@ def act(tool: ToolName, thought: str = "because", **args) -> AgentAction:
     return AgentAction(thought=thought, tool=tool, args=args)
 
 
-def make_settings(**kw) -> Settings:
+def make_settings(max_jobs_lookups: int | None = None, **kw) -> Settings:
     base = dict(
         llm_provider="stub", search_provider="fixture",
         max_steps=6, max_searches=4, max_fetches=4, total_timeout_s=60.0,
         offline=True,
     )
     base.update(kw)
-    return Settings(**base)
+    settings = Settings(**base)
+    if max_jobs_lookups is not None:
+        # Not a Settings field; Budget.from_settings reads it through getattr.
+        settings.max_jobs_lookups = max_jobs_lookups
+    return settings
 
 
 DEFAULT_ICP = ICPProfile(
@@ -172,7 +177,7 @@ def registry_of(*tools: FakeTool) -> dict[ToolName, FakeTool]:
 
 
 def test_budget_allows_and_consumes():
-    b = Budget(max_steps=5, max_searches=1, max_fetches=2, total_timeout_s=60)
+    b = Budget(max_steps=9, max_searches=1, max_fetches=2, max_jobs=1, total_timeout_s=60)
     assert b.allows(ToolName.WEB_SEARCH)
     b.consume(ToolName.WEB_SEARCH)
     assert b.searches == 1 and b.steps == 1
@@ -182,9 +187,20 @@ def test_budget_allows_and_consumes():
     b.consume(ToolName.DETECT_TECH)  # detect_tech spends the fetch budget too
     assert b.fetches == 2
     assert not b.allows(ToolName.FETCH_PAGE)
+
+    # fetch_jobs has its OWN allowance: it is one JSON call, not a page crawl, so
+    # it is still affordable with the page budget gone.
+    assert b.allows(ToolName.FETCH_JOBS)
+    assert b.exhausted_reason() is None, "a usable job-board lookup is research left"
+    b.consume(ToolName.FETCH_JOBS)
+    assert b.jobs == 1 and b.fetches == 2, "fetch_jobs must not spend the page budget"
+    assert not b.allows(ToolName.FETCH_JOBS)
+
     # finish is always affordable, even with nothing left
     assert b.allows(ToolName.FINISH)
     assert "exhausted: research budget" in (b.exhausted_reason() or "")
+    assert "job boards" in (b.exhausted_reason() or "")
+    assert not b.can_research()
 
 
 def test_budget_remaining_and_step_exhaustion():
@@ -344,7 +360,9 @@ def test_loop_stops_when_search_budget_runs_out(wired):
     ])
     wired(llm, registry_of(search))
 
-    result = loop_mod.run_agent("acme", make_settings(max_steps=9, max_searches=2, max_fetches=0))
+    result = loop_mod.run_agent(
+        "acme", make_settings(max_steps=9, max_searches=2, max_fetches=0, max_jobs_lookups=0)
+    )
 
     assert "exhausted: research budget" in result.stats.stop_reason
     assert result.stats.searches == 2
@@ -533,7 +551,7 @@ def test_learned_anything_ignores_synthesis_steps():
 
 def test_premature_finish_allows_finishing_when_out_of_budget():
     """Pushing back is pointless with no budget to act on the advice."""
-    spent = Budget(max_steps=1, max_searches=0, max_fetches=0, total_timeout_s=60)
+    spent = Budget(max_steps=1, max_searches=0, max_fetches=0, max_jobs=0, total_timeout_s=60)
     history = [TraceStep(n=1, tool=ToolName.WEB_SEARCH, ok=False)]
     assert premature_finish_reason(spent, history) is None
 
@@ -1257,7 +1275,12 @@ def test_rate_limit_is_not_reported_as_a_broken_setup(wired):
         # points. The fixture is now honest; the gap is in the funding-language
         # patterns, not here.
         ("Vanta", "A", 87.9, "Security & Compliance"),
-        ("Ramp", "B", 63.9, "Fintech"),
+        # 63.9 -> 68.4 (Agent D): the real TechCrunch headline ("nearly doubles
+        # valuation to $13B in secondary share sale") has no raise verb and was
+        # being filed as a `product` signal. It is now correctly `funding`,
+        # discounted 0.8x because a secondary sale brings no new primary
+        # capital. Verified stable across 6 consecutive runs.
+        ("Ramp", "B", 68.4, "Fintech"),
     ],
 )
 def test_stub_pipeline_on_fixtures_does_not_regress(target, tier, score, industry):
@@ -1280,3 +1303,175 @@ def test_stub_pipeline_on_fixtures_does_not_regress(target, tier, score, industr
     # and it stays cheap: no runaway searching
     assert result.stats.searches <= settings.max_searches
     assert result.stats.fetches <= settings.max_fetches
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs: a fourth tool with its own economics
+# --------------------------------------------------------------------------
+
+
+def test_board_identity_collapses_the_ways_to_name_one_board():
+    from lea.agent.policy import board_identity
+
+    same = [
+        "vanta.com",
+        "Vanta",
+        "https://jobs.ashbyhq.com/vanta",
+        "https://jobs.ashbyhq.com/vanta/",
+        "http://www.vanta.com",
+        "https://boards.greenhouse.io/vanta",
+    ]
+    keys = {board_identity(v) for v in same}
+    assert keys == {"vanta"}, keys
+
+    # ...without collapsing genuinely different companies
+    assert board_identity("ramp.com") != board_identity("vanta.com")
+    assert board_identity("https://jobs.lever.co/acme") == "acme"
+    assert board_identity("Acme Corp") == "acme-corp"
+    assert board_identity("") == ""
+
+
+def test_redundant_job_board_lookup_is_caught_across_spellings():
+    history = [TraceStep(n=2, tool=ToolName.FETCH_JOBS,
+                         args={"company_or_url": "https://jobs.ashbyhq.com/vanta"}, ok=True,
+                         sources=["https://jobs.ashbyhq.com/vanta"])]
+
+    dup = is_redundant(act(ToolName.FETCH_JOBS, company_or_url="vanta.com"), history)
+    assert dup and "already read vanta's job board" in dup
+
+    # a different company is fine, and so is a different tool on the same URL
+    assert is_redundant(act(ToolName.FETCH_JOBS, company_or_url="ramp.com"), history) is None
+    assert is_redundant(
+        act(ToolName.FETCH_PAGE, url="https://jobs.ashbyhq.com/vanta"), history
+    ) is None
+
+
+def test_job_board_lookup_marks_that_url_read():
+    """Otherwise the unread-URL nudge keeps pointing at a board already read."""
+    from lea.agent.policy import unread_urls
+
+    history = [
+        _search_step(1, "vanta careers", "https://jobs.ashbyhq.com/vanta", "https://vanta.com"),
+        TraceStep(n=2, tool=ToolName.FETCH_JOBS,
+                  args={"company_or_url": "https://jobs.ashbyhq.com/vanta"}, ok=True),
+    ]
+    assert unread_urls(history) == ["https://vanta.com"]
+
+
+def test_job_board_lookup_counts_as_reading_for_the_search_guard():
+    """search -> fetch_jobs -> search is a sane rhythm, not two searches in a row."""
+    from lea.agent.policy import search_without_reading_reason
+
+    history = [
+        _search_step(1, "vanta", "https://vanta.com"),
+        TraceStep(n=2, tool=ToolName.FETCH_JOBS, args={"company_or_url": "vanta.com"}, ok=True),
+    ]
+    assert search_without_reading_reason(
+        act(ToolName.WEB_SEARCH, query="vanta funding round"), history
+    ) is None
+
+
+def test_allowed_tools_offers_fetch_jobs_only_while_affordable():
+    registry = registry_of(
+        FakeTool(ToolName.WEB_SEARCH), FakeTool(ToolName.FETCH_PAGE),
+        FakeTool(ToolName.DETECT_TECH), FakeTool(ToolName.FETCH_JOBS),
+    )
+    b = Budget(max_steps=9, max_searches=2, max_fetches=2, max_jobs=1, total_timeout_s=60)
+    assert "fetch_jobs" in {s["name"] for s in allowed_tools(b, registry)}
+
+    b.consume(ToolName.FETCH_JOBS)
+    names = {s["name"] for s in allowed_tools(b, registry)}
+    assert "fetch_jobs" not in names, "spent allowance must not be offered"
+    # the page budget is untouched by it
+    assert "fetch_page" in names and "finish" in names
+
+
+def test_loop_spends_the_jobs_allowance_not_the_page_budget(wired):
+    jobs = FakeTool(ToolName.FETCH_JOBS, observations=[
+        Observation(
+            tool=ToolName.FETCH_JOBS, ok=True,
+            summary="Vanta — Ashby — 93 open roles (Sales 21)",
+            data={"company": "Vanta", "slug": "vanta", "open_roles": 93},
+            sources=["https://jobs.ashbyhq.com/vanta"],
+        )
+    ])
+    llm = FakeLLM([
+        act(ToolName.FETCH_JOBS, "count the open roles", company_or_url="vanta.com"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(jobs))
+
+    result = loop_mod.run_agent("Vanta", make_settings())
+
+    assert len(jobs.calls) == 1
+    assert result.stats.fetches == 0, "a job-board call is not a page fetch"
+    assert result.trace[0].ok is True
+    # and it does not eat the search budget either
+    assert result.stats.searches == 0
+
+
+def test_loop_blocks_a_repeat_job_board_lookup(wired):
+    jobs = FakeTool(ToolName.FETCH_JOBS)
+    llm = FakeLLM([
+        act(ToolName.FETCH_JOBS, "roles", company_or_url="https://jobs.ashbyhq.com/vanta"),
+        act(ToolName.FETCH_JOBS, "again", company_or_url="Vanta"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(jobs))
+
+    result = loop_mod.run_agent("Vanta", make_settings())
+
+    assert len(jobs.calls) == 1, "the duplicate must not reach the tool"
+    assert result.trace[1].error == "redundant"
+    assert "job board" in result.trace[1].observation
+
+
+def test_hiring_is_its_own_gap_so_the_agent_goes_and_gets_it():
+    from lea.models import Signal
+
+    rec = CompanyRecord(input="Vanta")
+    assert "hiring" in derive_gaps(rec)
+    assert "open roles" in " ".join(gap_labels(derive_gaps(rec)))
+
+    # a funding signal is not a hiring signal
+    rec.signals = [Signal(kind="funding", headline="Series C")]
+    assert "signals" not in derive_gaps(rec)
+    assert "hiring" in derive_gaps(rec)
+
+    rec.signals.append(Signal(kind="hiring", headline="93 open roles"))
+    assert "hiring" not in derive_gaps(rec)
+
+
+def test_synthesis_overrun_is_reported_not_hidden(wired, monkeypatch):
+    """A run reporting a 180s budget beside a 247s wall clock looks like it
+    ignored its own limit."""
+    search = FakeTool(ToolName.WEB_SEARCH)
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "s", query="vanta company overview"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search))
+
+    # make extraction "slow" by advancing the clock the loop measures
+    real = loop_mod.time.monotonic
+    offset = {"v": 0.0}
+
+    def fake_monotonic():
+        return real() + offset["v"]
+
+    monkeypatch.setattr(loop_mod.time, "monotonic", fake_monotonic)
+
+    original = loop_mod._call_extract
+
+    def slow_extract(*a, **k):
+        offset["v"] += 200.0  # synthesis burns 200s of wall clock
+        return original(*a, **k)
+
+    monkeypatch.setattr(loop_mod, "_call_extract", slow_extract)
+
+    result = loop_mod.run_agent("Vanta", make_settings(total_timeout_s=180.0))
+
+    reason = result.stats.stop_reason
+    assert "synthesis then ran a further" in reason
+    assert "past the 180s budget" in reason
+    assert result.stats.wall_ms / 1000 > 180

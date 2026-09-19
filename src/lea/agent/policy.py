@@ -24,8 +24,26 @@ from urllib.parse import urlsplit
 from lea.config import Settings
 from lea.models import AgentAction, CompanyRecord, ToolName, TraceStep
 
-# Tools that consume the "fetch a page over HTTP" budget.
+# Tools that consume the "fetch a page over HTTP" budget: these crawl and parse
+# real HTML, which is the expensive, rate-limit-prone thing being rationed.
 _FETCHING_TOOLS = (ToolName.FETCH_PAGE, ToolName.DETECT_TECH)
+
+# Every tool that can actually learn something, for the places where "was the last
+# move research, or was it the loop talking to itself?" matters.
+RESEARCH_TOOLS = (
+    ToolName.WEB_SEARCH, ToolName.FETCH_PAGE, ToolName.DETECT_TECH, ToolName.FETCH_JOBS,
+)
+
+# fetch_jobs gets its own small allowance rather than drawing on the page budget.
+# It is one authless JSON call (a couple, when the slug needs probing), not a
+# crawl, and it is now the highest-value call in the set — it fixed company_size
+# and supplies the best GTM signal. Making it compete with page reads would price
+# it as something it is not. But cheap is not free: unbudgeted, nothing stops a
+# loop. Two covers one company plus a retry under a different identifier.
+DEFAULT_MAX_JOBS_LOOKUPS = 2
+
+# Arg names any of the four tools might use for its target.
+_TARGET_ARG_KEYS = ("url", "page", "link", "domain", "company_or_url", "company")
 
 # How many consecutive useless steps (failed tool call or redundancy guard) before
 # we conclude the agent is stuck and stop it ourselves.
@@ -85,11 +103,13 @@ class Budget:
     max_steps: int = 12
     max_searches: int = 5
     max_fetches: int = 6
+    max_jobs: int = DEFAULT_MAX_JOBS_LOOKUPS
     total_timeout_s: float = 180.0
 
     steps: int = 0
     searches: int = 0
     fetches: int = 0
+    jobs: int = 0
 
     # monotonic clock so a system time change cannot extend or kill a run
     started_monotonic: float = field(default_factory=time.monotonic)
@@ -100,6 +120,9 @@ class Budget:
             max_steps=settings.max_steps,
             max_searches=settings.max_searches,
             max_fetches=settings.max_fetches,
+            # Not a Settings field today; read through getattr so it is picked up
+            # automatically if config grows one.
+            max_jobs=int(getattr(settings, "max_jobs_lookups", DEFAULT_MAX_JOBS_LOOKUPS)),
             total_timeout_s=settings.total_timeout_s,
         )
 
@@ -124,6 +147,8 @@ class Budget:
             return self.searches < self.max_searches
         if tool in _FETCHING_TOOLS or tool in ("fetch_page", "detect_tech"):
             return self.fetches < self.max_fetches
+        if tool in (ToolName.FETCH_JOBS, "fetch_jobs"):
+            return self.jobs < self.max_jobs
         # Unknown tool: allow it if there are steps left; the registry will reject it.
         return True
 
@@ -134,12 +159,15 @@ class Budget:
             self.searches += 1
         elif tool in _FETCHING_TOOLS or tool in ("fetch_page", "detect_tech"):
             self.fetches += 1
+        elif tool in (ToolName.FETCH_JOBS, "fetch_jobs"):
+            self.jobs += 1
 
     def remaining(self) -> dict[str, Any]:
         return {
             "steps": max(0, self.max_steps - self.steps),
             "searches": max(0, self.max_searches - self.searches),
             "fetches": max(0, self.max_fetches - self.fetches),
+            "job_boards": max(0, self.max_jobs - self.jobs),
             "seconds": max(0.0, round(self.total_timeout_s - self.elapsed_s(), 1)),
         }
 
@@ -154,6 +182,7 @@ class Budget:
             "steps_used": f"{self.steps}/{self.max_steps}",
             "searches_used": f"{self.searches}/{self.max_searches}",
             "fetches_used": f"{self.fetches}/{self.max_fetches}",
+            "job_boards_used": f"{self.jobs}/{self.max_jobs}",
         }
 
     def exhausted_reason(self) -> Optional[str]:
@@ -162,16 +191,20 @@ class Budget:
             return f"{STOP_EXHAUSTED}: time budget ({self.total_timeout_s:.0f}s)"
         if self.steps >= self.max_steps:
             return f"{STOP_EXHAUSTED}: step budget ({self.steps}/{self.max_steps} steps)"
-        if self.searches >= self.max_searches and self.fetches >= self.max_fetches:
+        if (
+            self.searches >= self.max_searches
+            and self.fetches >= self.max_fetches
+            and self.jobs >= self.max_jobs
+        ):
             return (
                 f"{STOP_EXHAUSTED}: research budget ({self.searches}/{self.max_searches} searches, "
-                f"{self.fetches}/{self.max_fetches} pages)"
+                f"{self.fetches}/{self.max_fetches} pages, {self.jobs}/{self.max_jobs} job boards)"
             )
         return None
 
     def can_research(self) -> bool:
         """Is there any budget left for a move that could actually learn something?"""
-        return self.allows(ToolName.WEB_SEARCH) or self.allows(ToolName.FETCH_PAGE)
+        return any(self.allows(t) for t in RESEARCH_TOOLS)
 
 
 # --------------------------------------------------------------------------
@@ -260,6 +293,52 @@ def normalize_url(url: str) -> str:
     return f"{host}{path}"
 
 
+def _ats_host_hints() -> tuple[str, ...]:
+    """Reuse the tool's own ATS host list when importable, so the two cannot drift."""
+    try:
+        from lea.tools.jobs import ATS_HOST_HINTS  # type: ignore
+
+        return tuple(ATS_HOST_HINTS)
+    except Exception:
+        return ("ashbyhq.com", "greenhouse.io", "lever.co", "workable.com")
+
+
+def board_identity(value: str) -> str:
+    """Collapse the many ways to name one company's job board to a single key.
+
+    `fetch_jobs` accepts a board URL, a domain or a bare name, so
+    `vanta.com`, `Vanta` and `https://jobs.ashbyhq.com/vanta` are one call made
+    three ways. Comparing raw args would let the agent make all three.
+
+    Deliberately offline and approximate: the tool's real resolver probes the
+    network, which a guard must never do. Worst case a miss lets one extra lookup
+    through, which the jobs allowance then caps.
+    """
+    raw = (value or "").strip().lower().rstrip("/")
+    if not raw:
+        return ""
+    host = ""
+    path = ""
+    if "://" in raw or "/" in raw:
+        candidate = raw if "://" in raw else "http://" + raw
+        parts = urlsplit(candidate)
+        host = (parts.netloc or "").split("@")[-1].split(":")[0]
+        path = (parts.path or "").strip("/")
+        if host.startswith("www."):
+            host = host[4:]
+    else:
+        host = raw
+
+    # An ATS URL identifies the company by its slug, not its host.
+    if host and any(hint in host for hint in _ats_host_hints()):
+        return path.split("/")[-1] if path else host
+
+    if "." in host:  # a domain: the registrable label is the company
+        return host.split(".")[0]
+    # A bare name: normalize spacing/punctuation so "Acme Corp" == "acme-corp".
+    return "-".join(_TOKEN_RE.findall(host)) or host
+
+
 def _tokens(text: str) -> set[str]:
     return {t for t in _TOKEN_RE.findall((text or "").lower()) if t not in _STOPWORDS}
 
@@ -288,6 +367,20 @@ def is_redundant(action: AgentAction, history: Iterable[TraceStep]) -> Optional[
     """
     steps = list(history)
     if action.tool == ToolName.FINISH:
+        return None
+
+    if action.tool == ToolName.FETCH_JOBS:
+        ident = board_identity(_arg(action.args, *_TARGET_ARG_KEYS))
+        if not ident:
+            return None
+        for s in steps:
+            if s.tool != ToolName.FETCH_JOBS:
+                continue
+            if board_identity(_arg(s.args, *_TARGET_ARG_KEYS)) == ident:
+                return (
+                    f"redundant: step {s.n} already read {ident}'s job board. One board "
+                    "per company is all there is — use a different tool."
+                )
         return None
 
     if action.tool in _FETCHING_TOOLS:
@@ -367,9 +460,11 @@ def fetched_urls(history: Iterable[TraceStep]) -> set[str]:
     """Normalized URLs some fetch/detect step has already opened."""
     read: set[str] = set()
     for s in history:
-        if s.tool not in _FETCHING_TOOLS:
+        # fetch_jobs counts: if it read a board URL that search surfaced, that URL
+        # is consumed and the unread list should stop nagging about it.
+        if s.tool not in _FETCHING_TOOLS and s.tool != ToolName.FETCH_JOBS:
             continue
-        norm = normalize_url(_arg(s.args, "url", "page", "link", "domain"))
+        norm = normalize_url(_arg(s.args, *_TARGET_ARG_KEYS))
         if norm:
             read.add(norm)
     return read
@@ -410,7 +505,7 @@ def search_without_reading_reason(
     for s in reversed(steps):
         if s.error in GUARD_ERRORS:
             continue
-        if s.tool in (ToolName.WEB_SEARCH, *_FETCHING_TOOLS):
+        if s.tool in RESEARCH_TOOLS:
             prior = s
             break
     if prior is None or prior.tool != ToolName.WEB_SEARCH:
@@ -440,6 +535,7 @@ GAP_LABELS: dict[str, str] = {
     "domain": "primary web domain",
     "industry": "industry / what they sell",
     "employees": "employee count or range",
+    "hiring": "open roles / which teams are growing (public ATS job board)",
     "hq": "headquarters location",
     "signals": "recent buying signals (funding, hiring, launches)",
     "tech": "technology stack",
@@ -447,7 +543,15 @@ GAP_LABELS: dict[str, str] = {
 
 
 def derive_gaps(record: CompanyRecord) -> list[str]:
-    """Which fields are still unknown, most important first."""
+    """Which fields are still unknown, most important first.
+
+    This list is both what the prompt chases and what `should_stop` calls complete,
+    and naming a gap concretely is what makes the agent go get it — the fetch-first
+    rhythm came from exactly this mechanism. `hiring` is listed separately from
+    `signals` because it points at one specific, cheap, authless call rather than
+    at "go find some news": open-role counts are the best public proxy for org size
+    and the strongest GTM signal available.
+    """
     gaps: list[str] = []
     if not record.domain:
         gaps.append("domain")
@@ -455,6 +559,8 @@ def derive_gaps(record: CompanyRecord) -> list[str]:
         gaps.append("industry")
     if not (record.employee_range or record.employee_estimate):
         gaps.append("employees")
+    if not any(s.kind == "hiring" for s in record.signals):
+        gaps.append("hiring")
     if not (record.hq_city or record.hq_country):
         gaps.append("hq")
     if not record.signals:

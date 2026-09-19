@@ -294,3 +294,58 @@ def test_cached_resolved_model_survives_a_moved_internal(monkeypatch):
     monkeypatch.setattr(oc, "_MODEL_RESOLUTION", Moved())
     assert cli_mod.cached_resolved_model(Settings.from_env(), "groq") is None
     assert run("doctor").exit_code == 0
+
+
+# --------------------------------------------------------------------------
+# --offline does not mean the LLM is offline
+# --------------------------------------------------------------------------
+
+
+def test_offline_warns_that_the_llm_is_still_live(monkeypatch):
+    """One run is ~11 calls against a ~20/day free tier, so a silent burn during
+    'offline' iteration costs a user their whole day's quota."""
+    from lea.config import Settings
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    settings = Settings.from_env()
+    settings.offline = True
+
+    err: list[str] = []
+    monkeypatch.setattr(cli_mod.err_console, "print", lambda m, *a, **k: err.append(str(m)))
+    cli_mod.warn_if_offline_but_live_llm(settings)
+
+    assert err, "an offline run against a live provider must say so"
+    joined = flat(" ".join(err))
+    assert "groq" in joined
+    assert "--provider stub" in joined
+    assert "quota" in joined
+
+
+def test_no_warning_when_the_run_really_is_offline(monkeypatch):
+    from lea.config import Settings
+
+    err: list[str] = []
+    monkeypatch.setattr(cli_mod.err_console, "print", lambda m, *a, **k: err.append(str(m)))
+
+    stub = Settings.from_env()          # keyless -> stub
+    stub.offline = True
+    cli_mod.warn_if_offline_but_live_llm(stub)
+    assert not err, "stub + offline is genuinely offline"
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    online = Settings.from_env()        # live provider but NOT offline: no surprise
+    online.offline = False
+    cli_mod.warn_if_offline_but_live_llm(online)
+    assert not err
+
+
+def test_offline_help_text_is_honest():
+    out = flat(run("enrich", "--help").output)
+    assert "LLM still makes live calls" in out
+    assert "--provider stub" in out
+
+
+def test_doctor_offline_row_is_honest(monkeypatch):
+    monkeypatch.setenv("LEA_OFFLINE", "1")
+    out = flat(run("doctor").output)
+    assert "the LLM is still live unless provider=stub" in out
