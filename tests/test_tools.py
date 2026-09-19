@@ -23,6 +23,9 @@ from lea.tools.fetch import FetchPageTool, extract_meta, extract_text, truncate
 from lea.tools.registry import build_registry, tool_specs
 from lea.tools.search import (
     WebSearchTool,
+    parse_scrappa,
+    parse_scrappa_knowledge_graph,
+    render_knowledge_graph,
     ddg_block_reason,
     parse_ddg_html,
     parse_ddg_lite,
@@ -634,6 +637,352 @@ def test_search_reports_missing_key(settings: Settings):
     obs = WebSearchTool().run({"query": "Ramp"}, settings)
     assert obs.ok is False
     assert "TAVILY_API_KEY" in (obs.error or "")
+
+
+# --------------------------------------------------------------------------
+# Scrappa (Google SERP) — field names verified against the live API
+# --------------------------------------------------------------------------
+
+SCRAPPA_PAYLOAD = {
+    "search_information": {"query_displayed": "Datadog", "organic_results_count": 2},
+    "search_url": "https://www.google.com/search?q=Datadog",
+    "organic_results": [
+        {
+            "position": 1,
+            "title": "Datadog: Cloud Monitoring as a Service",
+            "link": "https://www.datadoghq.com/",
+            # A google.com/goto tracking wrapper: must never reach the fetch tool.
+            "redirect_link": "https://www.google.com/goto?url=CAESXQHrOzAVatex8tCvtsyo",
+            "displayed_link": "https://www.datadoghq.com",
+            "snippet": "Datadog is the monitoring and security platform for cloud applications.",
+            "snippet_highlighted_words": ["Datadog"],
+            "source": "Datadog",
+            "rank_group": 1,
+        },
+        {
+            "position": 2,
+            "title": "Datadog - Wikipedia",
+            "link": "https://en.wikipedia.org/wiki/Datadog",
+            "redirect_link": "https://www.google.com/goto?url=CAESYAHrOzAVuMG1sGucZ1hg",
+            "snippet": "Datadog, Inc. is an American company.",
+        },
+    ],
+    "knowledge_graph": {
+        "title": "Datadog",
+        "type": "Software company",
+        "founded": "June 2010",
+        "headquarters": "United States",
+        "number_of_employees": "5,200 (2024)",
+        "ceo": "Olivier Pomel (2010–)",
+        "founders": "Olivier Pomel, Alexis Lê-Quôc",
+        # Navigation furniture that must not be rendered as a firmographic.
+        "ceo_links": [{"text": "Olivier Pomel", "link": "https://www.google.com/search?q=x"}],
+        "header_images": [],
+        "description": None,
+        "kgmid": None,
+    },
+    "related_searches": [],
+}
+
+# Scrappa returns null, not {}, when Google shows no panel.
+SCRAPPA_NO_PANEL = {
+    "search_url": "https://www.google.com/search?q=acme",
+    "organic_results": [
+        {"position": 1, "title": "Acme", "link": "https://acme.example/", "snippet": "Acme makes things."}
+    ],
+    "knowledge_graph": None,
+}
+
+
+def _scrappa_settings(settings: Settings) -> Settings:
+    settings.search_provider = "scrappa"
+    settings.scrappa_api_key = "test-key"
+    return settings
+
+
+def test_parse_scrappa_prefers_link_over_the_google_redirect_wrapper():
+    results = parse_scrappa(SCRAPPA_PAYLOAD)
+    assert [r.url for r in results] == [
+        "https://www.datadoghq.com/",
+        "https://en.wikipedia.org/wiki/Datadog",
+    ]
+    assert not any("google.com/goto" in r.url for r in results)
+
+
+def test_parse_scrappa_maps_the_shape():
+    first = parse_scrappa(SCRAPPA_PAYLOAD)[0]
+    assert first.title == "Datadog: Cloud Monitoring as a Service"
+    assert first.snippet.startswith("Datadog is the monitoring")
+
+
+def test_parse_scrappa_tolerates_junk_payloads():
+    assert parse_scrappa({}) == []
+    assert parse_scrappa({"organic_results": None}) == []
+    assert parse_scrappa({"organic_results": [None, "nope", 7]}) == []
+
+
+def test_parse_scrappa_knowledge_graph_keeps_firmographics_only():
+    kg = parse_scrappa_knowledge_graph(SCRAPPA_PAYLOAD)
+    assert kg == {
+        "title": "Datadog",
+        "Type": "Software company",
+        "Founded": "June 2010",
+        "Headquarters": "United States",
+        "Employees": "5,200 (2024)",
+        "CEO": "Olivier Pomel (2010–)",
+        "Founders": "Olivier Pomel, Alexis Lê-Quôc",
+    }
+    # link companions, empty lists and nulls are furniture, not facts
+    assert not any("google.com/search" in v for v in kg.values())
+
+
+def test_parse_scrappa_knowledge_graph_is_empty_when_google_shows_no_panel():
+    assert parse_scrappa_knowledge_graph(SCRAPPA_NO_PANEL) == {}
+    assert parse_scrappa_knowledge_graph({}) == {}
+    assert render_knowledge_graph({}) == ""
+    assert render_knowledge_graph({"title": "Acme"}) == "", "a bare title is not a firmographic"
+
+
+@respx.mock
+def test_scrappa_end_to_end_sends_the_key_and_the_query_param(settings: Settings):
+    _scrappa_settings(settings)
+    route = respx.get(lea_search.SCRAPPA_URL).mock(
+        return_value=httpx.Response(200, json=SCRAPPA_PAYLOAD)
+    )
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+
+    assert obs.ok is True
+    request = route.calls[0].request
+    assert request.headers["x-api-key"] == "test-key"
+    # `q` is a 422 from this API; the field is `query`.
+    assert dict(request.url.params) == {"query": "Datadog"}
+    assert obs.data["provider"] == "scrappa"
+    assert obs.data["results"][0]["url"] == "https://www.datadoghq.com/"
+
+
+@respx.mock
+def test_scrappa_folds_the_knowledge_panel_in_above_the_results(settings: Settings):
+    _scrappa_settings(settings)
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(200, json=SCRAPPA_PAYLOAD))
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+
+    assert obs.ok is True
+    panel, _, rest = obs.summary.partition("\n\n")
+    assert panel.startswith("Google knowledge panel for Datadog")
+    assert "Employees: 5,200 (2024)" in panel and "Founded: June 2010" in panel
+    assert rest.lstrip().startswith("1."), "the panel must come before the result list"
+    assert obs.data["knowledge_graph"]["Headquarters"] == "United States"
+    # the panel is a claim, so it has to be attributable
+    assert "https://www.google.com/search?q=Datadog" in obs.sources
+
+
+@respx.mock
+def test_scrappa_without_a_panel_degrades_to_a_plain_result_list(settings: Settings):
+    _scrappa_settings(settings)
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(200, json=SCRAPPA_NO_PANEL))
+    obs = WebSearchTool().run({"query": "acme"}, settings)
+
+    assert obs.ok is True
+    assert "knowledge panel" not in obs.summary
+    assert obs.summary.lstrip().startswith("1.")
+    assert obs.data["knowledge_graph"] == {}
+    assert obs.sources == ["https://acme.example/"], "no panel means no SERP citation"
+
+
+@respx.mock
+def test_scrappa_422_names_the_parameter_mistake(settings: Settings):
+    _scrappa_settings(settings)
+    respx.get(lea_search.SCRAPPA_URL).mock(
+        return_value=httpx.Response(422, json={"message": "The query field is required."})
+    )
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+
+    assert obs.ok is False
+    assert "422" in (obs.error or "") and "'query'" in (obs.error or "")
+
+
+@pytest.mark.parametrize(
+    "status,needle",
+    [(401, "SCRAPPA_API_KEY"), (403, "SCRAPPA_API_KEY"), (429, "credits")],
+)
+@respx.mock
+def test_scrappa_auth_and_quota_errors_are_actionable(settings: Settings, status: int, needle: str):
+    _scrappa_settings(settings)
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(status, text="nope"))
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+    assert obs.ok is False and needle in (obs.error or "")
+
+
+@respx.mock
+def test_scrappa_timeout_is_reported_not_raised(settings: Settings):
+    _scrappa_settings(settings)
+    respx.get(lea_search.SCRAPPA_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+
+    assert isinstance(obs, Observation) and obs.ok is False
+    assert "no response within" in (obs.error or "")
+
+
+def test_scrappa_gets_a_longer_timeout_than_a_page_fetch():
+    """A cold Scrappa call has been seen past 25s; the 15s page budget would cut it."""
+    assert lea_search.SCRAPPA_TIMEOUT_S >= 40
+    assert lea_search.SCRAPPA_TIMEOUT_S > Settings().http_timeout_s * 2
+
+
+@respx.mock
+def test_scrappa_request_uses_its_own_timeout(settings: Settings, monkeypatch):
+    _scrappa_settings(settings)
+    seen: list[object] = []
+    original = lea_http.request
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(lea_search._http, "request", spy)
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(200, json=SCRAPPA_NO_PANEL))
+    WebSearchTool().run({"query": "acme"}, settings)
+
+    assert seen == [lea_search.SCRAPPA_TIMEOUT_S]
+
+
+@respx.mock
+def test_scrappa_retries_once_on_a_server_fault(settings: Settings):
+    """A cold 503 followed by a clean 200 is real behaviour on this API."""
+    _scrappa_settings(settings)
+    route = respx.get(lea_search.SCRAPPA_URL).mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "Service Unavailable"}),
+            httpx.Response(200, json=SCRAPPA_PAYLOAD),
+        ]
+    )
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+
+    assert obs.ok is True and route.call_count == 2
+
+
+@respx.mock
+def test_scrappa_does_not_retry_a_fault_that_took_too_long_to_arrive(
+    settings: Settings, monkeypatch
+):
+    """A 40s 503 retried once is 90s — half the agent's entire run budget.
+
+    This is not hypothetical: it is what blocked the first live run.
+    """
+    _scrappa_settings(settings)
+    clock = iter([0.0, 40.0, 40.0, 80.0])
+    monkeypatch.setattr(lea_search.time, "monotonic", lambda: next(clock))
+    route = respx.get(lea_search.SCRAPPA_URL).mock(
+        return_value=httpx.Response(
+            503, json={"error": "Google Search Advanced is temporarily unable to return a valid SERP."}
+        )
+    )
+    obs = WebSearchTool().run({"query": "Linear issue tracker"}, settings)
+
+    assert route.call_count == 1, "a slow fault was retried; that doubles a 40s wait"
+    assert obs.ok is False and "503" in (obs.error or "")
+
+
+@respx.mock
+def test_scrappa_never_retries_a_successful_but_empty_answer(settings: Settings):
+    """Credits are finite and the balance is invisible: an empty 200 IS the answer.
+
+    Retrying it would spend a second credit to be told the same thing.
+    """
+    _scrappa_settings(settings)
+    route = respx.get(lea_search.SCRAPPA_URL).mock(
+        return_value=httpx.Response(200, json={"organic_results": [], "knowledge_graph": None})
+    )
+    obs = WebSearchTool().run({"query": "zzz no such thing"}, settings)
+
+    assert route.call_count == 1, "an empty result was retried — that costs a credit per try"
+    assert obs.ok is False
+
+
+@respx.mock
+def test_scrappa_burns_at_most_two_credits_even_when_it_keeps_failing(settings: Settings):
+    _scrappa_settings(settings)
+    route = respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(500, text="boom"))
+    WebSearchTool().run({"query": "Datadog"}, settings)
+    assert route.call_count == lea_search.SCRAPPA_SERVER_RETRIES + 1 == 2
+
+
+def test_scrappa_reports_a_missing_key(settings: Settings):
+    settings.search_provider = "scrappa"
+    settings.scrappa_api_key = None
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+    assert obs.ok is False and "SCRAPPA_API_KEY" in (obs.error or "")
+
+
+def test_scrappa_is_chosen_when_its_key_is_set():
+    assert Settings(scrappa_api_key="k").resolved_search() == "scrappa"
+    # ...and it outranks the others rather than merely being available
+    assert Settings(scrappa_api_key="k", tavily_api_key="t").resolved_search() == "scrappa"
+    assert Settings(tavily_api_key="t").resolved_search() == "tavily"
+    # offline and an explicit provider both still win
+    assert Settings(scrappa_api_key="k", offline=True).resolved_search() == "fixture"
+    assert Settings(scrappa_api_key="k", search_provider="duckduckgo").resolved_search() == "duckduckgo"
+
+
+@respx.mock
+def test_scrappa_failure_still_falls_back_to_a_recorded_fixture(settings: Settings):
+    """The degraded path must survive the new provider, not just DuckDuckGo."""
+    _scrappa_settings(settings)
+    _write_fixture(
+        settings,
+        lea_search.scrappa_request_url("Datadog"),
+        None,
+        json.dumps(SCRAPPA_PAYLOAD),
+        headers={"content-type": "application/json"},
+        query="datadog",
+    )
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(500, text="boom"))
+    obs = WebSearchTool().run({"query": "Datadog"}, settings)
+
+    assert obs.ok is True
+    assert obs.data["degraded"] is True and obs.data["served_from"] == "fixture"
+    assert obs.data["results"][0]["url"] == "https://www.datadoghq.com/"
+    # the cached panel is still worth reading
+    assert "Google knowledge panel" in obs.summary
+    assert obs.data["knowledge_graph"]["Founded"] == "June 2010"
+
+
+def test_offline_replays_a_scrappa_fixture_panel_and_all(settings: Settings):
+    settings.offline = True
+    settings.search_provider = "fixture"
+    _write_fixture(
+        settings,
+        lea_search.scrappa_request_url("Datadog"),
+        None,
+        json.dumps(SCRAPPA_PAYLOAD),
+        headers={"content-type": "application/json"},
+        query="datadog",
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        blocked = mock.route().mock(side_effect=AssertionError("network was used offline"))
+        obs = WebSearchTool().run({"query": "Datadog"}, settings)
+        assert not blocked.called
+
+    assert obs.ok is True
+    assert obs.data["results"][0]["url"] == "https://www.datadoghq.com/"
+    assert obs.data["knowledge_graph"]["CEO"].startswith("Olivier Pomel")
+
+
+def test_offline_fuzzy_match_reaches_a_scrappa_fixture(settings: Settings):
+    """An LLM will not reproduce a recorded query verbatim, whoever recorded it."""
+    settings.offline = True
+    settings.search_provider = "fixture"
+    _write_fixture(
+        settings,
+        lea_search.scrappa_request_url("Datadog monitoring company"),
+        None,
+        json.dumps(SCRAPPA_PAYLOAD),
+        headers={"content-type": "application/json"},
+        query="datadog monitoring company",
+    )
+    obs = WebSearchTool().run({"query": "Datadog observability platform overview"}, settings)
+    assert obs.ok is True
+    assert obs.data["results"][0]["url"] == "https://www.datadoghq.com/"
 
 
 # --------------------------------------------------------------------------
@@ -2085,11 +2434,16 @@ def test_strip_inline_assets_keeps_everything_the_tools_read():
     assert lea_http.strip_inline_assets("") == ""
 
 
-def test_every_url_the_search_fixtures_advertise_has_a_page_fixture():
+def test_every_url_the_demo_search_fixtures_advertise_has_a_page_fixture():
     """An offline run must never be told about a URL it then cannot open.
 
     A search result pointing at a page with no fixture reads to the agent as a
     dead source, and to a reviewer as a broken agent.
+
+    Scoped to the curated DuckDuckGo corpus, which IS the Vanta/Ramp offline demo
+    and is small enough to keep whole. Live Scrappa recordings are kept for
+    provider coverage and carry nine arbitrary Google results apiece; fixturing
+    all of those would cost more than the corpus is worth.
     """
     from urllib.parse import unquote
 
@@ -2108,7 +2462,20 @@ def test_every_url_the_search_fixtures_advertise_has_a_page_fixture():
             }
 
     missing = sorted(u for u in advertised if lea_http.canonical_url(u) not in recorded)
-    assert not missing, f"search fixtures advertise URLs with no page fixture: {missing}"
+    assert not missing, f"demo search fixtures advertise URLs with no page fixture: {missing}"
+
+
+def test_search_description_steers_query_shape(settings: Settings):
+    """Query style is the difference between vanta.com and a pesto recipe.
+
+    Measured: 'Vanta funding round' returns the company's own announcement and the
+    CNBC story; 'Vanta SOC 2 compliance automation software company' returns
+    generic pages about security operations centres.
+    """
+    spec = next(s for s in tool_specs(build_registry(settings)) if s["name"] == "web_search")
+    text = spec["description"].lower()
+    assert "short" in text
+    assert "disambiguator" in text or "disambiguate" in text
 
 
 def test_committed_board_fixtures_carry_no_job_descriptions():

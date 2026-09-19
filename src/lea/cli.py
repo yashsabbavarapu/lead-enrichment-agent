@@ -485,6 +485,81 @@ def cached_resolved_model(settings: Settings, provider: str) -> Optional[str]:
         return None
 
 
+# provider -> (Settings attribute holding its key, env var, one-line note).
+# The keyless fallback has no key attribute.
+_SEARCH_PROVIDERS: dict[str, tuple[Optional[str], str, str]] = {
+    "scrappa": ("scrappa_api_key", "SCRAPPA_API_KEY", "Google SERP · 500 free credits/mo"),
+    "tavily": ("tavily_api_key", "TAVILY_API_KEY", "search API built for agents"),
+    "serper": ("serper_api_key", "SERPER_API_KEY", "Google results"),
+    "brave": ("brave_api_key", "BRAVE_API_KEY", "Brave index"),
+    "duckduckgo": (None, "(no key)", "keyless · bot-blocks often"),
+}
+
+
+def search_provider_order() -> list[str]:
+    """The real auto-selection order, asked of Settings instead of duplicated here.
+
+    `doctor` is where someone decides which key to go and get, so a hardcoded
+    "first choice" is exactly the kind of copy that rots the moment the order
+    changes — which is what just happened to Tavily. This probes `resolved_search`
+    with every key set, then removes the winner and asks again. Pure function, no
+    I/O, and it tracks any future reordering for free.
+    """
+    probe = Settings(search_provider="auto", offline=False)
+    pending = {p: attr for p, (attr, _, _) in _SEARCH_PROVIDERS.items() if attr}
+    for attr in pending.values():
+        setattr(probe, attr, "probe")
+
+    order: list[str] = []
+    while pending:
+        winner = probe.resolved_search()
+        if winner not in pending:
+            break
+        order.append(winner)
+        setattr(probe, pending.pop(winner), None)
+
+    fallback = probe.resolved_search()  # whatever wins with no keys at all
+    if fallback not in order:
+        order.append(fallback)
+    # Anything config never picks still gets listed, just last.
+    order.extend(p for p in _SEARCH_PROVIDERS if p not in order)
+    return order
+
+
+def _print_search_providers(settings: Settings) -> None:
+    """Search providers in true priority order, with the active one marked."""
+    active = settings.resolved_search()
+    console.print(Text("search providers — tried in this order", style="bold white"))
+
+    for rank, name in enumerate(search_provider_order(), start=1):
+        attr, env, note = _SEARCH_PROVIDERS.get(name, (None, "(no key)", ""))
+        is_active = name == active
+        if attr is None:
+            status, style = "always", "green"
+        elif getattr(settings, attr, None):
+            status, style = "present", "green"
+        else:
+            status, style = "absent", "yellow"
+
+        line = Text()
+        line.append("  > " if is_active else "    ", style="bold green")
+        line.append(f"{rank}. ", style="dim")
+        line.append(f"{name:<12}", style="bold green" if is_active else "white")
+        line.append(f"{env:<18}", style="dim")
+        line.append(f"{status:<8}", style=style)
+        line.append(note, style="dim")
+        console.print(line)
+
+    if settings.offline:
+        console.print(Text("  (offline: every search is served from fixtures)", style="dim"))
+    elif settings.search_provider != "auto":
+        console.print(Text(
+            f"  LEA_SEARCH_PROVIDER pins this to '{settings.search_provider}', overriding the order.",
+            style="dim",
+        ))
+    console.print(Text("values are never printed, only presence.", style="dim"))
+
+
 def _print_llm_providers(settings: Settings) -> None:
     """The model-provider table: who you could use, who you are using, and why."""
     from lea.config import OPENAI_COMPAT_PRESETS
@@ -680,16 +755,7 @@ def doctor(
     _print_llm_providers(settings)
     console.print()
 
-    keys = Table(show_header=True, header_style="bold dim", title="search keys", title_justify="left")
-    keys.add_column("key", no_wrap=True)
-    keys.add_column("status")
-    keys.add_column("effect", style="dim", overflow="fold")
-    keys.add_row("TAVILY_API_KEY", _mark(bool(settings.tavily_api_key)), "best search quality (first choice)")
-    keys.add_row("SERPER_API_KEY", _mark(bool(settings.serper_api_key)), "Google results (second choice)")
-    keys.add_row("BRAVE_API_KEY", _mark(bool(settings.brave_api_key)), "Brave results (third choice)")
-    keys.add_row("(none)", _mark(True, "always", ""), "DuckDuckGo, keyless — works but gets rate-limited")
-    console.print(keys)
-    console.print("[dim]values are never printed, only presence.[/dim]")
+    _print_search_providers(settings)
     console.print()
 
     b = Table(show_header=True, header_style="bold dim", title="budgets per company", title_justify="left")

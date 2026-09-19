@@ -1147,15 +1147,29 @@ def score_icp(
     if is_unresearched(record, evidence):
         return _non_assessment(record, icp)
 
-    allowed_urls = {str(u).strip() for (u, _t) in evidence if u} | {
+    # Only pages that actually concern this company may be cited. Without this,
+    # a criterion could cite a search result that was never about the target -
+    # the live "Linear" run surfaced J.K. Rowling's site and Jira's API docs.
+    from lea.enrich.extract import relevant_evidence
+
+    usable, irrelevant = relevant_evidence(
+        evidence, record.input or "", record.company_name, record.domain
+    )
+    allowed_urls = {str(u).strip() for (u, _t) in usable if u} | {
         str(u).strip() for u in (record.sources or []) if u
     }
+
+    # A run where most of what we gathered was off-target is a bad run, and the
+    # record should say so rather than present a thin result as a normal one.
+    total_gathered = len({u for u, _t in evidence if u})
+    junk_ratio = (len(irrelevant) / total_gathered) if total_gathered else 0.0
+    poor_research = total_gathered >= 3 and junk_ratio > 0.5
 
     raw_fit: Optional[ICPFit] = None
     try:
         raw_fit, _usage = llm.extract(
             _scoring_prompt(),
-            _build_scoring_context(record, icp, evidence),
+            _build_scoring_context(record, icp, usable),
             ICPFit,
             hint="Score each criterion 0-10 with reasoning and evidence_urls. Do not compute the total.",
         )
@@ -1187,6 +1201,10 @@ def score_icp(
             hits.append(matched)
 
     confidence = _compute_confidence(scored, record)
+    if poor_research:
+        # Most of what search returned was not about this company. Whatever we
+        # concluded rests on a thin slice of a bad run.
+        confidence = round(confidence * 0.6, 2)
 
     # Reconcile the score with how much of it was actually evidenced. A 96.8
     # carrying confidence 0.40 is self-contradictory: it claims near-certainty
@@ -1233,6 +1251,12 @@ def score_icp(
             f"confidence {confidence:.2f} because most criteria were graded without a "
             f"cited source. The assessment below may well be right, but the evidence "
             f"gathered does not yet support a higher score. " + summary
+        )
+    if poor_research:
+        summary += (
+            f" Research quality was poor: {len(irrelevant)} of {total_gathered} pages "
+            f"gathered were not about this company and were discarded, so this rests on "
+            f"a thin slice of the run."
         )
     if hits:
         summary = f"DISQUALIFIED — {hits[0]} " + summary

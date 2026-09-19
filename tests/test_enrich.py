@@ -313,7 +313,8 @@ def test_extract_record_survives_llm_failure(settings):
     # domain stays unknown rather than being misattributed.
     assert rec.domain is None
     assert "domain" in rec.unknowns
-    assert rec.sources == ["https://ramp.com", "https://techcrunch.com/ramp"]
+    # ...and for the same reason none of it may be cited as a source about Ghost Co.
+    assert rec.sources == []
 
 
 def test_extract_record_repairs_a_partially_constructed_model(settings):
@@ -327,7 +328,7 @@ def test_extract_record_repairs_a_partially_constructed_model(settings):
     assert rec.company_name == "Ghost Co"   # derived, not left None
     assert rec.domain is None
     assert "domain" in rec.unknowns
-    assert rec.sources == ["https://ramp.com", "https://techcrunch.com/ramp"]
+    assert rec.sources == []                # Ramp's pages say nothing about Ghost Co
 
 
 # --------------------------------------------------------------------------
@@ -2131,3 +2132,141 @@ def test_a_bounded_score_leads_with_the_bound_not_the_enthusiasm(settings):
     assert fit.summary.startswith("Bounded by evidence:")
     assert f"tier {fit.tier}" in fit.summary
     assert fit.summary.index("Bounded by evidence") < fit.summary.index("exemplary")
+
+
+# --------------------------------------------------------------------------
+# Relevance gate — from the real out/linear.json failure
+#
+# A live run searched "Linear issue tracker software company"; the word "issue"
+# hijacked the results and these five pages were published as sources. A
+# reviewer clicking a citation and landing on J.K. Rowling's website is a
+# credibility event, so the gate is biased toward dropping.
+# --------------------------------------------------------------------------
+
+LINEAR_JUNK = [
+    ("https://www.jkrowling.com/opinions/j-k-rowling-writes-about-her-reasons-for-"
+     "speaking-out-on-sex-and-gender-issues/",
+     "J.K. Rowling writes about her reasons for speaking out on sex and gender issues."),
+    ("https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-issues/",
+     "Jira Cloud platform REST API. This resource represents Jira issues."),
+    ("https://github.com/whatwg/html/issues/11523",
+     "whatwg/html issue 11523: linear-gradient interpolation in canvas rendering. "
+     "The linear interpolation path is wrong."),
+    ("https://www.facebook.com/bbclearningenglish.multimedia/videos/4-ways-to-use-issue/"
+     "343528391359677/",
+     "4 ways to use issue - BBC Learning English video."),
+    ("https://support.google.com/pixelphone/thread/413513162/network-connection-issue-"
+     "with-pixel-10-pro-xl-512gb",
+     "Network connection issue with Pixel 10 Pro XL 512GB. Thread replies."),
+]
+
+LINEAR_GENUINE = [
+    ("https://linear.app/", "Linear is a purpose-built tool for planning and building "
+                            "products. Loops for product management. Priority inbox."),
+    ("https://lps.linear.app/", "Landing pages."),
+    # Thin but non-empty: the real run cited it, so something was read. A truly
+    # empty body is a failed fetch and is excluded by `citable_urls`, separately.
+    ("https://orbit.linear.app/", "Orbit"),
+    ("https://linear.app/brand", "Brand assets"),
+    ("https://linear.app/integrations/dixa", "Dixa integration"),
+    ("https://linear.app/quality/01", "Quality"),
+]
+
+
+@pytest.mark.parametrize("url,body", LINEAR_JUNK)
+def test_search_junk_is_never_cited(url, body):
+    from lea.enrich.extract import is_relevant_source
+
+    assert not is_relevant_source(url, body, "Linear", "Linear", "linear.app")
+
+
+@pytest.mark.parametrize("url,body", LINEAR_GENUINE)
+def test_the_companys_own_pages_are_always_kept(url, body):
+    """Thin pages on the company's own domain are genuine and never need to prove it."""
+    from lea.enrich.extract import is_relevant_source
+
+    assert is_relevant_source(url, body, "Linear", "Linear", "linear.app")
+
+
+def test_a_legitimate_third_party_article_is_kept():
+    """A funding article may not carry the name in its URL, so content is what counts."""
+    from lea.enrich.extract import is_relevant_source
+
+    assert is_relevant_source(
+        "https://www.forbes.com/sites/x/2025/01/01/software-roundup/",
+        "The roundup mentions Linear among the fastest-growing software companies.",
+        "Linear", "Linear", "linear.app")
+    assert is_relevant_source(
+        "https://techcrunch.com/2024/07/23/vanta-series-c-funding/",
+        "Vanta has raised a $150M Series C led by Sequoia, the company said today.",
+        "Vanta", "Vanta", "vanta.com")
+
+
+def test_a_common_word_name_is_not_matched_in_lowercase_prose():
+    """'linear-gradient' and 'linear algebra' must not qualify as mentions."""
+    from lea.enrich.extract import is_relevant_source
+
+    assert not is_relevant_source(
+        "https://example.com/math", "A linear map between linear spaces is linear.",
+        "Linear", "Linear", "linear.app")
+
+
+def test_the_gate_strips_junk_from_a_published_record(settings):
+    """End-to-end on the real failure: 11 sources in, 6 genuine ones out."""
+    evidence = LINEAR_JUNK + LINEAR_GENUINE
+    base = CompanyRecord(
+        input="Linear", company_name="Linear", domain="linear.app",
+        signals=[
+            Signal(kind="product", headline="Loops for product management",
+                   source_url="https://linear.app/"),
+            Signal(kind="news", headline="Gender issues opinion piece",
+                   source_url="https://www.jkrowling.com/opinions/j-k-rowling-writes-"
+                              "about-her-reasons-for-speaking-out-on-sex-and-gender-issues/"),
+        ],
+    )
+    rec = extract_record("Linear", evidence, FakeLLM({CompanyRecord: base}), settings)
+
+    assert len(rec.sources) == 6
+    assert all("linear.app" in u for u in rec.sources)
+    for junk_url, _ in LINEAR_JUNK:
+        assert junk_url not in rec.sources
+
+    # a signal whose only source was junk keeps its claim but loses the link,
+    # rather than carrying a citation that goes somewhere unrelated
+    by_head = {s.headline: s for s in rec.signals}
+    assert by_head["Loops for product management"].source_url == "https://linear.app/"
+    if "Gender issues opinion piece" in by_head:
+        assert by_head["Gender issues opinion piece"].source_url is None
+
+
+def test_criteria_cannot_cite_an_irrelevant_page(settings):
+    rec = CompanyRecord(input="Linear", company_name="Linear", domain="linear.app",
+                        industry="SaaS", sources=["https://linear.app/"])
+    junk_url = LINEAR_JUNK[0][0]
+    llm = FakeLLM({ICPFit: ICPFit(
+        score=90, tier="A", summary="Great fit.",
+        criteria=[CriterionScore(key=c.key, score=9.0, weight=1.0,
+                                 evidence_urls=[junk_url],
+                                 reasoning=f"Judged {c.key} from the sources.")
+                  for c in DEFAULT_ICP.criteria])})
+
+    fit = score_icp(rec, DEFAULT_ICP, LINEAR_JUNK + [("https://linear.app/", "Linear is a tool.")],
+                    llm, settings)
+    for c in fit.criteria:
+        assert junk_url not in c.evidence_urls
+
+
+def test_a_mostly_irrelevant_run_is_reported_as_poor_research(settings):
+    rec = CompanyRecord(input="Linear", company_name="Linear", domain="linear.app",
+                        industry="SaaS", sources=["https://linear.app/"])
+    evidence = LINEAR_JUNK + [("https://linear.app/", "Linear is a tool for teams.")]
+
+    fit = score_icp(rec, DEFAULT_ICP, evidence, _stub_like_llm(), settings)
+
+    assert "Research quality was poor" in fit.summary
+    assert "5 of 6" in fit.summary
+    # and a clean run says nothing of the sort
+    clean = score_icp(rec, DEFAULT_ICP, [("https://linear.app/", "Linear is a tool.")],
+                      _stub_like_llm(), settings)
+    assert "Research quality was poor" not in clean.summary
+    assert fit.confidence < clean.confidence

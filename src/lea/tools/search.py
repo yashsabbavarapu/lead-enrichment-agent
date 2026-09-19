@@ -21,6 +21,53 @@ DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
 TAVILY_URL = "https://api.tavily.com/search"
 SERPER_URL = "https://google.serper.dev/search"
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
+SCRAPPA_URL = "https://scrappa.co/api/search"
+
+# --- Scrappa --------------------------------------------------------------
+# Scrappa proxies a live Google SERP, so it is slow by nature: 5-7s warm, and a
+# cold start has been measured past 25s. settings.http_timeout_s is 15s because
+# it is sized for page fetches, and using it here would guillotine exactly the
+# calls we most want to wait for. Raising the global default instead would make
+# every page fetch sluggish, so this provider carries its own budget.
+SCRAPPA_TIMEOUT_S = 45.0
+
+# Credits are finite — 500/month, one per request — and nothing in the response
+# headers exposes the remaining balance, so retries have to be spent carefully.
+# A 200 carrying zero results IS an answer; asking again buys the same answer for
+# another credit, so that case is never retried. A 5xx or a timeout returned no
+# answer at all (a cold 503 followed immediately by a clean 200 is a thing that
+# happens here), and that alone is worth exactly one more try.
+SCRAPPA_SERVER_RETRIES = 1
+SCRAPPA_RETRY_BACKOFF_S = 2.0
+
+# ...but only when the fault arrived quickly. Measured: a healthy call answers in
+# 5-9s, while the unhealthy one ("Google Search Advanced is temporarily unable to
+# return a valid SERP") takes ~40s to admit it. Retrying a fault that slow turned
+# a single search step into 91s and consumed an entire 180s run budget in two
+# steps. A slow fault will be slow again; failing over to the cache beats waiting.
+SCRAPPA_FAST_FAULT_S = 12.0
+
+# Google's panel keys, in the order they are worth reading, mapped to labels for
+# the observation text. Everything else the panel carries (*_links companions,
+# image blobs, profile lists) is navigation furniture, not firmographics.
+SCRAPPA_KG_FIELDS: tuple[tuple[str, str], ...] = (
+    ("type", "Type"),
+    ("entity_type", "Type"),
+    ("description", "Description"),
+    ("founded", "Founded"),
+    ("headquarters", "Headquarters"),
+    ("number_of_employees", "Employees"),
+    ("revenue", "Revenue"),
+    ("industry", "Industry"),
+    ("ceo", "CEO"),
+    ("cto", "CTO"),
+    ("founders", "Founders"),
+    ("parent_organization", "Parent organization"),
+    ("subsidiaries", "Subsidiaries"),
+    ("traded_as", "Traded as"),
+    ("stock_price", "Stock price"),
+    ("website", "Website"),
+)
 
 # --- DuckDuckGo anti-bot handling ----------------------------------------
 # DDG trips a bot heuristic after a handful of quick queries. The trip is usually
@@ -291,6 +338,73 @@ def parse_serper(payload: dict[str, Any]) -> list[SearchResult]:
     return out
 
 
+def parse_scrappa(payload: dict[str, Any]) -> list[SearchResult]:
+    """Map Scrappa's `organic_results` onto the common shape.
+
+    `link` is the destination; `redirect_link` is a google.com/goto tracking
+    wrapper. Handing the wrapper downstream would have the fetch tool retrieving
+    Google instead of the company — the same trap as DuckDuckGo's `uddg`
+    redirector, arriving through a different door.
+    """
+    out: list[SearchResult] = []
+    for item in (payload or {}).get("organic_results") or []:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            SearchResult(
+                title=_clean(item.get("title")),
+                url=(item.get("link") or "").strip(),
+                snippet=_clean(item.get("snippet")),
+            )
+        )
+    return out
+
+
+def _kg_value(value: Any) -> str:
+    """Flatten one knowledge-panel value to text, or '' if it is not worth text."""
+    if isinstance(value, str):
+        return _clean(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, dict):
+        return _clean(str(value.get("name") or value.get("text") or ""))
+    if isinstance(value, list):
+        parts = [_kg_value(v) for v in value[:6]]
+        return ", ".join(p for p in parts if p)
+    return ""
+
+
+def parse_scrappa_knowledge_graph(payload: dict[str, Any]) -> dict[str, str]:
+    """The firmographic fields out of Google's knowledge panel, when there is one.
+
+    Genuinely absent much of the time — Scrappa returns `null`, not an empty dict —
+    and nothing here invents a field that Google did not show.
+    """
+    kg = (payload or {}).get("knowledge_graph")
+    if not isinstance(kg, dict):
+        return {}
+    out: dict[str, str] = {}
+    title = _kg_value(kg.get("title"))
+    if title:
+        out["title"] = title
+    for key, label in SCRAPPA_KG_FIELDS:
+        if label in out:
+            continue  # first spelling wins (type before entity_type)
+        text = _kg_value(kg.get(key))
+        if text:
+            out[label] = text
+    return out
+
+
+def render_knowledge_graph(kg: dict[str, str]) -> str:
+    """One compact block, placed above the results so extraction reads it first."""
+    fields = [(k, v) for k, v in kg.items() if k != "title"]
+    if not fields:
+        return ""
+    who = kg.get("title") or "this company"
+    return f"Google knowledge panel for {who} — " + "; ".join(f"{k}: {v}" for k, v in fields)
+
+
 def parse_brave(payload: dict[str, Any]) -> list[SearchResult]:
     out: list[SearchResult] = []
     web = (payload or {}).get("web") or {}
@@ -316,8 +430,18 @@ class WebSearchTool:
     name = ToolName.WEB_SEARCH
     description = (
         "Search the web for a company, its funding, hiring, news or people. "
-        "Returns a numbered list of titles, URLs and snippets. Use targeted queries "
-        "(e.g. 'Ramp Series D funding 2024') rather than bare company names."
+        "Returns a numbered list of titles, URLs and snippets, and — when the "
+        "provider is a Google SERP and the company is well known — a knowledge "
+        "panel stating founded date, headquarters, headcount and CEO outright.\n"
+        "Keep queries SHORT and anchored on the company name plus at most two "
+        "words for the angle: 'Vanta funding round', 'Ramp headquarters', "
+        "'Datadog'. Measured behaviour, not style advice — a long keyword-stuffed "
+        "query ('Vanta SOC 2 compliance automation software company') loses the "
+        "brand anchor and comes back with generic topic pages about SOC teams, "
+        "while 'Vanta funding round' returns the company's own announcement, the "
+        "press release and the CNBC story. If a company name is also a common "
+        "word (Ramp, Linear, Front), add ONE disambiguator — 'Ramp fintech', "
+        "'Linear issue tracker' — or search its domain instead."
     )
     args_schema: dict[str, Any] = {
         "query": {"type": "string", "required": True, "description": "Search query."},
@@ -340,7 +464,15 @@ class WebSearchTool:
             num = max(1, min(num, 10))
             provider = settings.resolved_search()
 
-            if provider == "duckduckgo":
+            # Side channel for anything a provider returns that is richer than a
+            # list of links. Only Scrappa fills it (Google's knowledge panel), and
+            # keeping it out of the (results, error) tuple leaves every other
+            # provider's signature alone.
+            extras: dict[str, Any] = {}
+
+            if provider == "scrappa":
+                results, err = self._scrappa(query, num, settings, extras)
+            elif provider == "duckduckgo":
                 results, err = self._duckduckgo(query, num, settings)
             elif provider == "tavily":
                 results, err = self._tavily(query, num, settings)
@@ -349,7 +481,7 @@ class WebSearchTool:
             elif provider == "brave":
                 results, err = self._brave(query, num, settings)
             elif provider == "fixture":
-                results, err = self._fixture(query, num, settings)
+                results, err = self._fixture(query, num, settings, extras)
             else:
                 return self._fail(f"unknown search provider '{provider}'", started, {"provider": provider})
 
@@ -359,7 +491,8 @@ class WebSearchTool:
             # results beat no results. A blocked demo with a populated cache should
             # still produce a record.
             if (err or not results) and provider != "fixture":
-                cached, _ = self._fixture(query, num, settings)
+                cached_extras: dict[str, Any] = {}
+                cached, _ = self._fixture(query, num, settings, cached_extras)
                 cached = _dedupe(cached, num)
                 if cached:
                     reason = err or f"{provider} returned no results"
@@ -367,10 +500,13 @@ class WebSearchTool:
                         f"[cached] {provider} unavailable ({reason}); "
                         f"served {len(cached)} result(s) from a recorded fixture."
                     )
+                    body, kg, kg_source = _with_knowledge_graph(
+                        _render(cached, settings.max_snippet_chars), cached_extras
+                    )
                     return Observation(
                         tool=self.name,
                         ok=True,
-                        summary=note + "\n" + _render(cached, settings.max_snippet_chars),
+                        summary=note + "\n" + body,
                         data={
                             "provider": provider,
                             "query": query,
@@ -378,8 +514,9 @@ class WebSearchTool:
                             "degraded": True,
                             "degraded_reason": reason,
                             "served_from": "fixture",
+                            "knowledge_graph": kg,
                         },
-                        sources=[r.url for r in cached],
+                        sources=[r.url for r in cached] + kg_source,
                         latency_ms=_ms(started),
                     )
 
@@ -393,17 +530,21 @@ class WebSearchTool:
                 )
 
             urls = [r.url for r in results]
+            body, kg, kg_source = _with_knowledge_graph(
+                _render(results, settings.max_snippet_chars), extras
+            )
             return Observation(
                 tool=self.name,
                 ok=True,
-                summary=_render(results, settings.max_snippet_chars),
+                summary=body,
                 data={
                     "provider": provider,
                     "query": query,
                     "results": [r.model_dump() for r in results],
                     "degraded": False,
+                    "knowledge_graph": kg,
                 },
-                sources=urls,
+                sources=urls + kg_source,
                 latency_ms=_ms(started),
             )
         except Exception as exc:  # last-resort net: the loop must never see a traceback
@@ -492,6 +633,48 @@ class WebSearchTool:
             f"{DDG_MAX_ATTEMPTS} attempts across both endpoints — {BLOCKED_ADVICE}"
         )
 
+    def _scrappa(
+        self, query: str, num: int, settings: Settings, extras: dict[str, Any]
+    ) -> tuple[list[SearchResult], Optional[str]]:
+        """Google SERP via Scrappa. One credit per call — see SCRAPPA_SERVER_RETRIES."""
+        if not settings.scrappa_api_key and not settings.offline:
+            return [], "scrappa selected but SCRAPPA_API_KEY is not set"
+
+        res = None
+        for attempt in range(SCRAPPA_SERVER_RETRIES + 1):
+            attempt_started = time.monotonic()
+            res = _http.request(
+                settings,
+                "GET",
+                SCRAPPA_URL,
+                # The API rejects `q` with a 422; the field is named `query`.
+                params={"query": query},
+                headers={
+                    "x-api-key": settings.scrappa_api_key or "",
+                    "Accept": "application/json",
+                },
+                timeout=SCRAPPA_TIMEOUT_S,
+            )
+            server_fault = res.timed_out or res.status >= 500
+            if not server_fault or settings.offline or attempt == SCRAPPA_SERVER_RETRIES:
+                break
+            if time.monotonic() - attempt_started > SCRAPPA_FAST_FAULT_S:
+                break  # a slow fault: give the run its time back, not another wait
+            _sleep(_jittered(SCRAPPA_RETRY_BACKOFF_S))
+
+        if res is None:  # unreachable; keeps the type checker and the reader honest
+            return [], "scrappa: no response"
+        if not res.ok:
+            return [], _scrappa_error(res)
+
+        payload = _json(res.text)
+        if payload is None:
+            return [], "scrappa: response was not JSON"
+
+        extras["knowledge_graph"] = parse_scrappa_knowledge_graph(payload)
+        extras["search_url"] = _clean(payload.get("search_url"))
+        return parse_scrappa(payload), None
+
     def _tavily(self, query: str, num: int, settings: Settings) -> tuple[list[SearchResult], Optional[str]]:
         if not settings.tavily_api_key and not settings.offline:
             return [], "tavily selected but TAVILY_API_KEY is not set"
@@ -553,9 +736,17 @@ class WebSearchTool:
             return [], "brave: response was not JSON"
         return parse_brave(payload), None
 
-    def _fixture(self, query: str, num: int, settings: Settings) -> tuple[list[SearchResult], Optional[str]]:
+    def _fixture(
+        self,
+        query: str,
+        num: int,
+        settings: Settings,
+        extras: Optional[dict[str, Any]] = None,
+    ) -> tuple[list[SearchResult], Optional[str]]:
         """Fixture-only mode: try every recorded search endpoint for this query."""
+        extras = extras if extras is not None else {}
         for url, body, parser in (
+            (scrappa_request_url(query), None, "scrappa"),
             (DDG_HTML_URL, {"q": query, "kl": "us-en"}, "ddg_html"),
             (DDG_HTML_URL, {"q": query}, "ddg_html"),
             (DDG_LITE_URL, {"q": query}, "ddg_lite"),
@@ -565,14 +756,7 @@ class WebSearchTool:
             hit = _http.read_fixture(settings, url, body)
             if hit is None or not hit.text:
                 continue
-            if parser == "ddg_html":
-                results = parse_ddg_html(hit.text)
-            elif parser == "ddg_lite":
-                results = parse_ddg_lite(hit.text)
-            elif parser == "tavily":
-                results = parse_tavily(_json(hit.text) or {})
-            else:
-                results = parse_serper(_json(hit.text) or {})
+            results = _parse_recorded(hit.text, parser, extras)
             if results:
                 return results, None
 
@@ -582,7 +766,7 @@ class WebSearchTool:
         near = _best_recorded_search(settings, query)
         if near is not None:
             text, kind = near
-            results = parse_ddg_lite(text) if kind == "ddg_lite" else parse_ddg_html(text)
+            results = _parse_recorded(text, kind, extras)
             if results:
                 return results, None
         return [], f"fixture: no recorded search results for '{query}'"
@@ -652,8 +836,41 @@ def _match_score(wanted: set[str], recorded: set[str]) -> float:
     return score if score >= _FIXTURE_MATCH_THRESHOLD else 0.0
 
 
+def scrappa_request_url(query: str) -> str:
+    """The exact URL `_http.request` will build, so fixture keys line up."""
+    from urllib.parse import urlencode
+
+    return f"{SCRAPPA_URL}?{urlencode({'query': query})}"
+
+
+def _parse_recorded(text: str, kind: str, extras: dict[str, Any]) -> list[SearchResult]:
+    """Replay one recorded search body with the parser that matches its provider."""
+    if kind == "scrappa":
+        payload = _json(text) or {}
+        extras["knowledge_graph"] = parse_scrappa_knowledge_graph(payload)
+        extras["search_url"] = _clean(payload.get("search_url"))
+        return parse_scrappa(payload)
+    if kind == "ddg_lite":
+        return parse_ddg_lite(text)
+    if kind == "tavily":
+        return parse_tavily(_json(text) or {})
+    if kind == "serper":
+        return parse_serper(_json(text) or {})
+    return parse_ddg_html(text)
+
+
+def _recorded_kind(url: str) -> Optional[str]:
+    if url.startswith(SCRAPPA_URL):
+        return "scrappa"
+    if url == DDG_LITE_URL:
+        return "ddg_lite"
+    if url == DDG_HTML_URL:
+        return "ddg_html"
+    return None
+
+
 def _best_recorded_search(settings: Settings, query: str) -> Optional[tuple[str, str]]:
-    """Closest recorded DDG search for `query`, as (html_text, parser_kind)."""
+    """Closest recorded search for `query`, as (body_text, parser_kind)."""
     import json as _json_mod
     from pathlib import Path as _Path
 
@@ -671,12 +888,8 @@ def _best_recorded_search(settings: Settings, query: str) -> Optional[tuple[str,
             raw = _json_mod.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        url = raw.get("url", "")
-        if url == DDG_LITE_URL:
-            kind = "ddg_lite"
-        elif url == DDG_HTML_URL:
-            kind = "ddg_html"
-        else:
+        kind = _recorded_kind(raw.get("url", ""))
+        if kind is None:
             continue
         recorded = _tokens(raw.get("query", ""))
         if not recorded:
@@ -686,6 +899,45 @@ def _best_recorded_search(settings: Settings, query: str) -> Optional[tuple[str,
             best = (score, raw.get("text", ""), kind)
 
     return (best[1], best[2]) if best else None
+
+
+def _scrappa_error(res: "_http.HttpResult") -> str:
+    """Phrase a Scrappa failure so the next step is obvious from the message."""
+    detail = _clean((res.text or "")[:200])
+    if res.timed_out:
+        return f"scrappa: no response within {SCRAPPA_TIMEOUT_S:.0f}s"
+    if res.status in (401, 403):
+        return f"scrappa: key rejected (HTTP {res.status}) — check SCRAPPA_API_KEY"
+    if res.status == 422:
+        return (
+            f"scrappa: HTTP 422 — the API rejected the request parameters "
+            f"(the search term must be sent as 'query', not 'q'){f': {detail}' if detail else ''}"
+        )
+    if res.status == 429:
+        return "scrappa: HTTP 429 — rate limited or out of monthly credits"
+    if res.status >= 500:
+        return f"scrappa: HTTP {res.status} upstream error{f' — {detail}' if detail else ''}"
+    return f"scrappa: {res.error or 'request failed'}"
+
+
+def _with_knowledge_graph(
+    body: str, extras: dict[str, Any]
+) -> tuple[str, dict[str, str], list[str]]:
+    """Fold Google's panel above the result list, and make it citable.
+
+    Returns (summary, knowledge_graph, extra_sources). The panel goes FIRST: it is
+    the only part of a SERP that states founded date, HQ, headcount or CEO
+    outright, and burying it under nine snippets is how extraction misses it.
+    """
+    kg = extras.get("knowledge_graph") or {}
+    if not isinstance(kg, dict) or not kg:
+        return body, {}, []
+    rendered = render_knowledge_graph(kg)
+    if not rendered:
+        return body, {}, []
+    search_url = extras.get("search_url") or ""
+    sources = [search_url] if search_url.startswith(("http://", "https://")) else []
+    return f"{rendered}\n\n{body}" if body else rendered, kg, sources
 
 
 def _host(url: str) -> str:

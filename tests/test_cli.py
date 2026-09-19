@@ -22,7 +22,8 @@ _PROVIDER_ENV = ["ANTHROPIC_API_KEY", "LEA_LLM_PROVIDER", "LEA_MODEL", "LEA_LLM_
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """A keyless machine, and no .env bleeding in from the repo."""
-    for name in _PROVIDER_ENV + ["TAVILY_API_KEY", "SERPER_API_KEY", "BRAVE_API_KEY", "LEA_OFFLINE"]:
+    for name in _PROVIDER_ENV + ["SCRAPPA_API_KEY", "TAVILY_API_KEY", "SERPER_API_KEY",
+                                 "BRAVE_API_KEY", "LEA_OFFLINE", "LEA_SEARCH_PROVIDER"]:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(cli_mod, "load_dotenv", lambda *a, **k: 0)
     # _MODEL_RESOLUTION is process-global and would leak between tests
@@ -349,3 +350,72 @@ def test_doctor_offline_row_is_honest(monkeypatch):
     monkeypatch.setenv("LEA_OFFLINE", "1")
     out = flat(run("doctor").output)
     assert "the LLM is still live unless provider=stub" in out
+
+
+# --------------------------------------------------------------------------
+# Search providers: the order must be read from config, not retyped
+# --------------------------------------------------------------------------
+
+
+def test_search_order_is_derived_from_config_not_hardcoded():
+    """Tavily was 'first choice' in doctor long after Scrappa took the slot. The
+    order is now asked of Settings.resolved_search, so it cannot go stale again."""
+    from lea.config import Settings
+
+    order = cli_mod.search_provider_order()
+    assert order[0] == "scrappa"
+    assert order[-1] == "duckduckgo", "the keyless fallback is always last"
+    assert set(order) == set(cli_mod._SEARCH_PROVIDERS)
+
+    # every prefix of the order must match what config actually picks
+    probe = Settings(search_provider="auto", offline=False)
+    for name in order:
+        attr, _, _ = cli_mod._SEARCH_PROVIDERS[name]
+        if attr is None:
+            continue
+        setattr(probe, attr, "k")
+        assert probe.resolved_search() == name, f"{name} should win once its key is set"
+        setattr(probe, attr, None)
+
+
+def test_doctor_lists_search_providers_in_real_priority_order():
+    out = flat(run("doctor").output)
+
+    assert "search providers — tried in this order" in out
+    # ranked, with Scrappa first and its free credit pool named
+    assert "1. scrappa" in out
+    assert "SCRAPPA_API_KEY" in out
+    assert "500 free credits/mo" in out
+    assert "2. tavily" in out and "5. duckduckgo" in out
+    # the stale hardcoded copy is gone
+    assert "best search quality (first choice)" not in out
+    assert "second choice" not in out and "third choice" not in out
+    assert "values are never printed, only presence." in out
+
+
+def test_doctor_marks_the_active_search_provider(monkeypatch):
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-scrappa-secret")
+    out = flat(run("doctor").output)
+    assert "> 1. scrappa" in out
+    assert "sk-scrappa-secret" not in out, "key values are never printed"
+    assert "search provider scrappa" in out or "scrappa" in out
+
+    # with only Brave set, Brave is active but still ranked fourth
+    monkeypatch.delenv("SCRAPPA_API_KEY")
+    monkeypatch.setenv("BRAVE_API_KEY", "b")
+    out = flat(run("doctor").output)
+    assert "> 4. brave" in out
+    assert "1. scrappa" in out and "absent" in out
+
+
+def test_doctor_notes_a_pinned_search_provider(monkeypatch):
+    monkeypatch.setenv("LEA_SEARCH_PROVIDER", "serper")
+    out = flat(run("doctor").output)
+    assert "overriding the order" in out
+    assert "> 3. serper" in out
+
+
+def test_doctor_notes_fixtures_when_offline(monkeypatch):
+    monkeypatch.setenv("LEA_OFFLINE", "1")
+    out = flat(run("doctor").output)
+    assert "every search is served from fixtures" in out

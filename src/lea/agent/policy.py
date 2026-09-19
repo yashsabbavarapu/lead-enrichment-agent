@@ -720,12 +720,76 @@ def llm_failure_stop_reason(details: list[str], provider: str = "", model: str =
     return f"{STOP_ERROR}: every LLM call to {where} failed ({first})."
 
 
+# Error text meaning "the call itself was malformed", not "the provider failed".
+_BAD_CALL_MARKERS = (
+    "missing required", "required arg", "missing arg", "no query", "empty query",
+    "invalid arg", "unknown arg", "must be a string", "is required", "missing '",
+)
+
+
+def looks_like_bad_tool_call(text: str) -> bool:
+    return any(m in (text or "").lower() for m in _BAD_CALL_MARKERS)
+
+
+def required_args(schema: Any) -> list[str]:
+    """Argument names a tool declares as required.
+
+    Handles both shapes seen in the wild: the flat one this project's tools use
+    (`{"query": {"required": True, ...}}`) and JSON-schema's
+    (`{"properties": {...}, "required": [...]}`). Anything it cannot read yields an
+    empty list, which lets the call through — a guard that misfires on an
+    unfamiliar schema would block legitimate work, which is the worse failure.
+    """
+    if not isinstance(schema, dict) or not schema:
+        return []
+
+    props = schema.get("properties")
+    req = schema.get("required")
+    if isinstance(props, dict):
+        if isinstance(req, (list, tuple)):
+            return [str(r) for r in req if r]
+        return [k for k, v in props.items() if isinstance(v, dict) and v.get("required") is True]
+
+    return [k for k, v in schema.items() if isinstance(v, dict) and v.get("required") is True]
+
+
+def missing_required_args(schema: Any, args: Optional[dict[str, Any]]) -> list[str]:
+    """Declared-required arguments this call left out or left blank."""
+    supplied = args or {}
+    missing: list[str] = []
+    for name in required_args(schema):
+        value = supplied.get(name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.append(name)
+    return missing
+
+
+def bad_call_hint(missing: Iterable[str] = ()) -> str:
+    """The nudge for a call the model got wrong, naming the arguments to supply."""
+    names = [m for m in missing if m]
+    which = f" Required argument(s): {', '.join(names)}." if names else ""
+    return (
+        " — this is a malformed call, not a provider problem: retrying it unchanged will "
+        f"fail identically.{which} Re-issue the call with every required argument filled "
+        "in, using the names in the tool's schema."
+    )
+
+
 def transient_failure_hint(step: TraceStep) -> str:
     """Appended to a failed step's observation so the model reacts to the *specific*
     error instead of treating any failure as a dead end.
 
-    Deliberately route-agnostic: it names no query, site or order of operations.
+    The distinction that matters: a malformed call and a blocked provider look the
+    same in a trace but need opposite responses. Telling a model that its
+    argument-less `web_search()` was "usually transient — retry with different
+    wording" is actively misleading; there was no wording, and retrying changes
+    nothing until it supplies the argument.
+
+    Deliberately route-agnostic otherwise: it names no query, site or ordering.
     """
+    if looks_like_bad_tool_call(step.error or step.observation or ""):
+        return bad_call_hint()
+
     if step.tool == ToolName.WEB_SEARCH:
         return (
             " — this is usually transient (rate limit or blocked provider), not a fact about "

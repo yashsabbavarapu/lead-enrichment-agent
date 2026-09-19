@@ -28,11 +28,13 @@ from lea.agent.policy import (
     derive_gaps,
     gap_labels,
     MODELS_HINT,
+    bad_call_hint,
     is_redundant,
     learned_anything,
     llm_error_detail,
     llm_failure_stop_reason,
     looks_like_stale_model,
+    missing_required_args,
     premature_finish_reason,
     search_without_reading_reason,
     should_stop,
@@ -601,6 +603,32 @@ def run_agent(
                     thought=action.thought,
                     observation=f"tool '{action.tool.value}' is not available; choose from the offered tools.",
                     error="unknown tool",
+                    tokens_in=tokens_in, tokens_out=tokens_out,
+                ),
+                trace, on_step,
+            )
+            continue
+
+        # Schema guard: catch a malformed call before it reaches the tool. A call
+        # missing a required argument cannot succeed, so spending a Scrappa credit
+        # or an HTTP round trip to discover that is pure waste — and the loop can
+        # say exactly which argument is missing, which the tool's own error string
+        # generally cannot. Reports, never repairs: inventing the query from the
+        # target would hide the mistake and teach the model nothing.
+        missing = missing_required_args(getattr(tool, "args_schema", None), action.args)
+        if missing:
+            budget.consume(None)  # costs a step, not a search/fetch/board credit
+            supplied = sorted(action.args or {}) or ["(none)"]
+            _emit(
+                TraceStep(
+                    n=len(trace) + 1, tool=action.tool, args=action.args, ok=False,
+                    thought=action.thought,
+                    observation=(
+                        f"{action.tool.value} was called without required argument(s) "
+                        f"{', '.join(missing)}; you supplied: {', '.join(supplied)}"
+                        + bad_call_hint(missing)
+                    ),
+                    error=f"missing required argument(s): {', '.join(missing)}",
                     tokens_in=tokens_in, tokens_out=tokens_out,
                 ),
                 trace, on_step,

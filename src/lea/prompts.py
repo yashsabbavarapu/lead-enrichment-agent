@@ -10,6 +10,7 @@ state they render, because they are called from a loop that may be mid-failure.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 __all__ = [
@@ -54,6 +55,44 @@ headcount / the funding details", that is a FETCH instruction, not a search inst
 open the company's /about or /company page, or open the article you already found.
 - A run that ends with more searches than page reads has almost certainly failed: it \
 collected links and never opened them.
+
+WRITING A SEARCH QUERY — short, and anchored on the brand
+Search engines collapse on long, keyword-stuffed queries. Adding descriptive words to \
+"help" does the opposite: it dilutes the brand anchor, and you get pages about the WORDS \
+instead of pages about the COMPANY. Measured against this project's own search provider:
+
+  "Datadog"                                    -> datadog.com + knowledge panel      GOOD
+  "vanta funding round"                        -> Vanta's release, BusinessWire, CNBC GOOD
+  "ramp corporate cards company"               -> gift cards, a card validator, Zazzle JUNK
+  "ramp careers hiring"                        -> a pesto recipe, a drowning report    JUNK
+  "vanta careers hiring"                       -> Brunswick, Coca-Cola, GAO careers    JUNK
+  "Vanta SOC 2 compliance automation software" -> generic SOC 2 pages, no Vanta        JUNK
+  "Linear issue tracker software company"      -> J.K. Rowling, Jira docs, a GitHub bug JUNK
+
+- Two to four words. If a query runs longer than four, delete the adjectives first.
+- Anchor on the NAME or the DOMAIN and almost nothing else: "<name> funding", not \
+"<name> latest funding round news 2025".
+- Never add category words — software, company, platform, tool, app, startup, solution. \
+Those are exactly what the engine matches when the brand anchor is weak.
+
+WHEN THE COMPANY NAME IS AN ORDINARY WORD — this is where runs go wrong
+Linear, Ramp, Notion, Figma, Arc, Lattice, Stripe and many others are everyday words, and \
+the engine will cheerfully return the word rather than the company.
+- Anchor on the DOMAIN instead: "linear.app", "ramp.com".
+- For anything on the company's own site, use a site: query. "site:linear.app about" and \
+"site:ramp.com careers" beat any descriptive phrasing, and are the most reliable way to \
+reach firmographics.
+- Never pair an ordinary-word name with generic category words. "Linear issue tracker \
+software company" is how a research run ends up citing a novelist's blog.
+
+READING A RESULT SET BEFORE YOU OPEN ANYTHING
+- Look at the DOMAINS first. If none of them relate to the target — not the company's own \
+site, not a news outlet covering it, not a directory profile of it — then the query \
+failed. Re-query with a tighter anchor: the bare domain, or site:<domain>.
+- Do NOT open a junk result hoping it turns out relevant. It will not, and its URL ends \
+up cited in a record a salesperson puts in front of a customer.
+- Results that are clearly about a different entity sharing the name are the same \
+failure. Re-anchor on the domain rather than reading them.
 
 DEFAULT RHYTHM (a strong default, not a script)
 - After a search returns plausible URLs, your next step should normally be to OPEN one of them.
@@ -361,6 +400,55 @@ def _fmt_args(args: Any) -> str:
     return ", ".join(parts)
 
 
+_NAME_NOISE = frozenset({"inc", "llc", "ltd", "corp", "the", "com", "www", "app", "io", "co", "gmbh", "plc"})
+
+
+def _target_tokens(target: str) -> list[str]:
+    """Lowercase tokens of the target, for judging whether a domain relates to it."""
+    base = (target or "").strip().lower()
+    base = base.split("//")[-1].split("/")[0]
+    return [t for t in re.split(r"[^a-z0-9]+", base) if len(t) > 2 and t not in _NAME_NOISE]
+
+
+def _domain_of(url: str) -> str:
+    """Bare host, no scheme and no www. — the part worth showing the model."""
+    text = str(url or "")
+    host = text.split("//")[-1].split("/")[0].split("?")[0].lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _url_relates(url: str, tokens: Sequence[str]) -> bool:
+    """Host OR path may carry the company: crunchbase.com/organization/vanta counts."""
+    if _domain_relates(_domain_of(url), tokens):
+        return True
+    path = str(url or "").split("//")[-1]
+    path = path[path.find("/") + 1 :].lower() if "/" in path else ""
+    return any(tok in path for tok in tokens)
+
+
+def _domain_relates(domain: str, tokens: Sequence[str]) -> bool:
+    """Does this host plausibly belong to, or cover, the target company?"""
+    if not domain:
+        return False
+    bare = domain.split(".")[0]
+    if any(tok in bare or bare in tok for tok in tokens):
+        return True
+    # Directories and news outlets are about the company even though the host
+    # is not; the path usually carries the name, which the caller checks.
+    return domain in _COVERAGE_DOMAINS
+
+
+#: Hosts that legitimately carry coverage of a company without bearing its name.
+_COVERAGE_DOMAINS = frozenset(
+    {
+        "crunchbase.com", "linkedin.com", "techcrunch.com", "businesswire.com",
+        "prnewswire.com", "reuters.com", "bloomberg.com", "cnbc.com", "forbes.com",
+        "wikipedia.org", "pitchbook.com", "theinformation.com", "axios.com",
+        "sec.gov", "glassdoor.com", "g2.com", "producthunt.com", "ycombinator.com",
+    }
+)
+
+
 def _tool_usage(steps: Sequence[Any]) -> dict[str, int]:
     """How many times each tool has actually run."""
     counts = {"web_search": 0, "fetch_page": 0, "detect_tech": 0, "finish": 0}
@@ -414,6 +502,7 @@ def build_agent_context(
     rec = _as_dict(record_so_far)
     steps = list(trace or [])
     budget = dict(remaining_budget or {})
+    tgt_tokens = _target_tokens(target)
 
     lines: list[str] = []
     lines.append(f"TARGET: {target}")
@@ -467,9 +556,22 @@ def build_agent_context(
                 lines.append(f"{head} -> FAILED: {_short(s.get('error') or 'unknown error', 160)}")
             else:
                 lines.append(f"{head} -> {_short(s.get('observation'), 300) or '(no output)'}")
-            srcs = s.get("sources") or []
-            if srcs:
-                lines.append(f"     sources: {', '.join(str(u) for u in srcs[:4])}")
+            srcs = [str(u) for u in (s.get("sources") or [])]
+            if srcs and tool == "web_search":
+                # Domains, not full URLs: a mismatch between the query and what
+                # came back is only obvious when the hosts are readable at a glance.
+                doms = list(dict.fromkeys(_domain_of(u) for u in srcs if u))
+                shown = ", ".join(doms[:6]) + ("…" if len(doms) > 6 else "")
+                related = [d for d in doms if _domain_relates(d, tgt_tokens)]
+                if doms and not related:
+                    lines.append(
+                        f"     results from: {shown}"
+                        f"  <- NONE of these relate to {target}; this query lost the brand anchor"
+                    )
+                else:
+                    lines.append(f"     results from: {shown}")
+            elif srcs:
+                lines.append(f"     sources: {', '.join(srcs[:4])}")
     else:
         lines.append("STEPS ALREADY TAKEN (0): this is your first move.")
 
@@ -492,30 +594,54 @@ def build_agent_context(
 
     # The single most useful thing to put in front of the model: the links it
     # has collected and never opened.
+    related = [u for u in unread if _url_relates(u, tgt_tokens)]
+    unrelated = [u for u in unread if u not in set(related)]
+
     lines.append("")
-    if unread:
-        lines.append(f"URLS FOUND BUT NOT YET READ ({len(unread)}) — these are your cheapest source of facts:")
-        lines.extend(f"  - {url}" for url in unread[:12])
-        if len(unread) > 12:
-            lines.append(f"  … and {len(unread) - 12} more")
+    if related:
+        lines.append(f"UNREAD LINKS THAT LOOK RELATED TO {target} ({len(related)}) — your cheapest source of facts:")
+        lines.extend(f"  - {url}" for url in related[:12])
+        if len(related) > 12:
+            lines.append(f"  … and {len(related) - 12} more")
+    elif unread:
+        lines.append(f"UNREAD LINKS RELATED TO {target} (0) — nothing you have found looks like this company.")
     else:
         lines.append("URLS FOUND BUT NOT YET READ (0): every link you have found has been opened.")
+
+    if unrelated:
+        lines.append("")
+        lines.append(
+            f"UNREAD LINKS THAT DO NOT LOOK RELATED ({len(unrelated)}) — do NOT open these; "
+            "citing one puts an unrelated page in a customer-facing record:"
+        )
+        lines.extend(f"  - {url}" for url in unrelated[:6])
+        if len(unrelated) > 6:
+            lines.append(f"  … and {len(unrelated) - 6} more")
 
     # --- the nudge -------------------------------------------------------
     lines.append("")
     if isinstance(steps_left, int) and steps_left <= 1:
         lines.append("BUDGET IS NEARLY SPENT — call finish unless one step clearly matters more.")
-    elif unread and n_searched > n_read:
+    elif unread and not related:
+        # Every link on the table is junk. Opening one is the failure mode that
+        # put an unrelated site into a published record; re-anchor instead.
+        lines.append(
+            f"NOTE: none of the {len(unread)} link(s) you have found look like {target}. Your "
+            "queries are matching the words in the name rather than the company. Do NOT open "
+            "any of them. Re-query with a tighter anchor: the bare domain, or a site: query "
+            "against the company's own domain."
+        )
+    elif related and n_searched > n_read:
         lines.append(
             f"NOTE: you have run {n_searched} search(es) and opened {n_read} page(s), with "
-            f"{len(unread)} link(s) still unread. Searching again will return more snippets, not "
-            "more facts. Unless every unread link above is irrelevant, open one now — and if you "
-            "search instead, say in your thought why none of them is worth opening."
+            f"{len(related)} related link(s) still unread. Searching again will return more "
+            "snippets, not more facts. Unless every related link above is useless, open one "
+            "now — and if you search instead, say in your thought why."
         )
-    elif unread and _last_tool(steps) == "web_search":
+    elif related and _last_tool(steps) == "web_search":
         lines.append(
-            "NOTE: your last step was a search and it returned links you have not opened. "
-            "Reading one is normally the right next move."
+            "NOTE: your last step was a search and it returned related links you have not "
+            "opened. Reading one is normally the right next move."
         )
 
     lines.append("")

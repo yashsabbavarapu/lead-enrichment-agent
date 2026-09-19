@@ -23,6 +23,7 @@ from lea.agent.policy import (
     query_similarity,
     should_stop,
     stop_class,
+    transient_failure_hint,
 )
 from lea.config import Settings
 from lea.llm.base import LLMUsage
@@ -1263,17 +1264,15 @@ def test_rate_limit_is_not_reported_as_a_broken_setup(wired):
 @pytest.mark.parametrize(
     "target, tier, score, industry",
     [
-        # Re-pinned when growth_signals gained recency weighting (Agent D): the
-        # fixtures' signals are undated or >1y old, so they now count for less.
-        # Tiers are unchanged; only the weighted scores moved.
+        # The keyless baseline. These move whenever the agent researches differently,
+        # which is the point of the test -- so the value is re-derived, never adjusted
+        # to make a diff pass. Both are deterministic across repeated runs.
         #
-        # Ramp re-pinned again, 64.4 -> 63.9 (Agent A), when the invented TechCrunch
-        # result in the Ramp search fixture was replaced by the real article (the
-        # made-up URL 404s live). The real headline reads "nearly doubles valuation
-        # ... secondary share sale" and never says "raised", so it classifies as a
-        # product signal rather than funding and growth_signals loses ~0.5 weighted
-        # points. The fixture is now honest; the gap is in the funding-language
-        # patterns, not here.
+        # Current values date from the stub planner learning to call fetch_jobs: reading
+        # the ATS board grades company_size on real evidence instead of a default, which
+        # lifts confidence to 0.95 and carries Ramp from B to A on 148 open roles, 63 of
+        # them in sales. Earlier movements came from signal recency weighting and from
+        # replacing an invented TechCrunch fixture with the real article.
         ("Vanta", "A", 90.6, "Security & Compliance"),
         # 63.9 -> 68.4 (Agent D): the real TechCrunch headline ("nearly doubles
         # valuation to $13B in secondary share sale") has no raise verb and was
@@ -1475,3 +1474,128 @@ def test_synthesis_overrun_is_reported_not_hidden(wired, monkeypatch):
     assert "synthesis then ran a further" in reason
     assert "past the 180s budget" in reason
     assert result.stats.wall_ms / 1000 > 180
+
+
+# --------------------------------------------------------------------------
+# Malformed calls vs genuine provider failures
+# --------------------------------------------------------------------------
+
+
+def test_required_args_reads_both_schema_shapes():
+    from lea.agent.policy import required_args
+
+    # the flat shape this project's tools use
+    flat = {"query": {"type": "string", "required": True},
+            "num_results": {"type": "integer", "required": False}}
+    assert required_args(flat) == ["query"]
+
+    # JSON-schema shape
+    js = {"properties": {"q": {"type": "string"}, "n": {"type": "integer"}}, "required": ["q"]}
+    assert required_args(js) == ["q"]
+
+    # unreadable/absent schemas let the call through rather than blocking it
+    assert required_args(None) == []
+    assert required_args({}) == []
+    assert required_args({"query": "str"}) == []
+
+
+def test_missing_required_args_treats_blank_as_missing():
+    from lea.agent.policy import missing_required_args
+
+    schema = {"query": {"required": True}}
+    assert missing_required_args(schema, {}) == ["query"]
+    assert missing_required_args(schema, None) == ["query"]
+    assert missing_required_args(schema, {"query": "   "}) == ["query"]
+    assert missing_required_args(schema, {"query": None}) == ["query"]
+    assert missing_required_args(schema, {"query": "vanta"}) == []
+    # an optional arg missing is not a violation
+    assert missing_required_args({"reason": {"required": False}}, {}) == []
+
+
+def test_malformed_call_is_caught_before_the_tool(wired):
+    """The live Figma failure: web_search() with no query. It cannot succeed, so
+    it must not cost a search credit or an HTTP round trip."""
+    search = FakeTool(ToolName.WEB_SEARCH)
+    search.args_schema = {"query": {"type": "string", "required": True}}
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "find them"),                      # no query!
+        act(ToolName.WEB_SEARCH, "with a query", query="vanta compliance"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("Vanta", make_settings())
+
+    bad = result.trace[0]
+    assert bad.ok is False
+    assert bad.error == "missing required argument(s): query"
+    assert "query" in bad.observation
+    assert "malformed call, not a provider problem" in bad.observation
+    assert "retrying it unchanged will fail identically" in bad.observation
+    # the misleading old wording must not appear on a malformed call
+    assert "usually transient" not in bad.observation
+    assert "rate limit" not in bad.observation
+
+    # it never reached the tool, and cost no search budget
+    assert len(search.calls) == 1, "only the well-formed call should execute"
+    assert search.calls[0] == {"query": "vanta compliance"}
+    assert result.stats.searches == 1
+    # reported, never repaired: the loop did not invent a query from the target
+    assert bad.args == {}
+
+
+def test_genuine_provider_failure_keeps_the_transient_wording():
+    """The distinction has to cut both ways."""
+    blocked = TraceStep(
+        n=1, tool=ToolName.WEB_SEARCH, args={"query": "vanta"}, ok=False,
+        observation="search failed: duckduckgo returned no parseable results",
+        error="duckduckgo returned no parseable results (rate limited?)",
+    )
+    hint = transient_failure_hint(blocked)
+    assert "usually transient" in hint
+    assert "malformed" not in hint
+
+    malformed = TraceStep(
+        n=1, tool=ToolName.WEB_SEARCH, args={}, ok=False,
+        observation="search failed: missing required arg 'query'",
+        error="missing required arg 'query'",
+    )
+    hint = transient_failure_hint(malformed)
+    assert "malformed call" in hint
+    assert "usually transient" not in hint
+    assert "rate limit" not in hint
+
+
+def test_tool_reported_bad_args_also_get_the_right_hint(wired):
+    """A tool that validates its own args (rather than the loop catching it first)
+    must still produce the malformed-call wording, not the transient one."""
+    picky = FakeTool(ToolName.WEB_SEARCH, observations=[
+        Observation(tool=ToolName.WEB_SEARCH, ok=False,
+                    summary="search failed: missing required arg 'query'",
+                    error="missing required arg 'query'"),
+    ])
+    picky.args_schema = {}  # declares nothing, so the loop cannot pre-empt it
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "go", query="something"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(picky))
+
+    step = loop_mod.run_agent("Vanta", make_settings()).trace[0]
+    assert "malformed call" in step.observation
+    assert "usually transient" not in step.observation
+
+
+def test_schema_guard_does_not_block_well_formed_or_unknown_schemas(wired):
+    """A guard that misfires on an unfamiliar schema is worse than one that misses."""
+    odd = FakeTool(ToolName.WEB_SEARCH)
+    odd.args_schema = {"query": "a bare string, not a dict"}   # unreadable
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "go", query="vanta"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(odd))
+
+    result = loop_mod.run_agent("Vanta", make_settings())
+    assert result.trace[0].ok is True
+    assert len(odd.calls) == 1

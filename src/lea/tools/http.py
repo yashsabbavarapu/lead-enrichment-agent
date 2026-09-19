@@ -379,6 +379,26 @@ def _body_query(body: Any) -> str:
     return ""
 
 
+def _url_query(url: str) -> str:
+    """The search term carried in the URL's own query string, if any.
+
+    POST-based search providers put the term in the body; GET-based ones (Scrappa,
+    Brave) put it in the URL. Both need the `query` annotation on the fixture, or
+    the offline fuzzy match has nothing to compare a reworded query against.
+    """
+    try:
+        from urllib.parse import parse_qs
+
+        params = parse_qs(urlparse(url or "").query)
+    except Exception:
+        return ""
+    for key in ("query", "q"):
+        values = params.get(key) or []
+        if values and str(values[0]).strip():
+            return str(values[0]).strip().lower()
+    return ""
+
+
 def _same_url(a: str, b: str) -> bool:
     if not a or not b:
         return False
@@ -434,7 +454,7 @@ def write_fixture(settings: Settings, url: str, body: Any, result: HttpResult) -
         }
         if truncated:
             payload["truncated_from"] = len(text)
-        q = _body_query(body)
+        q = _body_query(body) or _url_query(url)
         if q:
             payload["query"] = q
         fixture_path(settings, fixture_key(url, body)).write_text(

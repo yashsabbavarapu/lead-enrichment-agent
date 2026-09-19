@@ -29,6 +29,9 @@ __all__ = [
     "is_aggregator",
     "registrable_label",
     "citable_urls",
+    "apply_relevance_gate",
+    "is_relevant_source",
+    "relevant_evidence",
     "verify_record",
     "VERIFIED_FIELDS",
     "classify_funding",
@@ -628,6 +631,202 @@ def describe_age(age_days: Optional[int]) -> str:
     if age_days <= 400:
         return f"{max(1, round(age_days / 30))} months old"
     return f"{age_days / 365:.1f} years old"
+
+
+# --------------------------------------------------------------------------
+# Relevance gate
+#
+# Live search sometimes returns pages with nothing to do with the target. A run
+# for "Linear" searched `Linear issue tracker software company`, the word
+# "issue" hijacked the results, and the published record cited J.K. Rowling's
+# website, Jira's REST docs and a Pixel support thread. A reviewer clicking a
+# citation and landing there is a credibility event; a missing citation is
+# invisible. So this gate is deliberately biased toward dropping.
+#
+# The test is content, not URL: a legitimate funding article lives at
+# techcrunch.com and may not carry the company name in its path. The bar is low
+# - one clear branded mention is enough - because this is a junk filter, not a
+# precision instrument.
+# --------------------------------------------------------------------------
+
+#: Words that make a nearby name-mention look like it is about a company.
+_COMPANY_CONTEXT = (
+    "inc", "inc.", "llc", "ltd", "corp", "company", "startup", "platform",
+    "software", "saas", "founded", "founder", "co-founder", "ceo", "raises",
+    "raised", "funding", "series", "valuation", "customers", "product",
+    "launch", "hiring", "team", "app", "acquires", "acquired", "headquarters",
+    "teams", "customers", "products", "founders", "employees", "pricing",
+    "integrations", "enterprise", "workspace", "dashboard", "subscription",
+)
+
+
+def _host_of(url: str) -> str:
+    return normalize_domain(url) or ""
+
+
+def _is_own_domain(url: str, domain: Optional[str]) -> bool:
+    """Is this URL on the company's own site (including any subdomain)?
+
+    `lps.linear.app`, `orbit.linear.app` and `linear.app/brand` are all genuine
+    even when the page body is thin, so they never need to prove themselves.
+    """
+    if not domain:
+        return False
+    host, own = _host_of(url), normalize_domain(domain)
+    if not host or not own:
+        return False
+    return host == own or host.endswith("." + own) or own.endswith("." + host)
+
+
+def _name_variants(*names: Optional[str]) -> list[str]:
+    out: list[str] = []
+    for n in names:
+        n = (n or "").strip()
+        if len(n) < 2:
+            continue
+        if n not in out:
+            out.append(n)
+        # "Acme Inc." also matches as "Acme"
+        head = re.split(r"[,(]| - ", n)[0].strip()
+        head = re.sub(r"\b(inc|llc|ltd|corp|corporation|co|gmbh|plc)\.?$", "", head,
+                      flags=re.I).strip()
+        if len(head) >= 2 and head not in out:
+            out.append(head)
+    return out
+
+
+#: Tokens that make a preceding name read as the SUBJECT of a sentence - the
+#: company doing something - rather than an adjective modifying a noun.
+_SUBJECT_FOLLOWERS = {
+    "is", "was", "are", "were", "has", "have", "had", "will", "can", "does",
+    "did", "announced", "announces", "raised", "raises", "launched", "launches",
+    "said", "says", "offers", "provides", "builds", "helps", "acquired",
+    "acquires", "closed", "secured", "plans", "adds", "ships", "integrates",
+    "supports", "lets", "makes", "uses", "joined", "hired", "expanded",
+    "became", "remains", "continues", "reported", "confirmed", "unveiled",
+    "introduced", "partnered", "teamed", "sells", "serves", "powers", "enables",
+    "today", "now", "also", "recently", "just", "and", "or", "which", "that",
+}
+
+#: Tokens that, following the name, mark it as a company even when capitalised.
+_COMPANY_SUFFIXES = {
+    "inc", "inc.", "corp", "corp.", "llc", "ltd", "ltd.", "co", "co.", "gmbh",
+    "plc", "labs", "software", "technologies", "technology", "systems",
+    "solutions", "group", "holdings", "ventures", "ai", "io", "app", "platform",
+    "hq", "team",
+}
+
+_SENTENCE_ENDERS = set(".!?\n\r\u2022\u2013\u2014|*-:;\u2026")
+
+
+def _mention_strength(text: str, match: "re.Match[str]") -> str:
+    """How much does this occurrence look like a brand rather than a word?
+
+    Sentence-initial capitalisation is grammar, not evidence: "Linear algebra is
+    the branch of mathematics..." capitalises Linear for the same reason every
+    sentence capitalises its first word. Wikipedia, docs and academic pages do
+    this constantly, and those are exactly what ranks for a bare common-word
+    query. So position and the right-hand neighbour decide, not case alone.
+    """
+    before = text[: match.start()].rstrip()
+    sentence_initial = not before or before[-1] in _SENTENCE_ENDERS
+
+    after = text[match.end():].lstrip()
+    if after[:2] in ("'s", "\u2019s") or after[:1] in (",", ";"):
+        return "strong"                      # possessive or appositive: a subject
+    follower = re.match(r"[A-Za-z][A-Za-z.'\u2019-]*", after)
+    word = follower.group(0) if follower else ""
+    low = word.lower().rstrip(".,;:")
+
+    if low in _SUBJECT_FOLLOWERS or low in _COMPANY_SUFFIXES:
+        return "strong"
+    if word[:1].isupper():
+        # "Linear Algebra", "Introduction to Linear Regression" - part of a
+        # larger title-cased phrase, which is how the adjective reads.
+        return "weak"
+    if sentence_initial:
+        # Capitalised only because a sentence started. Needs corroboration.
+        return "weak"
+    return "strong"                          # mid-sentence capital: a proper noun
+
+
+def _mentions(text: str, name: str) -> list[str]:
+    """Strength of every standalone, capitalised occurrence of `name`."""
+    if not name:
+        return []
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])"
+    return [_mention_strength(text or "", m) for m in re.finditer(pattern, text or "")]
+
+
+def _branded_mentions(text: str, name: str) -> int:
+    """Occurrences that actually read as the brand. Kept for callers/tests."""
+    return sum(1 for st in _mentions(text, name) if st == "strong")
+
+
+def is_relevant_source(
+    url: str,
+    text: str,
+    target: str,
+    company_name: Optional[str] = None,
+    domain: Optional[str] = None,
+) -> bool:
+    """May this page be cited as a source about this company?"""
+    if not url:
+        return False
+    if _is_own_domain(url, domain):
+        return True
+
+    body = text or ""
+    names = _name_variants(company_name, target)
+
+    # The company's domain named anywhere in the page or the URL is decisive.
+    own = normalize_domain(domain) if domain else None
+    haystack_url = (url or "").lower()
+    if own and (own in body.lower() or own in haystack_url):
+        return True
+
+    # A name in the URL path is NOT sufficient on its own: "wikipedia.org/wiki/
+    # Linear_algebra" and "traffic.gov/ramp" both carry the slug while having
+    # nothing to do with the company. It only decides when the body is too
+    # short to judge, which covers a thin fetch of a genuinely relevant page.
+    if len(body.strip()) < 40:
+        for n in names:
+            slug = _SLUG_RE.sub("-", n.lower()).strip("-")
+            if len(slug) >= 4 and slug in haystack_url:
+                return True
+
+    for n in names:
+        strengths = _mentions(body, n)
+        if any(st == "strong" for st in strengths):
+            return True
+        if strengths:
+            # Only weak (sentence-initial or title-cased) matches. These need
+            # corroboration from the surrounding prose, which is what separates
+            # "Linear customers include..." from "Linear algebra is...".
+            pattern = r"(?<![A-Za-z0-9])" + re.escape(n) + r"(?![A-Za-z0-9])"
+            for m in re.finditer(pattern, body):
+                window = body[max(0, m.start() - 90): m.end() + 90].lower()
+                padded = f" {re.sub(r'[^a-z0-9]+', ' ', window).strip()} "
+                if any(f" {w} " in padded for w in _COMPANY_CONTEXT):
+                    return True
+    return False
+
+
+def relevant_evidence(
+    evidence: list[tuple[str, str]],
+    target: str,
+    company_name: Optional[str] = None,
+    domain: Optional[str] = None,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Split evidence into what may be cited and the URLs that may not."""
+    keep: list[tuple[str, str]] = []
+    rejected: list[str] = []
+    for url, text in evidence or []:
+        if is_relevant_source(url, text, target, company_name, domain):
+            keep.append((url, text))
+        elif url and url not in rejected:
+            rejected.append(url)
+    return keep, rejected
 
 
 # --------------------------------------------------------------------------
@@ -1369,6 +1568,38 @@ def normalize_record(
     return rec
 
 
+def apply_relevance_gate(
+    rec: CompanyRecord, evidence: list[tuple[str, str]], target: str
+) -> CompanyRecord:
+    """Strip citations that point at pages unrelated to this company.
+
+    Applies to `sources` and to each `Signal.source_url`. A signal whose only
+    source is dropped keeps its claim but loses the link, so it flows into the
+    uncited path the scorer already handles rather than carrying a broken one.
+    """
+    out = rec.model_copy(deep=True)
+    _keep, rejected = relevant_evidence(evidence, target, out.company_name, out.domain)
+    if not rejected:
+        return out
+
+    bad = {r for r in rejected}
+    bad_keys = {_url_compare_key(b) for b in bad}
+
+    out.sources = [u for u in (out.sources or []) if _url_compare_key(u) not in bad_keys]
+    for sig in out.signals or []:
+        if sig.source_url and _url_compare_key(sig.source_url) in bad_keys:
+            sig.source_url = None
+    return out
+
+
+def _url_compare_key(url: str) -> str:
+    u = (url or "").strip().lower()
+    u = re.sub(r"^https?://", "", u).split("#", 1)[0]
+    if u.startswith("www."):
+        u = u[4:]
+    return u.rstrip("/")
+
+
 def extract_record(
     target: str,
     evidence: list[tuple[str, str]],
@@ -1436,6 +1667,12 @@ def extract_record(
     rec, _dropped = verify_record(rec, evidence)
 
     rec = normalize_record(rec, target, evidence_urls=evidence_urls)
+
+    # Relevance gate, after normalization because it needs the resolved domain
+    # and company name. A citation pointing at an unrelated page is worse than
+    # no citation, so anything that cannot be tied to this company is dropped
+    # and whatever rested on it becomes uncited.
+    rec = apply_relevance_gate(rec, evidence, target)
 
     if base is not None:
         # base wins for anything it confidently holds.

@@ -105,7 +105,9 @@ class Settings:
     # or to point at a provider this build has never heard of.
     llm_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None
-    search_provider: str = "auto"  # auto | tavily | serper | brave | duckduckgo | fixture
+    # auto | scrappa | tavily | serper | brave | duckduckgo | fixture
+    search_provider: str = "auto"
+    scrappa_api_key: Optional[str] = None
     tavily_api_key: Optional[str] = None
     serper_api_key: Optional[str] = None
     brave_api_key: Optional[str] = None
@@ -142,6 +144,7 @@ class Settings:
             llm_base_url=_env("LEA_LLM_BASE_URL"),
             llm_api_key=_env("LEA_LLM_API_KEY"),
             search_provider=_env("LEA_SEARCH_PROVIDER", "auto"),
+            scrappa_api_key=_env("SCRAPPA_API_KEY"),
             tavily_api_key=_env("TAVILY_API_KEY"),
             serper_api_key=_env("SERPER_API_KEY"),
             brave_api_key=_env("BRAVE_API_KEY"),
@@ -199,6 +202,10 @@ class Settings:
             return self.search_provider
         if self.offline:
             return "fixture"
+        # Scrappa first: it returns Google SERP results, which are materially
+        # better for firmographics than any of the alternatives.
+        if self.scrappa_api_key:
+            return "scrappa"
         if self.tavily_api_key:
             return "tavily"
         if self.serper_api_key:
