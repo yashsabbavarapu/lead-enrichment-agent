@@ -28,6 +28,14 @@ cp .env.example .env
 ./.venv/bin/lea doctor        # confirms which provider resolved
 ```
 
+**Free-tier volume is the real constraint, not cost.** Google allows roughly
+**20 requests per day per model**. One company costs ~11 calls, so that is about
+**two companies per day per model**. The quota is per *model*, and several Flash
+variants exist, so switching `LEA_MODEL` when one is exhausted gives you more
+headroom — but this tier suits demos, not batch runs. For a real list use Groq
+(much higher free limits) or a small Anthropic balance. A per-day quota is not
+retried; the error names the fix.
+
 Also supported, same adapter, all free tiers: `GROQ_API_KEY`, `OPENROUTER_API_KEY`,
 `CEREBRAS_API_KEY`, or a local Ollama at `http://localhost:11434/v1` needing no key
 at all. Pick with `--provider`, or let `auto` take the first key it finds.

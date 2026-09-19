@@ -30,7 +30,26 @@ from lea.tools.search import (
     parse_tavily,
     unwrap_ddg_href,
 )
-from lea.tools.tech_detect import SIGNATURES, DetectTechTool, detect_from_html
+from lea.tools.jobs import (
+    FetchJobsTool,
+    Role,
+    aggregate,
+    parse_ashby,
+    parse_greenhouse,
+    parse_lever,
+    parse_workable,
+    prune_descriptions,
+    resolve_candidates,
+    slugify,
+)
+from lea.tools.tech_detect import (
+    SIGNATURES,
+    DetectTechTool,
+    clear_ats_memo,
+    detect_from_html,
+    extract_ats_boards,
+    recall_ats_boards,
+)
 
 from selectolax.parser import HTMLParser
 
@@ -49,10 +68,12 @@ def _clean_module_state():
     lea_http.clear_robots_cache()
     lea_http.clear_response_cache()
     lea_search.reset_pacing()
+    clear_ats_memo()
     yield
     lea_http.clear_robots_cache()
     lea_http.clear_response_cache()
     lea_search.reset_pacing()
+    clear_ats_memo()
 
 
 PUBLIC_IP = "93.184.216.34"
@@ -1299,13 +1320,631 @@ def test_detect_tech_tool_ok_with_empty_list_when_nothing_matches(settings: Sett
 
 
 # --------------------------------------------------------------------------
+# ATS slug extraction (tech_detect) — the key fetch_jobs runs on
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "snippet,expected",
+    [
+        ('<a href="https://jobs.ashbyhq.com/vanta">Open roles</a>', ("ashby", "vanta")),
+        ('fetch("https://api.ashbyhq.com/posting-api/job-board/vanta")', ("ashby", "vanta")),
+        ('<a href="https://jobs.ashbyhq.com/ramp/a1b2c3">Role</a>', ("ashby", "ramp")),
+        ('<a href="https://boards.greenhouse.io/ramp">Jobs</a>', ("greenhouse", "ramp")),
+        ('<a href="https://job-boards.greenhouse.io/duolingo/jobs/77">x</a>', ("greenhouse", "duolingo")),
+        ('<script src="https://boards.greenhouse.io/embed/job_board/js?for=acme">', ("greenhouse", "acme")),
+        ('"https://boards-api.greenhouse.io/v1/boards/figma/jobs"', ("greenhouse", "figma")),
+        ('<a href="https://jobs.lever.co/outreach">Careers</a>', ("lever", "outreach")),
+        ('"https://api.lever.co/v0/postings/matchgroup?mode=json"', ("lever", "matchgroup")),
+        ('<iframe src="https://apply.workable.com/epignosis/"></iframe>', ("workable", "epignosis")),
+        ('<a href="https://acme.workable.com/jobs">Jobs</a>', ("workable", "acme")),
+    ],
+)
+def test_extract_ats_board_slug_from_every_url_shape(snippet: str, expected: tuple[str, str]):
+    boards = extract_ats_boards(snippet)
+    assert (boards[0]["platform"], boards[0]["slug"]) == expected
+    assert boards[0]["board_url"].endswith(expected[1])
+
+
+def test_extract_ats_board_reads_the_url_as_well_as_the_body():
+    boards = extract_ats_boards("", "https://jobs.ashbyhq.com/linear")
+    assert boards[0]["slug"] == "linear"
+
+
+def test_extract_ats_board_sees_through_escaped_json_urls():
+    """Careers pages hide the board URL inside a hydration payload."""
+    for escaped in (
+        r'{"board":"https:\/\/jobs.lever.co\/outreach"}',
+        r'{"board":"https://jobs.lever.co/outreach"}',
+    ):
+        assert extract_ats_boards(escaped)[0]["slug"] == "outreach"
+
+
+def test_extract_ats_board_ignores_url_grammar_as_a_slug():
+    """`boards.greenhouse.io/embed/...` must not yield the org slug 'embed'."""
+    boards = extract_ats_boards('<script src="https://boards.greenhouse.io/embed/job_board.js"></script>')
+    assert boards == []
+
+
+def test_extract_ats_board_deduplicates_and_finds_nothing_in_noise():
+    html = '<a href="https://jobs.ashbyhq.com/vanta">a</a><a href="https://jobs.ashbyhq.com/vanta">b</a>'
+    assert len(extract_ats_boards(html)) == 1
+    assert extract_ats_boards("<p>we are hiring!</p>") == []
+
+
+@respx.mock
+def test_detect_tech_publishes_the_board_and_remembers_it(settings: Settings):
+    """detect_tech is where the slug is discovered; fetch_jobs reads it later."""
+    respx.get("https://acme.example/careers").mock(
+        return_value=httpx.Response(200, text=COMPANY_HTML, headers={"content-type": "text/html"})
+    )
+    obs = DetectTechTool().run({"url": "https://acme.example/careers"}, settings)
+
+    assert obs.ok is True
+    assert obs.data["ats_boards"] == [
+        {
+            "ats": "Greenhouse",
+            "platform": "greenhouse",
+            "slug": "acme",
+            "board_url": "https://job-boards.greenhouse.io/acme",
+            "evidence": obs.data["ats_boards"][0]["evidence"],
+        }
+    ]
+    # The summary has to name the tool the planner should reach for next.
+    assert "fetch_jobs" in obs.summary
+    assert recall_ats_boards("acme.example")[0]["slug"] == "acme"
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs — parsing each ATS into one shape
+# --------------------------------------------------------------------------
+
+ASHBY_URL = "https://api.ashbyhq.com/posting-api/job-board/{slug}"
+GREENHOUSE_DEPTS_URL = "https://boards-api.greenhouse.io/v1/boards/{slug}/departments"
+GREENHOUSE_JOBS_URL = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+LEVER_URL = "https://api.lever.co/v0/postings/{slug}?mode=json"
+WORKABLE_URL = "https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true"
+
+# Field names below are copied from live responses captured while building this
+# tool; the recorded fixtures in examples/fixtures are the same shapes at scale.
+ASHBY_PAYLOAD = {
+    "apiVersion": "1",
+    "jobs": [
+        {
+            "title": "Account Executive, Mid-Market", "department": "Sales", "team": "Commercial",
+            "location": "San Francisco, CA", "isListed": True, "isRemote": False,
+            "publishedAt": "2026-09-15T20:18:58.727+00:00",
+            "descriptionHtml": "<p>" + "x" * 5000 + "</p>",
+        },
+        {
+            "title": "Senior Backend Engineer", "department": "Engineering", "team": "Platform",
+            "location": "Remote (US)", "isListed": True, "isRemote": True,
+            "publishedAt": "2026-09-10T09:00:00.000+00:00",
+            "descriptionPlain": "y" * 5000,
+        },
+        {
+            "title": "Draft role nobody can see", "department": "Engineering",
+            "location": "Dublin, Ireland", "isListed": False, "publishedAt": "2026-09-01T00:00:00Z",
+        },
+    ],
+}
+
+GREENHOUSE_PAYLOAD = {
+    "departments": [
+        {
+            "id": 1, "name": "Engineering", "parent_id": None, "child_ids": [2],
+            "jobs": [
+                {"id": 10, "title": "Staff Engineer", "location": {"name": "New York, NY"},
+                 "first_published": "2026-09-14T10:00:00-04:00"},
+                {"id": 11, "title": "Engineering Manager", "location": {"name": "Remote - US"},
+                 "first_published": "2026-08-02T10:00:00-04:00"},
+            ],
+        },
+        # A child department repeats a parent's job: counted once, not twice.
+        {"id": 2, "name": "Infrastructure", "parent_id": 1, "child_ids": [],
+         "jobs": [{"id": 10, "title": "Staff Engineer", "location": {"name": "New York, NY"}}]},
+        {"id": 3, "name": "Sales", "parent_id": None, "child_ids": [],
+         "jobs": [{"id": 12, "title": "Enterprise AE", "location": {"name": "London, UK"},
+                   "first_published": "2026-09-16T10:00:00-04:00"}]},
+        {"id": 4, "name": "Nobody Is Hiring Here", "parent_id": None, "child_ids": [], "jobs": []},
+    ]
+}
+
+LEVER_PAYLOAD = [
+    {"text": "Solutions Consultant", "categories": {"department": "Sales", "team": "Pre-Sales",
+                                                    "location": "Seattle, WA"},
+     "createdAt": 1789748062697, "workplaceType": "onsite", "descriptionPlain": "z" * 5000},
+    {"text": "Data Engineer", "categories": {"team": "Data", "location": "Remote - United States"},
+     "createdAt": 1789748062697, "workplaceType": "remote"},
+]
+
+WORKABLE_PAYLOAD = {
+    "name": "Acme Widgets",
+    "jobs": [
+        {"title": "Partner Marketing Lead", "department": "Marketing", "city": "Athens",
+         "country": "Greece", "telecommuting": False, "published_on": "2026-09-07",
+         "description": "<p>" + "q" * 5000 + "</p>"},
+        {"title": "Cloud Engineer", "department": "", "function": "Engineering", "city": "Boston",
+         "country": "United States", "telecommuting": True, "published_on": "2026-09-01"},
+    ],
+}
+
+
+def test_parse_ashby_flattens_and_drops_unlisted():
+    roles = parse_ashby(ASHBY_PAYLOAD)
+    assert [r.title for r in roles] == ["Account Executive, Mid-Market", "Senior Backend Engineer"]
+    assert roles[0].department == "Sales" and roles[0].location == "San Francisco, CA"
+    assert roles[0].posted == "2026-09-15"
+    assert roles[1].remote is True
+
+
+def test_parse_greenhouse_deduplicates_jobs_shared_by_parent_and_child():
+    roles = parse_greenhouse(GREENHOUSE_PAYLOAD)
+    assert len(roles) == 3, "a job filed under a parent AND a child was double counted"
+    assert {r.department for r in roles} == {"Engineering", "Sales"}
+    assert {r.title for r in roles} == {"Staff Engineer", "Engineering Manager", "Enterprise AE"}
+
+
+def test_parse_greenhouse_also_reads_the_flat_jobs_shape():
+    roles = parse_greenhouse(
+        {"jobs": [{"id": 1, "title": "Designer", "location": {"name": "Berlin"}}], "meta": {"total": 1}}
+    )
+    assert len(roles) == 1 and roles[0].location == "Berlin"
+    assert roles[0].department == ""  # /jobs genuinely does not say
+
+
+def test_parse_lever_falls_back_from_department_to_team():
+    roles = parse_lever(LEVER_PAYLOAD)
+    assert [r.department for r in roles] == ["Sales", "Data"]
+    assert roles[0].posted == "2026-09-18"  # epoch milliseconds
+    assert roles[1].remote is True
+
+
+def test_parse_workable_builds_a_location_and_falls_back_to_function():
+    roles = parse_workable(WORKABLE_PAYLOAD)
+    assert roles[0].location == "Athens, Greece"
+    assert roles[1].department == "Engineering"
+    assert roles[1].remote is True
+
+
+def test_parsers_never_choke_on_junk():
+    for parse in (parse_ashby, parse_greenhouse, parse_lever, parse_workable):
+        assert parse({}) == [] or parse({}) is not None
+        assert parse({"jobs": [None, "nope", 7]}) == []
+        assert parse([]) == []
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs — aggregation
+# --------------------------------------------------------------------------
+
+
+def test_aggregate_counts_departments_and_orders_them_by_size():
+    roles = (
+        [Role("E%d" % i, "Engineering", "New York, NY") for i in range(4)]
+        + [Role("S%d" % i, "Sales", "London") for i in range(6)]
+        + [Role("D1", "", "new york, ny")]
+    )
+    stats = aggregate(roles)
+    assert stats["open_roles"] == 11
+    assert list(stats["departments"].items()) == [("Sales", 6), ("Engineering", 4), ("Unspecified", 1)]
+    assert sum(stats["departments"].values()) == stats["open_roles"], "counts must reconcile"
+    # Locations dedupe case-insensitively, keeping the first spelling, by frequency.
+    assert stats["locations"] == ["London", "New York, NY"]
+
+
+def test_aggregate_samples_titles_across_departments_not_just_the_biggest():
+    roles = [Role("Eng %d" % i, "Engineering") for i in range(40)] + [Role("AE", "Sales")]
+    titles = aggregate(roles)["titles"]
+    assert len(titles) == 15, "title sample is not capped"
+    assert "AE" in titles, "a one-role department was crowded out of the sample"
+
+
+def test_aggregate_flags_recent_postings():
+    from datetime import date, timedelta as td
+
+    fresh = (date.today() - td(days=3)).isoformat()
+    stale = (date.today() - td(days=400)).isoformat()
+    stats = aggregate([Role("A", "Sales", posted=fresh), Role("B", "Sales", posted=stale)])
+    assert stats["posted_last_30d"] == 1
+    assert stats["latest_posted"] == fresh
+
+
+def test_aggregate_handles_an_empty_board():
+    stats = aggregate([])
+    assert stats == {
+        "open_roles": 0, "departments": {}, "locations": [], "titles": [],
+        "remote_roles": 0, "latest_posted": "", "posted_last_30d": 0,
+    }
+
+
+def test_slugify_strips_punctuation_and_suffixes():
+    assert slugify("Match Group, Inc.") == "matchgroup"
+    assert slugify("Ramp") == "ramp"
+    assert slugify("!!!") == ""
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs — end to end per platform
+# --------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fetch_jobs_ashby_end_to_end(settings: Settings):
+    respx.get(ASHBY_URL.format(slug="vanta")).mock(
+        return_value=httpx.Response(200, json=ASHBY_PAYLOAD)
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings)
+
+    assert obs.ok is True and obs.tool is ToolName.FETCH_JOBS
+    assert obs.data["open_roles"] == 2
+    assert obs.data["ats"] == "Ashby" and obs.data["slug"] == "vanta"
+    assert obs.data["departments"] == {"Engineering": 1, "Sales": 1}
+    assert obs.data["board_url"] == "https://jobs.ashbyhq.com/vanta"
+    assert obs.sources == ["https://jobs.ashbyhq.com/vanta"]
+    assert obs.data["resolved_by"] == "board_url"
+    assert "Vanta — 2 open roles on Ashby" in obs.summary
+    # Descriptions are megabytes of HTML the LLM must never be handed.
+    assert "descriptionHtml" not in json.dumps(obs.data)
+    assert len(json.dumps(obs.data)) < 4000
+
+
+@respx.mock
+def test_fetch_jobs_greenhouse_end_to_end(settings: Settings):
+    respx.get(GREENHOUSE_DEPTS_URL.format(slug="duolingo")).mock(
+        return_value=httpx.Response(200, json=GREENHOUSE_PAYLOAD)
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://boards.greenhouse.io/duolingo"}, settings)
+
+    assert obs.ok is True
+    assert obs.data["open_roles"] == 3
+    assert obs.data["departments"] == {"Engineering": 2, "Sales": 1}
+    assert obs.data["company"] == "Duolingo"
+
+
+@respx.mock
+def test_fetch_jobs_lever_end_to_end(settings: Settings):
+    respx.get(LEVER_URL.format(slug="outreach")).mock(
+        return_value=httpx.Response(200, json=LEVER_PAYLOAD)
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.lever.co/outreach"}, settings)
+    assert obs.ok is True
+    assert obs.data["open_roles"] == 2 and obs.data["ats"] == "Lever"
+
+
+@respx.mock
+def test_fetch_jobs_workable_end_to_end(settings: Settings):
+    respx.get(WORKABLE_URL.format(slug="acme")).mock(
+        return_value=httpx.Response(200, json=WORKABLE_PAYLOAD)
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://apply.workable.com/acme"}, settings)
+    assert obs.ok is True
+    assert obs.data["open_roles"] == 2 and obs.data["ats"] == "Workable"
+
+
+@respx.mock
+def test_fetch_jobs_observation_data_shape_is_stable(settings: Settings):
+    """Downstream extraction reads these keys by name; locking the contract."""
+    respx.get(ASHBY_URL.format(slug="vanta")).mock(
+        return_value=httpx.Response(200, json=ASHBY_PAYLOAD)
+    )
+    data = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings).data
+    assert set(data) == {
+        "company", "ats", "platform", "slug", "board_url", "api_url", "resolved_by",
+        "truncated", "from_fixture", "open_roles", "departments", "locations",
+        "titles", "remote_roles", "latest_posted", "posted_last_30d",
+    }
+    assert isinstance(data["open_roles"], int)
+    assert isinstance(data["departments"], dict)
+    assert isinstance(data["locations"], list) and isinstance(data["titles"], list)
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs — degradation
+# --------------------------------------------------------------------------
+
+
+@respx.mock
+def test_a_live_board_with_zero_roles_is_a_real_answer(settings: Settings):
+    """'Not hiring' is a finding, not a failure — it must not read as an error."""
+    respx.get(WORKABLE_URL.format(slug="hotjar")).mock(
+        return_value=httpx.Response(200, json={"name": "Hotjar", "jobs": []})
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://apply.workable.com/hotjar"}, settings)
+
+    assert obs.ok is True
+    assert obs.error is None
+    assert obs.data["open_roles"] == 0
+    assert obs.data["departments"] == {} and obs.data["titles"] == []
+    assert "0 open roles" in obs.summary and "not hiring publicly" in obs.summary
+
+
+@respx.mock
+def test_greenhouse_falls_back_to_the_flat_jobs_endpoint(settings: Settings):
+    """An empty /departments may just be the wrong view of a live board."""
+    depts = respx.get(GREENHOUSE_DEPTS_URL.format(slug="acme")).mock(
+        return_value=httpx.Response(200, json={"departments": []})
+    )
+    jobs = respx.get(GREENHOUSE_JOBS_URL.format(slug="acme")).mock(
+        return_value=httpx.Response(
+            200, json={"jobs": [{"id": 1, "title": "Designer", "location": {"name": "Berlin"}}]}
+        )
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://boards.greenhouse.io/acme"}, settings)
+
+    assert depts.called and jobs.called
+    assert obs.ok is True and obs.data["open_roles"] == 1
+
+
+@respx.mock
+def test_a_missing_or_private_board_degrades_cleanly(settings: Settings):
+    respx.get(ASHBY_URL.format(slug="nosuchorg")).mock(return_value=httpx.Response(404, text="Not Found"))
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/nosuchorg"}, settings)
+
+    assert obs.ok is False
+    assert "no public Ashby board" in (obs.error or "")
+    assert obs.data["open_roles"] is None and obs.data["departments"] == {}
+    assert obs.sources == []
+
+
+@respx.mock
+def test_a_404_stops_the_platform_instead_of_trying_its_other_endpoint(settings: Settings):
+    """A wrong slug is wrong on every endpoint; do not spend a second request."""
+    depts = respx.get(GREENHOUSE_DEPTS_URL.format(slug="nosuchorg")).mock(
+        return_value=httpx.Response(404, json={"status": 404, "error": "Job not found"})
+    )
+    jobs = respx.get(GREENHOUSE_JOBS_URL.format(slug="nosuchorg")).mock(
+        return_value=httpx.Response(404, json={"status": 404, "error": "Job not found"})
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://boards.greenhouse.io/nosuchorg"}, settings)
+
+    assert obs.ok is False
+    assert depts.called and not jobs.called
+
+
+@respx.mock
+def test_an_oversized_board_is_refused_rather_than_parsed(settings: Settings):
+    from lea.tools import jobs as lea_jobs
+
+    huge = '{"jobs":[' + ",".join(['{"title":"x"}'] * 200) + "]}"
+    respx.get(ASHBY_URL.format(slug="huge")).mock(
+        return_value=httpx.Response(200, text=huge, headers={"content-type": "application/json"})
+    )
+    original = lea_jobs.MAX_RESPONSE_CHARS
+    lea_jobs.MAX_RESPONSE_CHARS = 100
+    try:
+        obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/huge"}, settings)
+    finally:
+        lea_jobs.MAX_RESPONSE_CHARS = original
+
+    assert obs.ok is False
+    assert "over the" in (obs.error or "") and "limit" in (obs.error or "")
+
+
+@respx.mock
+def test_a_long_board_is_counted_in_full_but_reported_in_brief(settings: Settings):
+    """Hundreds of roles must not become hundreds of lines in the prompt."""
+    payload = {
+        "jobs": [
+            {"title": f"Engineer {i}", "department": f"Team {i % 30}", "location": f"City {i % 40}",
+             "isListed": True, "descriptionHtml": "<p>" + "x" * 2000 + "</p>"}
+            for i in range(400)
+        ]
+    }
+    respx.get(ASHBY_URL.format(slug="big")).mock(return_value=httpx.Response(200, json=payload))
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/big"}, settings)
+
+    assert obs.ok is True
+    assert obs.data["open_roles"] == 400  # the count is exact
+    assert len(obs.data["titles"]) == 15
+    assert len(obs.data["locations"]) <= 12
+    assert len(obs.data["departments"]) <= 25
+    assert len(obs.summary) < 400
+
+
+@respx.mock
+def test_unparseable_json_fails_without_raising(settings: Settings):
+    respx.get(ASHBY_URL.format(slug="broken")).mock(
+        return_value=httpx.Response(200, text="<html>bot check</html>")
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/broken"}, settings)
+    assert obs.ok is False and "unparseable JSON" in (obs.error or "")
+
+
+def test_fetch_jobs_rejects_a_missing_argument(settings: Settings):
+    obs = FetchJobsTool().run({}, settings)
+    assert obs.ok is False and "company_or_url" in (obs.error or "")
+    assert FetchJobsTool().run({"company_or_url": "   "}, settings).ok is False
+
+
+@respx.mock
+def test_fetch_jobs_never_raises_on_a_transport_error(settings: Settings):
+    respx.get(ASHBY_URL.format(slug="vanta")).mock(side_effect=httpx.ConnectError("boom"))
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings)
+    assert isinstance(obs, Observation) and obs.ok is False
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs — resolving which board to read
+# --------------------------------------------------------------------------
+
+
+@respx.mock
+def test_fetch_jobs_uses_the_board_detect_tech_already_found(settings: Settings):
+    """The whole point of the tech_detect handoff: no second page scrape."""
+    page = respx.get("https://acme.example/careers").mock(
+        return_value=httpx.Response(200, text=COMPANY_HTML, headers={"content-type": "text/html"})
+    )
+    board = respx.get(GREENHOUSE_DEPTS_URL.format(slug="acme")).mock(
+        return_value=httpx.Response(200, json=GREENHOUSE_PAYLOAD)
+    )
+    DetectTechTool().run({"url": "https://acme.example/careers"}, settings)
+    page_calls = page.call_count
+
+    obs = FetchJobsTool().run({"company_or_url": "acme.example"}, settings)
+
+    assert obs.ok is True and board.called
+    assert obs.data["resolved_by"] == "detected_ats"
+    assert page.call_count == page_calls, "fetch_jobs re-scraped a page detect_tech already read"
+
+
+@respx.mock
+def test_fetch_jobs_finds_the_board_on_the_careers_page(settings: Settings):
+    respx.get("https://acme.example/careers").mock(
+        return_value=httpx.Response(200, text=COMPANY_HTML, headers={"content-type": "text/html"})
+    )
+    respx.get(GREENHOUSE_DEPTS_URL.format(slug="acme")).mock(
+        return_value=httpx.Response(200, json=GREENHOUSE_PAYLOAD)
+    )
+    obs = FetchJobsTool().run({"company_or_url": "https://acme.example"}, settings)
+    assert obs.ok is True and obs.data["resolved_by"] == "careers_page"
+
+
+@respx.mock
+def test_slug_guessing_is_capped_at_two_platforms(settings: Settings):
+    """No ATS detected must not mean brute-forcing every platform we know."""
+    respx.get("https://acme.example/careers").mock(return_value=httpx.Response(404))
+    respx.get("https://acme.example/jobs").mock(return_value=httpx.Response(404))
+    tried = {
+        "ashby": respx.get(ASHBY_URL.format(slug="acme")).mock(return_value=httpx.Response(404)),
+        "greenhouse": respx.get(GREENHOUSE_DEPTS_URL.format(slug="acme")).mock(
+            return_value=httpx.Response(404)
+        ),
+        "lever": respx.get(LEVER_URL.format(slug="acme")).mock(return_value=httpx.Response(404)),
+        "workable": respx.get(WORKABLE_URL.format(slug="acme")).mock(return_value=httpx.Response(404)),
+    }
+    obs = FetchJobsTool().run({"company_or_url": "acme.example"}, settings)
+
+    assert obs.ok is False
+    assert sum(1 for route in tried.values() if route.called) == 2
+    assert not tried["lever"].called and not tried["workable"].called
+
+
+@respx.mock
+def test_a_bare_company_name_is_slugified_into_a_board_guess(settings: Settings):
+    respx.get(ASHBY_URL.format(slug="matchgroup")).mock(
+        return_value=httpx.Response(200, json=ASHBY_PAYLOAD)
+    )
+    obs = FetchJobsTool().run({"company_or_url": "Match Group, Inc."}, settings)
+    assert obs.ok is True
+    assert obs.data["slug"] == "matchgroup" and obs.data["resolved_by"] == "slug_guess"
+    assert obs.data["company"] == "Match Group, Inc."
+
+
+def test_a_bare_name_does_not_trigger_a_careers_page_fetch(settings: Settings):
+    with respx.mock(assert_all_called=False) as mock:
+        pages = mock.route(path="/careers").mock(
+            side_effect=AssertionError("guessed a domain out of a bare company name")
+        )
+        mock.route(host__in=("api.ashbyhq.com", "boards-api.greenhouse.io")).mock(
+            return_value=httpx.Response(404)
+        )
+        FetchJobsTool().run({"company_or_url": "Acme"}, settings)
+        assert not pages.called
+
+
+def test_resolve_candidates_prefers_a_board_url_over_everything(settings: Settings):
+    candidates, _ = resolve_candidates("https://jobs.lever.co/outreach", settings)
+    assert [(c.platform, c.slug, c.how) for c in candidates] == [("lever", "outreach", "board_url")]
+
+
+# --------------------------------------------------------------------------
+# fetch_jobs — SSRF, offline, fixtures
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target", ["http://localhost/careers", "http://169.254.169.254/", "http://127.0.0.1:8080"]
+)
+def test_fetch_jobs_careers_probe_is_ssrf_guarded(settings: Settings, target: str):
+    with respx.mock(assert_all_called=False) as mock:
+        blocked = mock.route(host__in=("localhost", "169.254.169.254", "127.0.0.1")).mock(
+            side_effect=AssertionError("SSRF guard did not fire")
+        )
+        # The slug-guess fallback still runs afterwards; it must go nowhere either.
+        mock.route().mock(return_value=httpx.Response(404))
+        obs = FetchJobsTool().run({"company_or_url": target}, settings)
+        assert not blocked.called
+    assert obs.ok is False
+
+
+def test_fetch_jobs_careers_probe_is_guarded_on_a_rebinding_host(
+    settings: Settings, stub_dns: dict[str, list[str]]
+):
+    stub_dns["evil.example"] = ["127.0.0.1"]
+    with respx.mock(assert_all_called=False) as mock:
+        blocked = mock.route(host="evil.example").mock(
+            side_effect=AssertionError("SSRF guard did not fire on a public name resolving inward")
+        )
+        obs = FetchJobsTool().run({"company_or_url": "evil.example"}, settings)
+        assert not blocked.called
+    assert obs.ok is False
+
+
+def test_fetch_jobs_offline_serves_a_fixture(settings: Settings):
+    settings.offline = True
+    _write_fixture(
+        settings,
+        ASHBY_URL.format(slug="vanta"),
+        None,
+        json.dumps(ASHBY_PAYLOAD),
+        headers={"content-type": "application/json"},
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        blocked = mock.route().mock(side_effect=AssertionError("network was used in offline mode"))
+        obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings)
+        assert not blocked.called
+
+    assert obs.ok is True
+    assert obs.data["open_roles"] == 2 and obs.data["from_fixture"] is True
+
+
+def test_fetch_jobs_offline_without_a_fixture_says_so(settings: Settings):
+    settings.offline = True
+    obs = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings)
+    assert obs.ok is False and "offline" in (obs.error or "")
+
+
+def test_prune_descriptions_keeps_the_counts_and_drops_the_prose():
+    raw = json.dumps(ASHBY_PAYLOAD)
+    pruned = prune_descriptions(raw)
+    assert len(pruned) < len(raw) / 5
+    reparsed = json.loads(pruned)  # still valid JSON, unlike a truncated blob
+    assert len(reparsed["jobs"]) == 3
+    assert "descriptionHtml" not in pruned and "descriptionPlain" not in pruned
+    assert parse_ashby(reparsed) == parse_ashby(ASHBY_PAYLOAD)
+    assert prune_descriptions("not json at all") == "not json at all"
+
+
+@respx.mock
+def test_recording_a_board_writes_a_small_replayable_fixture(settings: Settings):
+    settings.record_fixtures = True
+    respx.get(ASHBY_URL.format(slug="vanta")).mock(return_value=httpx.Response(200, json=ASHBY_PAYLOAD))
+    live = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings)
+    assert live.ok is True
+
+    written = [p for p in Path(settings.fixture_dir).glob("*.json")]
+    assert len(written) == 1
+    payload = json.loads(written[0].read_text())
+    assert "descriptionHtml" not in payload["text"], "job descriptions were recorded"
+    assert len(payload["text"]) < 1500
+
+    settings.record_fixtures = False
+    settings.offline = True
+    replay = FetchJobsTool().run({"company_or_url": "https://jobs.ashbyhq.com/vanta"}, settings)
+    assert replay.data["open_roles"] == live.data["open_roles"]
+
+
+# --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
 
 
-def test_build_registry_returns_three_runnable_tools(settings: Settings):
+def test_build_registry_returns_four_runnable_tools(settings: Settings):
     registry = build_registry(settings)
-    assert set(registry) == {ToolName.WEB_SEARCH, ToolName.FETCH_PAGE, ToolName.DETECT_TECH}
+    assert set(registry) == {
+        ToolName.WEB_SEARCH, ToolName.FETCH_PAGE, ToolName.DETECT_TECH, ToolName.FETCH_JOBS
+    }
     assert ToolName.FINISH not in registry
     for name, tool in registry.items():
         assert tool.name is name
@@ -1317,7 +1956,7 @@ def test_build_registry_returns_three_runnable_tools(settings: Settings):
 def test_tool_specs_include_finish(settings: Settings):
     specs = tool_specs(build_registry(settings))
     names = [s["name"] for s in specs]
-    assert names == ["web_search", "fetch_page", "detect_tech", "finish"]
+    assert names == ["web_search", "fetch_page", "detect_tech", "fetch_jobs", "finish"]
     for spec in specs:
         assert set(spec) == {"name", "description", "args_schema"}
         assert spec["description"]
@@ -1387,6 +2026,56 @@ def test_offline_demo_pages_fetch_and_detect(demo_settings: Settings, url: str, 
     tech = registry[ToolName.DETECT_TECH].run({"url": url}, demo_settings)
     assert tech.ok is True
     assert expected_tech <= {t["name"] for t in tech.data["tech"]}
+
+
+@pytest.mark.parametrize(
+    "target,ats,least",
+    [
+        # Live recordings: three of the four platforms, at real board sizes.
+        ("https://jobs.ashbyhq.com/vanta", "Ashby", 50),
+        ("https://jobs.ashbyhq.com/ramp", "Ashby", 50),
+        ("https://boards.greenhouse.io/duolingo", "Greenhouse", 50),
+        ("https://jobs.lever.co/outreach", "Lever", 20),
+        # Hand-authored, so the fourth parser is exercised offline too.
+        ("https://apply.workable.com/acmewidgets", "Workable", 5),
+    ],
+)
+def test_offline_demo_boards_produce_headcount_signal(
+    demo_settings: Settings, target: str, ats: str, least: int
+):
+    """The whole point: --offline answers 'how big are they?' with a number."""
+    obs = build_registry(demo_settings)[ToolName.FETCH_JOBS].run(
+        {"company_or_url": target}, demo_settings
+    )
+    assert obs.ok is True, obs.error
+    assert obs.data["ats"] == ats
+    assert obs.data["open_roles"] >= least
+    assert sum(obs.data["departments"].values()) == obs.data["open_roles"]
+    assert obs.data["titles"] and len(obs.data["titles"]) <= 15
+    assert obs.data["from_fixture"] is True
+
+
+def test_offline_demo_resolves_a_board_from_a_bare_company_name(demo_settings: Settings):
+    """Ramp's careers page is too big to fixture whole, so the slug guess carries it."""
+    obs = build_registry(demo_settings)[ToolName.FETCH_JOBS].run(
+        {"company_or_url": "Ramp"}, demo_settings
+    )
+    assert obs.ok is True, obs.error
+    assert obs.data["slug"] == "ramp" and obs.data["open_roles"] > 0
+
+
+def test_committed_board_fixtures_carry_no_job_descriptions():
+    """A recorded board must be counts and titles, never posting HTML."""
+    d = Path(Settings().fixture_dir)
+    if not d.is_dir():
+        pytest.skip("no fixtures committed to the repo")
+    offenders = []
+    for p in d.glob("*.json"):
+        raw = p.read_text()
+        if "job-board" in raw[:300] or "v0/postings" in raw[:300]:
+            if "descriptionHtml" in raw or "descriptionPlain" in raw:
+                offenders.append(p.name)
+    assert not offenders, f"job descriptions leaked into fixtures: {offenders}"
 
 
 def test_committed_fixtures_stay_small():

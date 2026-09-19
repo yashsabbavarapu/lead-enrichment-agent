@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -384,6 +385,26 @@ def is_unresearched(record: CompanyRecord, evidence: list[tuple[str, str]]) -> b
     return bool(record_empty or no_evidence)
 
 
+def _freshest_signal_phrase(record: CompanyRecord, today: Optional[datetime] = None) -> str:
+    """The single most actionable recent signal, for the summary line.
+
+    The tier is a ranking; this is the reason to pick up the phone this week, so
+    it belongs on the same line rather than buried in the signal table.
+    """
+    from lea.enrich.extract import describe_age, signal_age_days
+
+    best: Optional[tuple[int, str]] = None
+    for sig in record.signals or []:
+        age = signal_age_days(sig, today)
+        if age is None or age > 120:
+            continue
+        if best is None or age < best[0]:
+            best = (age, (sig.headline or "").strip())
+    if best is None or not best[1]:
+        return ""
+    return f'Freshest signal ({describe_age(best[0])}): "{best[1][:80]}".'
+
+
 def _non_assessment(record: CompanyRecord, icp: ICPProfile) -> ICPFit:
     """The output when research turned up nothing.
 
@@ -477,8 +498,12 @@ _SIZE_SCORES = {
 class _Facts:
     """Everything the deterministic scorers need, computed once per record."""
 
-    def __init__(self, record: CompanyRecord):
+    def __init__(self, record: CompanyRecord, today: Optional[datetime] = None):
+        from lea.enrich.extract import jobs_from_record
+
         self.record = record
+        self.today = today
+        self.jobs = jobs_from_record(record)
         self.text = " ".join(
             str(x or "").lower()
             for x in (record.industry, record.sub_industry, record.description)
@@ -601,6 +626,13 @@ def _sc_gtm_segment(f: _Facts) -> tuple[float, str, list[str]]:
 
 
 def _sc_company_size(f: _Facts) -> tuple[float, str, list[str]]:
+    """Size, graded on whatever evidence exists — headcount, else open roles.
+
+    Open roles are a stage/momentum proxy, not a headcount: a company running 47
+    live reqs is demonstrably not a five-person shop, but we do not know whether
+    it is 200 people or 600, and we never write a fabricated `employee_range`
+    from it. The reasoning says which evidence it used and what it cannot know.
+    """
     rec = f.record
     if rec.employee_range and rec.employee_range in _SIZE_SCORES:
         score = _SIZE_SCORES[rec.employee_range]
@@ -611,10 +643,43 @@ def _sc_company_size(f: _Facts) -> tuple[float, str, list[str]]:
             f"where GTM process pain is real but procurement is still light.",
             [f.default_url] if f.default_url else [],
         )
+
+    jobs = f.jobs
+    if jobs is not None and jobs.open_roles > 0:
+        n = jobs.open_roles
+        board = f"their {jobs.ats.title()} board" if jobs.ats else "their public job board"
+        if n >= 150:
+            score, reads = 3.0, ("hiring at a scale that implies well over 1,000 staff, "
+                                 "above the band this rubric targets")
+        elif n >= 60:
+            score, reads = 6.0, ("consistent with a late-stage company of roughly 500+, "
+                                 "near the top of the target band")
+        elif n >= 20:
+            score, reads = 9.5, ("the hiring pattern of a company scaling through the "
+                                 "51-500 band this rubric targets")
+        elif n >= 6:
+            score, reads = 8.5, ("steady hiring, consistent with an established team "
+                                 "inside the target band")
+        elif n >= 1:
+            score, reads = 6.0, ("light hiring, consistent with an early or deliberately "
+                                 "small team")
+        else:
+            score, reads = 4.0, "no live reqs, so no momentum to read"
+        gtm = jobs.gtm_roles
+        gtm_bit = f", {gtm} of them in GTM functions" if gtm else ""
+        return (
+            _clamp(score),
+            f"{n} open roles on {board}{gtm_bit} — {reads}. A company running {n} live reqs "
+            f"is demonstrably not a handful of people. Exact headcount is still unconfirmed, "
+            f"so this is graded on hiring evidence rather than a headcount band.",
+            [jobs.board_url] if jobs.board_url else ([f.default_url] if f.default_url else []),
+        )
+
     return (
         5.0,
-        "Headcount could not be established from public sources, so this is scored mid "
-        "rather than penalised. It is a gap, not a negative — see `confidence`.",
+        "Neither a headcount band nor a public job board could be found, so size is "
+        "genuinely unknown and scored mid rather than penalised. It is a gap, not a "
+        "negative — see `confidence`.",
         [],
     )
 
@@ -652,40 +717,65 @@ def _sc_tech_maturity(f: _Facts) -> tuple[float, str, list[str]]:
 
 
 def _sc_growth_signals(f: _Facts) -> tuple[float, str, list[str]]:
-    funding, hiring = f.kind("funding"), f.kind("hiring")
-    product, leadership = f.kind("product"), f.kind("leadership") + f.kind("partnership")
+    """Trigger events, discounted by age.
+
+    A nine-day-old product launch is a reason to call this week; a funding round
+    from two years ago is history. Both used to score the same. Each signal's
+    contribution is now multiplied by `recency_weight(age)`, and the reasoning
+    names which signals drove the score and how old they were.
+    """
+    from lea.enrich.extract import describe_age, recency_weight, signal_age_days
+
+    base_points = {"funding": 5.0, "hiring": 2.5, "product": 1.0,
+                   "leadership": 0.5, "partnership": 0.5, "news": 0.5}
+    caps = {"product": 2.0, "leadership": 1.0, "partnership": 1.0, "news": 1.0}
 
     score = 2.0
-    parts = []
-    if funding:
-        s = funding[0]
-        recent = bool(s.date) and "within" in (s.recency_note or "").lower()
-        score += 6.0 if recent else 5.0
-        when = f" ({s.date})" if s.date else " (undated)"
-        parts.append(f'funding: "{s.headline[:90]}"{when}')
-    if hiring:
-        score += 2.5
-        parts.append(f'hiring: "{hiring[0].headline[:70]}"')
-    if product:
-        score += min(2.0, 1.0 * len(product))
-        parts.append(f"{_plural(len(product), 'product launch', 'product launches')}")
-    if leadership:
-        score += 0.5
-        parts.append(f"{_plural(len(leadership), 'leadership/partnership signal')}")
+    spent: dict[str, float] = {}
+    scored: list[tuple[float, str, Optional[int]]] = []
 
-    if not parts:
+    for sig in f.record.signals or []:
+        pts = base_points.get(sig.kind)
+        if pts is None:
+            continue
+        age = signal_age_days(sig, f.today)
+        weighted = pts * recency_weight(age)
+        cap = caps.get(sig.kind)
+        if cap is not None:
+            room = max(0.0, cap - spent.get(sig.kind, 0.0))
+            weighted = min(weighted, room)
+            spent[sig.kind] = spent.get(sig.kind, 0.0) + weighted
+        elif sig.kind in spent:
+            continue                      # one funding/hiring signal is enough
+        else:
+            spent[sig.kind] = weighted
+        if weighted <= 0:
+            continue
+        score += weighted
+        scored.append((weighted, f'{sig.kind}: "{(sig.headline or "")[:70]}"', age))
+
+    if not scored:
         return (
             2.0,
             "No funding, hiring, product or leadership signal was found in the evidence. "
             "Without a trigger event there is no urgency to sell into.",
             [],
         )
-    return (
-        _clamp(score),
-        "Trigger events found — " + "; ".join(parts) + ". Funding plus GTM hiring in the "
-        "same period is the strongest buying signal in the rubric.",
-        f.urls_for("funding", "hiring", "product"),
-    )
+
+    scored.sort(key=lambda t: -t[0])
+    described = "; ".join(f"{label} ({describe_age(age)})" for _w, label, age in scored[:3])
+    freshest = min((a for _w, _l, a in scored if a is not None), default=None)
+    if freshest is not None and freshest <= 30:
+        tail = (f"The freshest is {describe_age(freshest)}, which is current enough to open "
+                f"a conversation on this week.")
+    elif freshest is not None and freshest > 365:
+        tail = ("Everything here is over a year old, so it is context rather than a reason "
+                "to call now — scored down accordingly.")
+    else:
+        tail = "Signals are weighted by age, so older events count for less."
+
+    return (_clamp(score), f"Trigger events — {described}. {tail}",
+            f.urls_for("funding", "hiring", "product"))
 
 
 def _sc_geo(f: _Facts) -> tuple[float, str, list[str]]:
@@ -870,6 +960,29 @@ def _align_scores(
             score = 5.0
         score = max(0.0, min(10.0, score))
         urls = [u for u in (got.evidence_urls or []) if u in allowed_urls]
+        # Narrow override: the model punted to the neutral 5/10 with nothing to
+        # cite, while the rubric scorer has an actual citation. Observed live as
+        # "Employee range is unknown... using the fallback unknown score of 5",
+        # sometimes alongside a headcount recalled from training data. A cited
+        # grade beats an uncited non-answer. Deliberately does NOT fire when the
+        # model made a real judgement (any score but the 5.0 fallback) - an
+        # uncited good judgement is still a judgement.
+        sub = fallback.get(crit.key)
+        if (
+            not urls
+            and score == 5.0
+            and sub is not None
+            and sub.evidence_urls
+            and sub.score != 5.0
+        ):
+            sub = sub.model_copy(deep=True)
+            sub.reasoning = (
+                "Superseded the model's uncited grade "
+                f"({score:.0f}/10) with cited evidence. " + sub.reasoning
+            )
+            out.append(sub)
+            continue
+
         reasoning = (got.reasoning or "").strip() or "No reasoning returned."
         if not urls and "no evidence" not in reasoning.lower():
             reasoning = reasoning.rstrip(".") + ". (No source URL cited for this criterion.)"
@@ -993,6 +1106,9 @@ def score_icp(
         )
         if weak:
             summary += f" Weakest: {weak[0].key} {weak[0].score:.0f}/10."
+        fresh = _freshest_signal_phrase(record)
+        if fresh:
+            summary += f" {fresh}"
         if graded_by == "rubric":
             summary += (
                 " Graded by the deterministic rubric (no LLM judgement available) — "

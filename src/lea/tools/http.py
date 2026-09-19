@@ -12,7 +12,8 @@ import ipaddress
 import json
 import socket
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -517,8 +518,15 @@ def request(
     allow_private_hosts: Optional[bool] = None,
     timeout: Optional[float] = None,
     client: Optional[httpx.Client] = None,
+    record_transform: Optional[Callable[[str], str]] = None,
 ) -> HttpResult:
-    """Perform (or replay) one HTTP call. Never raises."""
+    """Perform (or replay) one HTTP call. Never raises.
+
+    `record_transform` shrinks the body *on its way to disk only*; the caller
+    still gets the full response. An ATS board is 2.5MB of job descriptions we
+    never read, and blind truncation would leave invalid JSON in the fixture —
+    the caller knows which fields are dead weight, so it does the pruning.
+    """
     started = time.perf_counter()
     method = method.upper()
     full_url = _with_params(url, params)
@@ -607,8 +615,20 @@ def request(
     # `record=False` lets a caller defer recording until it knows the body is
     # actually useful — a search provider must not cache a bot-challenge page.
     if settings.record_fixtures and record:
-        write_fixture(settings, full_url, body, result)
+        write_fixture(settings, full_url, body, _for_fixture(result, record_transform))
     return result
+
+
+def _for_fixture(result: HttpResult, transform: Optional[Callable[[str], str]]) -> HttpResult:
+    if transform is None or not result.text:
+        return result
+    try:
+        pruned = transform(result.text)
+    except Exception:
+        return result  # a bad pruner must not cost us the recording
+    if not pruned or pruned == result.text:
+        return result
+    return replace(result, text=pruned)
 
 
 def _with_params(url: str, params: Optional[dict[str, Any]]) -> str:

@@ -29,6 +29,14 @@ __all__ = [
     "is_aggregator",
     "registrable_label",
     "citable_urls",
+    "parse_jobs_evidence",
+    "jobs_from_record",
+    "jobs_signal",
+    "signal_age_days",
+    "recency_weight",
+    "describe_age",
+    "JobsData",
+    "GTM_DEPARTMENTS",
     "AGGREGATOR_DOMAINS",
     "MAX_COMPANY_NAME_CHARS",
     "PRIORITY_FIELDS",
@@ -316,6 +324,301 @@ def _sort_signals(signals: list[Signal]) -> list[Signal]:
             dated.append((k, i, s))
     dated.sort(key=lambda t: (t[0][0], t[0][1], t[0][2], -t[1]), reverse=True)
     return [t[2] for t in dated] + undated
+
+
+# --------------------------------------------------------------------------
+# Job-board evidence
+#
+# Agent A's `fetch_jobs` tool reads public ATS boards and returns
+#   {"open_roles": int, "departments": {name: count}, "locations": [...],
+#    "titles": [...], "ats": "ashby", "board_url": "..."}
+# but the agent loop flattens every observation to (source_url, text) before it
+# reaches us, so that payload arrives as prose. We parse it back out tolerantly:
+# JSON first, then the summary text. If the tool ships a different shape, the
+# text path still recovers the two numbers that matter.
+#
+# Honesty rule: open roles are NEVER converted into an `employee_range`. A
+# hiring count is evidence about stage and momentum, not a headcount, and
+# inventing a band from it is exactly the plausible-fabrication failure this
+# project exists to avoid.
+# --------------------------------------------------------------------------
+
+_ATS_HOSTS = ("ashby", "greenhouse", "lever.co", "workable", "jobs.", "boards.", "careers")
+_OPEN_ROLES_RE = re.compile(r"(\d{1,4})\s+open\s+(?:roles?|positions?|jobs?)", re.I)
+# Agent A's `fetch_jobs` renders "Engineering (21), Sales (9)"; we also accept
+# "Engineering: 21" and "21 in Engineering" so a summary reword does not break us.
+# Each word must be capitalised, so "roles on Ashby across Engineering (21)"
+# yields "Engineering" rather than swallowing the prose before it.
+_DEPT_PAREN_RE = re.compile(
+    r"([A-Z][\w&/+'.]*(?:\s*[&/]?\s*[A-Z][\w&/+'.]*)*)\s*\((\d{1,4})\)")
+_DEPT_COLON_RE = re.compile(r"([A-Z][\w&/+'. ]{1,28}?)\s*[:\u2013-]\s*(\d{1,4})\b")
+_DEPT_IN_RE = re.compile(r"(\d{1,4})\s+in\s+([A-Z][\w&/+'.]*(?:\s[A-Z][\w&/+'.]*)*)")
+_LATEST_POSTED_RE = re.compile(r"latest\s+(\d{4}-\d{2}-\d{2})", re.I)
+_POSTED_30D_RE = re.compile(r"(\d{1,4})\s+posted\s+in\s+the\s+last\s+(\d{1,3})\s+days", re.I)
+_ATS_NAME_RE = re.compile(r"\b(ashby|greenhouse|lever|workable)\b", re.I)
+#: Host fragments, because "jobs.ashbyhq.com" has no word boundary after "ashby".
+_ATS_HOST_NAMES = (("ashbyhq", "ashby"), ("greenhouse.io", "greenhouse"),
+                   ("boards-api.greenhouse", "greenhouse"), ("lever.co", "lever"),
+                   ("workable.com", "workable"))
+
+
+def _ats_name(text: str, url: str) -> str:
+    """Which ATS is this? Prefer the host, which cannot be a coincidence."""
+    low = (url or "").lower()
+    for fragment, name in _ATS_HOST_NAMES:
+        if fragment in low:
+            return name
+    m = _ATS_NAME_RE.search(text or "")
+    return m.group(1).lower() if m else ""
+
+#: Departments a GTM seller actually cares about.
+GTM_DEPARTMENTS = ("sales", "revenue", "marketing", "growth", "customer success",
+                   "business development", "partnerships", "revops", "gtm")
+
+
+class JobsData:
+    """Parsed public-job-board evidence. A cheap value object, not a model."""
+
+    __slots__ = ("open_roles", "departments", "locations", "ats", "board_url",
+                 "latest_posted", "posted_recently")
+
+    def __init__(self, open_roles: int = 0, departments: Optional[dict[str, int]] = None,
+                 locations: Optional[list[str]] = None, ats: str = "",
+                 board_url: str = "", latest_posted: str = "",
+                 posted_recently: int = 0) -> None:
+        self.open_roles = int(open_roles or 0)
+        self.departments = {str(k): int(v) for k, v in (departments or {}).items() if str(k).strip()}
+        self.locations = list(locations or [])
+        self.ats = str(ats or "")
+        self.board_url = str(board_url or "")
+        self.latest_posted = str(latest_posted or "")
+        self.posted_recently = int(posted_recently or 0)
+
+    @property
+    def gtm_roles(self) -> int:
+        return sum(n for d, n in self.departments.items()
+                   if any(g in d.lower() for g in GTM_DEPARTMENTS))
+
+    def gtm_breakdown(self, k: int = 3) -> list[tuple[str, int]]:
+        hits = [(d, n) for d, n in self.departments.items()
+                if any(g in d.lower() for g in GTM_DEPARTMENTS)]
+        return sorted(hits, key=lambda kv: (-kv[1], kv[0]))[:k]
+
+    def top_departments(self, k: int = 3) -> list[tuple[str, int]]:
+        return sorted(self.departments.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"JobsData(open_roles={self.open_roles}, departments={self.departments})"
+
+
+def _jobs_from_json(text: str) -> Optional[JobsData]:
+    if "{" not in (text or ""):
+        return None
+    try:
+        import json
+        start, end = text.index("{"), text.rindex("}") + 1
+        blob = json.loads(text[start:end])
+    except Exception:
+        return None
+    if not isinstance(blob, dict) or "open_roles" not in blob:
+        return None
+    try:
+        return JobsData(
+            open_roles=blob.get("open_roles") or 0,
+            departments=blob.get("departments") or {},
+            locations=blob.get("locations") or [],
+            ats=blob.get("ats") or "",
+            board_url=blob.get("board_url") or "",
+            latest_posted=blob.get("latest_posted") or "",
+            posted_recently=blob.get("posted_last_30d") or 0,
+        )
+    except Exception:
+        return None
+
+
+def _jobs_from_text(text: str, url: str) -> Optional[JobsData]:
+    total_m = _OPEN_ROLES_RE.search(text or "")
+    if not total_m:
+        return None
+    total = int(total_m.group(1))
+    tail = text[total_m.end():][:600]      # the breakdown follows the total
+
+    departments: dict[str, int] = {}
+    for name, count in _DEPT_PAREN_RE.findall(tail):
+        departments.setdefault(name.strip(" ,;.-"), int(count))
+    if not departments:
+        for name, count in _DEPT_COLON_RE.findall(tail):
+            departments.setdefault(name.strip(" ,;.-"), int(count))
+    if not departments:
+        for count, name in _DEPT_IN_RE.findall(tail):
+            departments.setdefault(name.strip(" ,;.-"), int(count))
+    departments = {
+        k: v for k, v in departments.items()
+        if k and k.lower() not in {"open", "roles", "total", "and", "in", "remote", "latest"}
+        and 0 < v <= total
+    }
+
+    latest_m = _LATEST_POSTED_RE.search(text)
+    recent_m = _POSTED_30D_RE.search(text)
+    return JobsData(
+        open_roles=total,
+        departments=departments,
+        ats=_ats_name(text[:400], url),
+        board_url=url,
+        latest_posted=latest_m.group(1) if latest_m else "",
+        posted_recently=int(recent_m.group(1)) if recent_m else 0,
+    )
+
+
+def parse_jobs_evidence(evidence: list[tuple[str, str]]) -> Optional[JobsData]:
+    """Find and parse the job-board block in an evidence list, if there is one."""
+    best: Optional[JobsData] = None
+    for url, text in evidence or []:
+        if not text:
+            continue
+        looks_like_board = any(h in (url or "").lower() for h in _ATS_HOSTS) or bool(
+            _OPEN_ROLES_RE.search(text))
+        if not looks_like_board:
+            continue
+        got = _jobs_from_json(text) or _jobs_from_text(text, url or "")
+        if got is None:
+            continue
+        if not got.board_url:
+            got.board_url = url or ""
+        if best is None or (got.open_roles, len(got.departments)) > (
+                best.open_roles, len(best.departments)):
+            best = got
+    return best
+
+
+def jobs_signal(jobs: JobsData) -> Signal:
+    """A hiring Signal carrying the counts in `detail`.
+
+    The record model is frozen, so `detail` is where this structured fact lives.
+    The format is deliberately both readable in the CLI and parseable back by
+    `jobs_from_record`.
+    """
+    breakdown = ", ".join(f"{n} in {d}" for d, n in jobs.top_departments(4))
+    where = f" on their {jobs.ats.title()} board" if jobs.ats else " on their public job board"
+    detail = f"{jobs.open_roles} open roles{where}"
+    if breakdown:
+        detail += f" - {breakdown}"
+    return Signal(
+        kind="hiring",
+        headline=f"{jobs.open_roles} open roles" + (f" ({breakdown})" if breakdown else ""),
+        detail=detail + ".",
+        date=jobs.latest_posted or None,
+        source_url=jobs.board_url or None,
+        recency_note=(
+            f"{jobs.posted_recently} posted in the last 30 days"
+            if jobs.posted_recently else "live job board"
+        ),
+    )
+
+
+_READBACK_TOTAL_RE = re.compile(r"(\d{1,4})\s+open\s+roles", re.I)
+_READBACK_DEPT_RE = re.compile(r"(\d{1,4})\s+in\s+([A-Z][\w&/+']*(?:\s[A-Z][\w&/+']*)*)")
+
+
+def jobs_from_record(record: CompanyRecord) -> Optional[JobsData]:
+    """Recover job-board facts from the hiring signal `jobs_signal` wrote.
+
+    Lets the ICP scorer and hook writer reuse the department mix without adding
+    a field to the frozen record model.
+    """
+    for s in record.signals or []:
+        if s.kind != "hiring":
+            continue
+        blob = f"{s.headline or ''} {s.detail or ''}"
+        m = _READBACK_TOTAL_RE.search(blob)
+        if not m:
+            continue
+        depts: dict[str, int] = {}
+        for n, name in _READBACK_DEPT_RE.findall(blob):
+            depts.setdefault(name.strip(), int(n))
+        return JobsData(open_roles=int(m.group(1)), departments=depts,
+                        ats=_ats_name(blob, s.source_url or ""),
+                        board_url=s.source_url or "")
+    return None
+
+
+# --------------------------------------------------------------------------
+# Signal recency
+# --------------------------------------------------------------------------
+
+_RECENCY_NOTE_DAYS = [
+    (re.compile(r"\blive\s+job\s+board\b", re.I), lambda m: 0),
+    (re.compile(r"\bwithin\s+(\d+)\s+days?\b", re.I), lambda m: int(m.group(1))),
+    (re.compile(r"\bwithin\s+a\s+week\b", re.I), lambda m: 7),
+    (re.compile(r"\bwithin\s+a\s+month\b", re.I), lambda m: 30),
+    (re.compile(r"\b(\d+)\s+days?\s+ago\b", re.I), lambda m: int(m.group(1))),
+    (re.compile(r"\bover\s+a\s+year\s+ago\b", re.I), lambda m: 500),
+    (re.compile(r"\bthis\s+(?:week|month)\b", re.I), lambda m: 14),
+]
+
+
+def signal_age_days(signal: Signal, today: Optional[datetime] = None) -> Optional[int]:
+    """How old is this signal, in days? None means genuinely undated.
+
+    Prefers the parsed `date`, falls back to phrases in `recency_note`. A live
+    job board counts as today: it is a snapshot of right now.
+    """
+    now = today or datetime.now(timezone.utc)
+    key = _date_key(signal.date) if signal.date else None
+    if key is not None:
+        y, m, d = key
+        try:
+            when = datetime(y, m or 1, d or 1, tzinfo=timezone.utc)
+            return max(0, (now - when).days)
+        except ValueError:
+            pass
+    for rx, fn in _RECENCY_NOTE_DAYS:
+        m = rx.search(signal.recency_note or "")
+        if m:
+            try:
+                return max(0, int(fn(m)))
+            except Exception:
+                continue
+    return None
+
+
+def recency_weight(age_days: Optional[int]) -> float:
+    """How much a signal still counts, by age.
+
+    Undated sits at 0.7 — deliberately above the 0.55 a dated 6-12 month signal
+    gets, and below the 0.9+ of anything under 90 days. An undated signal might
+    be from last week; discounting it to half would penalise the company for our
+    extractor failing to find a date, which is the same "missing evidence read as
+    bad evidence" mistake `confidence` exists to avoid.
+    """
+    if age_days is None:
+        return 0.7
+    if age_days <= 30:
+        return 1.0
+    if age_days <= 90:
+        return 0.9
+    if age_days <= 180:
+        return 0.75
+    if age_days <= 365:
+        return 0.55
+    if age_days <= 730:
+        return 0.35
+    return 0.2
+
+
+def describe_age(age_days: Optional[int]) -> str:
+    """Human phrasing for a signal's age, for the reasoning column."""
+    if age_days is None:
+        return "undated"
+    if age_days <= 1:
+        return "today"
+    if age_days <= 30:
+        return f"{age_days} days old"
+    if age_days <= 75:
+        return f"{max(1, round(age_days / 7))} weeks old"
+    if age_days <= 400:
+        return f"{max(1, round(age_days / 30))} months old"
+    return f"{age_days / 365:.1f} years old"
 
 
 def _tech_tokens(name: str) -> list[str]:
@@ -808,6 +1111,30 @@ def extract_record(
 
     if not isinstance(rec, CompanyRecord):
         rec = CompanyRecord(input=target)
+
+    # A public job board is the one hard hiring number we can get. Fold it in as
+    # a proper signal before normalization so dedupe and sorting see it, and so
+    # it lands in `sources` like any other cited fact. It never becomes an
+    # employee_range - see the honesty note on the parser.
+    jobs = parse_jobs_evidence(evidence)
+    if jobs is not None and jobs.open_roles > 0:
+        # The counted board is the best hiring evidence we have, so redundant
+        # hiring signals go rather than sitting beside it: both the vague
+        # "See open positions" scraped off a careers page, and the model's own
+        # restatement of the same total ("Vanta has 93 open roles on Ashby").
+        total = str(jobs.open_roles)
+
+        def redundant(sig: Signal) -> bool:
+            if sig.kind != "hiring":
+                return False
+            blob = f"{sig.headline or ''} {sig.detail or ''}"
+            if total in re.findall(r"\d+", blob):
+                return True                      # restates the same count
+            return not any(ch.isdigit() for ch in sig.headline or "")
+
+        rec.signals = [jobs_signal(jobs)] + [
+            s for s in (rec.signals or []) if not redundant(s)
+        ]
 
     # Only evidence we actually read is citable — a robots-blocked or 404'd fetch
     # still appears in the list and must not end up in `sources`.

@@ -8,6 +8,7 @@ rather than about model behavior.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pytest
@@ -739,34 +740,35 @@ def test_score_icp_falls_back_to_the_rubric_when_the_model_fails(settings):
     """No flat 50/C. The record itself is graded, and the arithmetic is exact.
 
     _known_record() -> company_type 9.0 (fintech + Salesforce CRM), company_size
-    10.0 (201-500), tech_maturity 4.7 (1 tech / 1 category + CRM), growth_signals
-    7.0 (undated funding signal). Weights 2,1,1,1:
-        (9.0*2 + 10.0 + 4.7 + 7.0) / 5 * 10 = 39.7 / 5 * 10 = 79.4
+    10.0 (known 201-500 band), tech_maturity 4.7 (1 tech / 1 category + CRM),
+    growth_signals 5.5 (one UNDATED funding signal: 2.0 base + 5.0 * 0.7 undated
+    recency weight). Weights 2,1,1,1:
+        (9.0*2 + 10.0 + 4.7 + 5.5) / 5 * 10 = 38.2 / 5 * 10 = 76.4
     """
     llm = FakeLLM(raise_on=ICPFit)
     fit = score_icp(_known_record(), _icp_4(), [("https://a.example", "t")], llm, settings)
 
-    assert fit.score == 79.4
+    assert fit.score == 76.4
     assert fit.tier == "B"
     assert (fit.score, fit.tier) != (50.0, "C")
-    assert all(len(c.reasoning) > 40 for c in fit.criteria)   # real analysis, not a stub line
+    assert all(len(c.reasoning) > 40 for c in fit.criteria)
     assert "deterministic rubric" in fit.summary
 
 
 def test_model_scores_are_kept_and_only_gaps_are_rubric_graded(settings):
-    """A partial model response is not discarded — the judgement it did make stands.
+    """A partial model response is not discarded - the judgement it made stands.
 
-    company_type 10.0 comes from the model; the other three are rubric-graded as
-    above: (10.0*2 + 10.0 + 4.7 + 7.0) / 5 * 10 = 41.7 / 5 * 10 = 83.4
+    company_type 10.0 from the model; the other three rubric-graded as above:
+        (10.0*2 + 10.0 + 4.7 + 5.5) / 5 * 10 = 40.2 / 5 * 10 = 80.4
     """
     fit_in = _fit_from({"company_type": 10}, urls=["https://a.example"])
     llm = FakeLLM({ICPFit: fit_in})
     fit = score_icp(_known_record(), _icp_4(), [("https://a.example", "t")], llm, settings)
 
     assert len(fit.criteria) == 4
-    assert fit.score == 83.4
+    assert fit.score == 80.4
     by_key = {c.key: c for c in fit.criteria}
-    assert by_key["company_type"].score == 10.0                      # the model's
+    assert by_key["company_type"].score == 10.0
     assert "skipped this criterion" in by_key["tech_maturity"].reasoning
 
 
@@ -896,12 +898,16 @@ def test_rubric_scores_respond_to_the_evidence_that_drives_them(settings):
 
 
 def test_unknown_headcount_scores_mid_not_zero(settings):
+    """Neither a band nor a job board: genuinely unknown, scored mid, said plainly."""
     rec = _ramp_like()
+    rec.signals = [s for s in rec.signals if s.kind != "hiring"]   # remove the board evidence
     assert rec.employee_range is None
+
     fit = score_icp(rec, DEFAULT_ICP, _ev(rec), _stub_like_llm(), settings)
     size = next(c for c in fit.criteria if c.key == "company_size")
     assert size.score == 5.0
-    assert "could not be established" in size.reasoning
+    assert "genuinely unknown" in size.reasoning
+    assert size.evidence_urls == []
 
 
 def test_degenerate_detection(settings):
@@ -1332,3 +1338,286 @@ def test_write_csv_round_trips_through_read_targets(tmp_path):
     write_csv([_result("Ramp", 82.0, "A"), _result("Vanta", 71.0, "B")], out)
     # the output's `company_name` column is a valid input list for a re-run
     assert read_targets(out) == ["Ramp", "Vanta"]
+
+
+# --------------------------------------------------------------------------
+# Job-board evidence (Agent A's fetch_jobs) and signal recency
+# --------------------------------------------------------------------------
+
+JOBS_JSON = (
+    '{"open_roles": 47, "departments": {"Engineering": 21, "Sales": 9, "Security": 6, '
+    '"Marketing": 4}, "locations": ["Remote", "SF"], "ats": "ashby", '
+    '"board_url": "https://jobs.ashbyhq.com/vanta"}'
+)
+# Exactly what Agent A's fetch_jobs `render_summary` emits — the loop flattens
+# observations to (url, summary), so this string is what actually reaches us.
+JOBS_PROSE = (
+    "Vanta — 47 open roles on Ashby across Engineering (21), Sales (9), Security (6); "
+    "locations incl. Remote, SF; 12 remote; 9 posted in the last 30 days "
+    "(latest 2026-09-10). Board: https://jobs.ashbyhq.com/vanta"
+)
+JOBS_COLON = "Vanta: 47 open roles. Engineering: 21, Sales: 9, Security: 6."
+
+
+@pytest.mark.parametrize("text", [JOBS_JSON, JOBS_PROSE, JOBS_COLON])
+def test_parse_jobs_evidence_handles_every_shape_the_tool_emits(text):
+    """JSON payload, Agent A's rendered summary, and a colon-separated reword."""
+    from lea.enrich.extract import parse_jobs_evidence
+
+    jobs = parse_jobs_evidence([("https://jobs.ashbyhq.com/vanta", text)])
+    assert jobs is not None
+    assert jobs.open_roles == 47
+    assert jobs.departments["Sales"] == 9
+    assert jobs.departments["Security"] == 6
+    assert jobs.ats == "ashby"
+    assert jobs.gtm_roles >= 9          # Sales, plus Marketing when present
+
+
+def test_parse_jobs_picks_up_posting_recency_from_the_summary():
+    """`latest_posted` makes the hiring signal properly dated, not just 'live'."""
+    from lea.enrich.extract import parse_jobs_evidence
+
+    jobs = parse_jobs_evidence([("https://jobs.ashbyhq.com/vanta", JOBS_PROSE)])
+    assert jobs.latest_posted == "2026-09-10"
+    assert jobs.posted_recently == 9
+
+
+def test_job_board_signal_is_dated_from_the_latest_posting(settings):
+    from lea.enrich.extract import signal_age_days
+
+    llm = FakeLLM({CompanyRecord: CompanyRecord(input="Vanta", company_name="Vanta")})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_PROSE)], llm, settings)
+    sig = next(s for s in rec.signals if s.kind == "hiring")
+
+    assert sig.date == "2026-09-10"
+    assert signal_age_days(sig, TODAY) == 9        # fresh, not merely "undated"
+
+
+def test_parse_jobs_evidence_ignores_ordinary_pages():
+    from lea.enrich.extract import parse_jobs_evidence
+
+    assert parse_jobs_evidence([("https://vanta.com", "We build compliance software.")]) is None
+    assert parse_jobs_evidence([]) is None
+
+
+def test_open_roles_never_fabricate_an_employee_range(settings):
+    """The honesty rule: a hiring count is not a headcount."""
+    llm = FakeLLM({CompanyRecord: CompanyRecord(input="Vanta", company_name="Vanta")})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+
+    assert rec.employee_range is None
+    assert rec.employee_estimate is None
+    assert "employee_range" in rec.unknowns
+
+
+def test_job_board_becomes_a_hiring_signal_with_counts(settings):
+    llm = FakeLLM({CompanyRecord: CompanyRecord(input="Vanta", company_name="Vanta")})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+
+    hiring = [s for s in rec.signals if s.kind == "hiring"]
+    assert len(hiring) == 1
+    sig = hiring[0]
+    assert "47 open roles" in sig.headline
+    assert "9 in Sales" in sig.detail
+    assert sig.source_url == "https://jobs.ashbyhq.com/vanta"
+    assert sig.source_url in rec.sources
+
+
+def test_job_board_signal_round_trips_back_out_of_the_record(settings):
+    """icp.py and hooks.py read the counts back via the signal, not a new field."""
+    from lea.enrich.extract import jobs_from_record
+
+    llm = FakeLLM({CompanyRecord: CompanyRecord(input="Vanta", company_name="Vanta")})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+
+    back = jobs_from_record(rec)
+    assert back is not None
+    assert back.open_roles == 47
+    assert back.departments["Sales"] == 9
+    assert back.gtm_roles == 13
+
+
+def test_counted_board_replaces_a_vague_hiring_signal(settings):
+    vague = CompanyRecord(
+        input="Vanta", company_name="Vanta",
+        signals=[Signal(kind="hiring", headline="See open positions",
+                        source_url="https://vanta.com/careers")],
+    )
+    llm = FakeLLM({CompanyRecord: vague})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+
+    headlines = [s.headline for s in rec.signals if s.kind == "hiring"]
+    assert headlines == ["47 open roles (21 in Engineering, 9 in Sales, 6 in Security, 4 in Marketing)"]
+    assert "See open positions" not in headlines
+
+
+def test_company_size_grades_on_open_roles_and_cites_the_board(settings):
+    """WEAKNESS 1: the criterion must stop defaulting to 5.0 with no evidence."""
+    llm = FakeLLM({CompanyRecord: CompanyRecord(input="Vanta", company_name="Vanta",
+                                                domain="vanta.com", industry="Compliance")})
+    ev = [("https://jobs.ashbyhq.com/vanta", JOBS_JSON), ("https://vanta.com", "compliance")]
+    rec = extract_record("Vanta", ev, llm, settings)
+    fit = score_icp(rec, DEFAULT_ICP, ev, rec and _stub_like_llm(), settings)
+
+    size = next(c for c in fit.criteria if c.key == "company_size")
+    assert size.score != 5.0, "must not default to mid when a job board was read"
+    assert size.score >= 9.0                       # 47 roles == scaling through the band
+    assert "47 open roles" in size.reasoning
+    assert "unconfirmed" in size.reasoning          # still honest about headcount
+    assert size.evidence_urls == ["https://jobs.ashbyhq.com/vanta"]
+
+
+def test_reading_a_job_board_raises_confidence(settings):
+    """WEAKNESS 1: confidence was stuck at 0.30-0.35 because size was never evidenced."""
+    base = CompanyRecord(input="Vanta", company_name="Vanta", domain="vanta.com",
+                         industry="Compliance")
+    plain_ev = [("https://vanta.com", "We build compliance software.")]
+    board_ev = plain_ev + [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)]
+
+    without = score_icp(
+        extract_record("Vanta", plain_ev, FakeLLM({CompanyRecord: base}), settings),
+        DEFAULT_ICP, plain_ev, _stub_like_llm(), settings)
+    with_board = score_icp(
+        extract_record("Vanta", board_ev, FakeLLM({CompanyRecord: base}), settings),
+        DEFAULT_ICP, board_ev, _stub_like_llm(), settings)
+
+    assert with_board.confidence > without.confidence
+
+
+# --- recency --------------------------------------------------------------
+
+TODAY = datetime(2026, 9, 19, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "date,expected_days",
+    [
+        ("2026-09-10", 9),
+        ("2026-09-03", 16),
+        ("2026-08-19", 31),
+        ("2024-07-24", 787),
+        (None, None),
+    ],
+)
+def test_signal_age_days(date, expected_days):
+    from lea.enrich.extract import signal_age_days
+
+    sig = Signal(kind="product", headline="x", date=date)
+    assert signal_age_days(sig, TODAY) == expected_days
+
+
+def test_recency_weight_curve():
+    from lea.enrich.extract import recency_weight
+
+    assert recency_weight(9) == 1.0
+    assert recency_weight(60) == 0.9
+    assert recency_weight(400) == 0.35
+    assert recency_weight(800) == 0.2
+    # undated counts for something, and is NOT the worst case
+    assert recency_weight(None) == 0.7
+    assert recency_weight(None) > recency_weight(400)
+    assert recency_weight(None) < recency_weight(9)
+
+
+def test_fresh_signals_outscore_stale_ones(settings):
+    """WEAKNESS 2: a 9-day-old launch and a 2-year-old round must not tie."""
+    fresh = CompanyRecord(
+        input="Linear", company_name="Linear", domain="linear.app", industry="SaaS",
+        sources=["https://linear.app/changelog"],
+        signals=[
+            Signal(kind="product", headline="Linear ships Agents", date="2026-09-10",
+                   source_url="https://linear.app/changelog"),
+            Signal(kind="product", headline="Customer Requests GA", date="2026-09-03",
+                   source_url="https://linear.app/changelog"),
+        ],
+    )
+    stale = CompanyRecord(
+        input="Oldco", company_name="Oldco", domain="oldco.com", industry="SaaS",
+        sources=["https://oldco.com/news"],
+        signals=[
+            Signal(kind="funding", headline="Oldco raises $40M Series B", date="2024-07-24",
+                   source_url="https://oldco.com/news"),
+        ],
+    )
+    ev_f = [("https://linear.app/changelog", "t")]
+    ev_s = [("https://oldco.com/news", "t")]
+
+    gf = next(c for c in score_icp(fresh, DEFAULT_ICP, ev_f, _stub_like_llm(), settings).criteria
+              if c.key == "growth_signals")
+    gs = next(c for c in score_icp(stale, DEFAULT_ICP, ev_s, _stub_like_llm(), settings).criteria
+              if c.key == "growth_signals")
+
+    assert gf.score > gs.score, "a 9-day-old launch must beat a 2-year-old round"
+    assert "9 days old" in gf.reasoning
+    assert "this week" in gf.reasoning
+    assert "over a year old" in gs.reasoning
+
+
+def test_freshest_signal_is_surfaced_in_the_summary(settings):
+    rec = CompanyRecord(
+        input="Linear", company_name="Linear", domain="linear.app", industry="SaaS",
+        sources=["https://linear.app/changelog"],
+        signals=[Signal(kind="product", headline="Linear ships Agents", date="2026-09-10",
+                        source_url="https://linear.app/changelog")],
+    )
+    from lea.enrich.icp import _freshest_signal_phrase
+
+    phrase = _freshest_signal_phrase(rec, TODAY)
+    assert "Linear ships Agents" in phrase
+    assert "9 days old" in phrase
+    # a two-year-old signal is not "freshest" material at all
+    old = rec.model_copy(deep=True)
+    old.signals[0].date = "2024-07-24"
+    assert _freshest_signal_phrase(old, TODAY) == ""
+
+
+def test_signals_are_sorted_freshest_first(settings):
+    rec = CompanyRecord(
+        input="Linear", company_name="Linear",
+        signals=[
+            Signal(kind="product", headline="Oldest", date="2026-08-19"),
+            Signal(kind="product", headline="Newest", date="2026-09-10"),
+            Signal(kind="product", headline="Undated"),
+            Signal(kind="product", headline="Middle", date="2026-09-03"),
+        ],
+    )
+    llm = FakeLLM({CompanyRecord: rec})
+    out = extract_record("Linear", [("https://linear.app", "t")], llm, settings)
+    assert [s.headline for s in out.signals] == ["Newest", "Middle", "Oldest", "Undated"]
+
+
+def test_hooks_lead_with_the_gtm_department_mix(settings):
+    """WEAKNESS 1: '9 open sales roles' is the best hook material we have."""
+    llm = FakeLLM({CompanyRecord: CompanyRecord(input="Vanta", company_name="Vanta")})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+    hooks = generate_hooks(rec, None, [], _stub_like_llm(), settings)
+
+    first = hooks[0]
+    assert "9 in sales" in first.hook.lower()
+    assert "47" in first.hook
+    assert first.source_url == "https://jobs.ashbyhq.com/vanta"
+    assert is_grounded(first.grounded_in, rec)
+    assert len(first.hook.split()) <= MAX_HOOK_WORDS
+
+
+def test_counted_board_also_absorbs_the_models_restatement(settings):
+    """Live Gemini restated the board total as a second hiring signal."""
+    dup = CompanyRecord(
+        input="Vanta", company_name="Vanta",
+        signals=[
+            Signal(kind="hiring", headline="Vanta has 47 open roles on Ashby",
+                   source_url="https://jobs.ashbyhq.com/vanta"),
+            Signal(kind="hiring", headline="See open positions",
+                   source_url="https://vanta.com/careers"),
+            Signal(kind="hiring", headline="Hiring 3 principal engineers in Dublin",
+                   source_url="https://vanta.com/careers"),
+        ],
+    )
+    llm = FakeLLM({CompanyRecord: dup})
+    rec = extract_record("Vanta", [("https://jobs.ashbyhq.com/vanta", JOBS_JSON)], llm, settings)
+
+    hiring = [s.headline for s in rec.signals if s.kind == "hiring"]
+    assert len(hiring) == 2
+    assert hiring[0].startswith("47 open roles (")        # ours, with the breakdown
+    # a hiring signal about something else survives
+    assert "Hiring 3 principal engineers in Dublin" in hiring

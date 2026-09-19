@@ -331,6 +331,49 @@ def _h_funding(name: str, s: Signal) -> Optional[tuple[str, str, str, Optional[s
     return (f"{raised} -> GTM scale", text, s.headline, s.source_url)
 
 
+def _h_jobs(name: str, record: CompanyRecord) -> Optional[tuple[str, str, str, Optional[str]]]:
+    """Department mix off a live job board.
+
+    For a GTM buyer this is the best material in the record: "9 open sales roles"
+    says more about budget and urgency right now than a funding round from 2024.
+    """
+    from lea.enrich.extract import jobs_from_record
+
+    jobs = jobs_from_record(record)
+    if jobs is None or jobs.open_roles <= 0:
+        return None
+
+    gtm = jobs.gtm_breakdown(2)
+    url = jobs.board_url or (record.sources[0] if record.sources else None)
+    grounded = f"{jobs.open_roles} open roles"
+
+    if gtm:
+        mix = _join_human([f"{n} in {d.lower()}" for d, n in gtm])
+        total_gtm = sum(n for _d, n in gtm)
+        text = (
+            f"{jobs.open_roles} roles open at {name} right now, {mix}. Hiring {total_gtm} "
+            f"go-to-market people at once is usually a number someone had to defend — "
+            f"what breaks first when they all land?"
+        )
+        return (f"{total_gtm} open GTM roles", text, grounded, url)
+
+    top = jobs.top_departments(2)
+    if top:
+        mix = _join_human([f"{n} in {d.lower()}" for d, n in top])
+        text = (
+            f"{jobs.open_roles} open roles at {name}, weighted toward {mix}. That mix "
+            f"tends to show up right before the reporting everyone relies on stops matching "
+            f"the org chart."
+        )
+        return ("hiring mix", text, grounded, url)
+
+    text = (
+        f"{jobs.open_roles} roles open at {name} at once. That pace usually outruns the "
+        f"process around it by a quarter or so — is that where you are?"
+    )
+    return (f"{jobs.open_roles} open roles", text, grounded, url)
+
+
 def _h_hiring(name: str, s: Signal) -> Optional[tuple[str, str, str, Optional[str]]]:
     sp = _specifics(s)
     count, roles, ae = sp.get("role_count"), sp.get("roles"), sp.get("ae")
@@ -437,6 +480,9 @@ def _fallback_hooks(record: CompanyRecord, icp_fit: Optional[ICPFit], need: int)
     for s in record.signals or []:
         by_kind.setdefault(s.kind, s)
 
+    # Job-board evidence leads: a live department mix beats a dated round for a
+    # GTM buyer, because it says what they are spending on this quarter.
+    add(_h_jobs(name, record), "jobs")
     if "funding" in by_kind:
         add(_h_funding(name, by_kind["funding"]), "funding")
     if "hiring" in by_kind:

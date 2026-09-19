@@ -9,6 +9,7 @@ from lea.models import ToolName
 from lea.tools.base import Tool
 
 from .fetch import FetchPageTool
+from .jobs import FetchJobsTool
 from .search import WebSearchTool
 from .tech_detect import DetectTechTool
 
@@ -26,16 +27,27 @@ FINISH_ARGS_SCHEMA: dict[str, Any] = {
 }
 
 
+# Prompt order, and it is load-bearing: the planner reads the list top-down, so
+# the two tools that turn one URL into hard structured facts come after the two
+# that only produce more text to read.
+SPEC_ORDER: tuple[ToolName, ...] = (
+    ToolName.WEB_SEARCH,
+    ToolName.FETCH_PAGE,
+    ToolName.DETECT_TECH,
+    ToolName.FETCH_JOBS,
+)
+
+
 def build_registry(settings: Settings) -> dict[ToolName, Tool]:
     """The executable tools. FINISH is deliberately absent — the loop handles it."""
-    tools: list[Tool] = [WebSearchTool(), FetchPageTool(), DetectTechTool()]
+    tools: list[Tool] = [WebSearchTool(), FetchPageTool(), DetectTechTool(), FetchJobsTool()]
     return {t.name: t for t in tools}
 
 
 def tool_specs(registry: dict[ToolName, Tool]) -> list[dict[str, Any]]:
     """Prompt-facing description of every callable action, FINISH included."""
     specs: list[dict[str, Any]] = []
-    for name in (ToolName.WEB_SEARCH, ToolName.FETCH_PAGE, ToolName.DETECT_TECH):
+    for name in SPEC_ORDER:
         tool = registry.get(name)
         if tool is None:
             continue
@@ -48,7 +60,7 @@ def tool_specs(registry: dict[ToolName, Tool]) -> list[dict[str, Any]]:
         )
     # Anything in the registry the loop does not know about statically.
     for name, tool in registry.items():
-        if name in (ToolName.WEB_SEARCH, ToolName.FETCH_PAGE, ToolName.DETECT_TECH):
+        if name in SPEC_ORDER:
             continue
         specs.append(
             {"name": tool.name.value, "description": tool.description, "args_schema": tool.args_schema}

@@ -35,12 +35,10 @@ from lea.agent.policy import (
     looks_like_stale_model,
     premature_finish_reason,
     search_without_reading_reason,
-    seen_urls,
     should_stop,
     stop_class,
     transient_failure_hint,
     truncate_words,
-    unread_urls,
 )
 from lea.config import Settings
 from lea.models import (
@@ -354,19 +352,17 @@ def provider_label(llm: Any, settings: Settings) -> str:
 
 
 def budget_view(budget: Budget, trace: list[TraceStep]) -> dict[str, Any]:
-    """What the prompt is told about resources: remaining, spent, and unexploited.
+    """What the prompt is told about resources: remaining, plus spend as x/y.
 
-    The unread-URL set is the one that matters and is trace-derived, so the loop is
-    the only place that knows it. Showing "12 found, 2 read" is usually enough on
-    its own to send a model to open one instead of searching a fifth time.
+    Only budget-authoritative numbers go in. The unread-URL set lives in
+    `policy.unread_urls` and drives the balance guard and the stall grace, but it
+    is deliberately NOT passed here: prompts.py already derives and formats it from
+    the trace, and shipping it twice put a raw Python list repr in every prompt
+    right next to that formatted block. The counts still come from the Budget and
+    not the trace, because a guard bounce is a step that spends no search.
     """
     view: dict[str, Any] = dict(budget.remaining())
     view.update(budget.used())
-    unread = unread_urls(trace)
-    view["urls_found"] = len(seen_urls(trace))
-    view["urls_unread"] = len(unread)
-    # Capped: this renders into every prompt, and a long list is just noise.
-    view["unread_urls"] = unread[:8]
     return view
 
 

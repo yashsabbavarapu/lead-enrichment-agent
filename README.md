@@ -52,6 +52,8 @@ python3 -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
 
   Any other OpenAI-compatible endpoint works via `LEA_LLM_BASE_URL`, no code change. `lea doctor` shows which resolved and why.
 
+> **Free tiers limit volume, not just cost.** Google AI Studio allows ~20 requests per day *per model*, and one company costs ~11 calls — about two companies per day per model. Fine for demos; use Groq or a small paid balance for batch runs. The quota is per model, so switching `LEA_MODEL` buys more headroom.
+
 > **Model ids go stale.** Free lineups rotate, and each provider's default model id is an educated guess that may already be retired. If calls fail, run `lea doctor --models` to list what your key actually serves, then set `LEA_MODEL`. The OpenAI-compatible adapter is tested against mocked endpoints but has **not** been exercised against a live one — the first real key is the first real proof.
 
 Keys are picked up automatically; `lea doctor` prints exactly which provider resolved and why. See **[SETUP.md](SETUP.md)** for the placeholder checklist and key setup.

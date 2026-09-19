@@ -43,10 +43,14 @@ DEFAULT_ICP = ICPProfile(
             description="Sells into a market that requires a real outbound/inbound GTM motion, with an identifiable sales org.",
             weight=2.0,
             rubric=(
-                "10 = mid-market or enterprise sales motion with named AE/SDR/RevOps roles visible. "
-                "6 = mixed PLG plus sales-assist. "
-                "3 = pure self-serve PLG with no sales headcount. "
-                "0 = no discernible commercial GTM function."
+                "Grade from observable artefacts, not vibes: open AE/SDR/RevOps reqs, a "
+                "CRM in the detected stack, a 'talk to sales' or demo-request path, sales "
+                "tooling (Qualified, Outreach, Gong, 6sense). "
+                "10 = open GTM reqs AND a CRM detected. "
+                "7 = one of the two, or a clear enterprise sales motion. "
+                "5 = evidence is absent either way - say so rather than guessing. "
+                "3 = pure self-serve PLG with no sales headcount visible. "
+                "0 = no commercial GTM function at all."
             ),
         ),
         ICPCriterion(
@@ -54,11 +58,17 @@ DEFAULT_ICP = ICPProfile(
             description="Headcount in the 50-500 band, where GTM process pain is acute but procurement is still light.",
             weight=1.5,
             rubric=(
-                "10 = 51-200 or 201-500 employees. "
-                "6 = 11-50 (early, may lack budget) or 501-1000 (may have incumbent tooling). "
-                "3 = 1001-5000. "
-                "1 = 1-10 or 5000+. "
-                "Score 5 and say so if headcount is unknown."
+                "Grade on the best size evidence available, in this order. "
+                "(a) A stated headcount or band: 10 = 51-200 or 201-500; 6 = 11-50 or "
+                "501-1000; 3 = 1001-5000; 1 = 1-10 or 5000+. "
+                "(b) No headcount but a public job board: grade on open-role count as a "
+                "stage proxy - 9-10 = 20-59 live roles; 8-9 = 6-19; 6 = 1-5 or 60-149; "
+                "3 = 150+. Say it is a hiring-volume inference and that exact headcount "
+                "is unconfirmed. Do NOT state an employee range you did not read. "
+                "(c) Neither: score 5 and say size is genuinely unknown. Do NOT fall back on "
+                "what you already know about this company - if the gathered evidence does "
+                "not contain a headcount or a job board, it is unknown, and guessing from "
+                "memory is the failure this rubric exists to prevent."
             ),
         ),
         ICPCriterion(
@@ -77,10 +87,16 @@ DEFAULT_ICP = ICPProfile(
             description="A recent trigger event that creates budget and urgency: funding, GTM hiring, expansion, or a product launch.",
             weight=1.5,
             rubric=(
-                "10 = funding round in the last 12 months AND open GTM roles. "
-                "7 = either one alone. "
-                "4 = older (12-24mo) growth signal only. "
-                "0 = layoffs, down round, acquisition, or no signal in 24 months."
+                "Weight every signal by how old it is - recency is most of the value here. "
+                "10 = a signal under 30 days old AND open GTM roles right now. "
+                "8 = a signal under 90 days old. "
+                "6 = a dated signal 3-12 months old, or strong undated evidence. "
+                "4 = the only signals are 1-2 years old. "
+                "2 = everything is over 2 years old, or nothing was found. "
+                "0 = layoffs, a down round, or an announced acquisition. "
+                "An undated signal counts, but less than a dated recent one - a missing "
+                "date is not evidence of staleness. Name the signals you used and their "
+                "ages in the reasoning."
             ),
         ),
         ICPCriterion(

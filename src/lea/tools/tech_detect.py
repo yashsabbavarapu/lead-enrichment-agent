@@ -6,6 +6,7 @@ that matched and where it matched, so the report can cite its own reasoning.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -172,6 +173,148 @@ SIGNATURES: tuple[Signature, ...] = (
 
 
 # --------------------------------------------------------------------------
+# ATS job boards: the platform *and* the org slug
+# --------------------------------------------------------------------------
+
+# Knowing a company runs Greenhouse is a weak signal; knowing its board is
+# `boards.greenhouse.io/duolingo` is an exact, free, public headcount proxy —
+# that slug is the key to the job-board JSON API (see tools/jobs.py). We are
+# already parsing the careers page here, so we capture it in the same pass
+# instead of scraping the page a second time.
+
+# Path segments that are part of the URL grammar, never an org slug.
+ATS_RESERVED_SLUGS = frozenset(
+    {
+        "embed", "api", "v0", "v1", "v2", "v3", "jobs", "job", "job_board",
+        "job-board", "posting-api", "postings", "boards", "widget", "accounts",
+        "static", "assets", "js", "css", "www", "search", "apply", "j",
+    }
+)
+
+_SLUG = r"([A-Za-z0-9][A-Za-z0-9_-]*)"
+
+# (display name, platform key, pattern). Every capturing group in a pattern is
+# an alternative spelling of the same slug, so callers take the first non-empty.
+ATS_BOARD_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
+    (
+        "Ashby",
+        "ashby",
+        re.compile(rf"(?:jobs\.ashbyhq\.com|api\.ashbyhq\.com/posting-api/job-board)/{_SLUG}", re.I),
+    ),
+    (
+        "Greenhouse",
+        "greenhouse",
+        re.compile(
+            rf"(?:boards|job-boards)\.greenhouse\.io/(?:embed/job_board(?:/js)?/?\?for=)?{_SLUG}"
+            rf"|boards-api\.greenhouse\.io/v1/boards/{_SLUG}",
+            re.I,
+        ),
+    ),
+    (
+        "Lever",
+        "lever",
+        re.compile(rf"(?:jobs\.lever\.co|api\.lever\.co/v0/postings)/{_SLUG}", re.I),
+    ),
+    (
+        "Workable",
+        "workable",
+        re.compile(
+            rf"apply\.workable\.com/(?:api/v\d+/widget/accounts/)?{_SLUG}"
+            rf"|\b{_SLUG}\.workable\.com",
+            re.I,
+        ),
+    ),
+)
+
+# Where a human would go to read the board. Kept next to the patterns so the two
+# never drift; tools/jobs.py owns the *API* URLs.
+ATS_BOARD_URLS: dict[str, str] = {
+    "ashby": "https://jobs.ashbyhq.com/{slug}",
+    "greenhouse": "https://job-boards.greenhouse.io/{slug}",
+    "lever": "https://jobs.lever.co/{slug}",
+    "workable": "https://apply.workable.com/{slug}",
+}
+
+# JSON embedded in a <script> escapes its slashes, and hydration payloads are
+# exactly where modern careers pages hide the board URL.
+_ESCAPED_SLASH = re.compile(r"\\+/|\\u002[fF]", re.I)
+
+
+def board_url_for(platform: str, slug: str) -> str:
+    template = ATS_BOARD_URLS.get((platform or "").lower())
+    return template.format(slug=slug) if template and slug else ""
+
+
+def extract_ats_boards(html: str, url: str = "") -> list[dict[str, str]]:
+    """Every ATS board referenced by this page: platform, org slug, board URL.
+
+    Pure string work, no network. Ordered by first appearance, deduplicated on
+    (platform, slug) — a careers page links its own board many times over.
+    """
+    haystack = _ESCAPED_SLASH.sub("/", f"{url or ''}\n{html or ''}")
+    if not haystack.strip():
+        return []
+
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for name, platform, pattern in ATS_BOARD_PATTERNS:
+        for match in pattern.finditer(haystack):
+            slug = next((g for g in match.groups() if g), "")
+            slug = slug.strip().strip("-_").lower()
+            if not slug or slug in ATS_RESERVED_SLUGS or len(slug) < 2:
+                continue
+            key = (platform, slug)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "ats": name,
+                    "platform": platform,
+                    "slug": slug,
+                    "board_url": board_url_for(platform, slug),
+                    "evidence": f"found '{match.group(0)[:80]}' on the page",
+                }
+            )
+    return out
+
+
+# A careers page is usually visited once, by detect_tech, several steps before
+# anything asks about headcount. Remembering what it saw — for this process only —
+# is what lets fetch_jobs hit the right board without fetching the page again.
+_ATS_BOARD_MEMO: dict[str, list[dict[str, str]]] = {}
+
+
+def domain_key(url_or_domain: str) -> str:
+    """`https://www.Vanta.com/careers` -> `vanta.com`. The memo's cache key."""
+    raw = (url_or_domain or "").strip().lower()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        host = (urlparse(raw).hostname or "").strip(".")
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def remember_ats_boards(url: str, boards: Iterable[dict[str, str]]) -> None:
+    key = domain_key(url)
+    entries = [b for b in boards if b.get("slug")]
+    if key and entries:
+        _ATS_BOARD_MEMO[key] = entries
+
+
+def recall_ats_boards(url_or_domain: str) -> list[dict[str, str]]:
+    return list(_ATS_BOARD_MEMO.get(domain_key(url_or_domain), ()))
+
+
+def clear_ats_memo() -> None:
+    _ATS_BOARD_MEMO.clear()
+
+
+# --------------------------------------------------------------------------
 # detection
 # --------------------------------------------------------------------------
 
@@ -326,12 +469,17 @@ class DetectTechTool:
 
             final_url = res.url or url
             tech = detect_from_result(res.text or "", res.headers, final_url)
+            boards = extract_ats_boards(res.text or "", final_url)
+            # Remembered against the page's own host so fetch_jobs can find it by
+            # company domain later in the run.
+            remember_ats_boards(final_url, boards)
+
             if not tech:
                 return Observation(
                     tool=self.name,
                     ok=True,
                     summary=f"No known technologies matched on {final_url}.",
-                    data={"url": final_url, "tech": []},
+                    data={"url": final_url, "tech": [], "ats_boards": boards},
                     sources=[final_url],
                     latency_ms=_ms(started),
                 )
@@ -339,8 +487,8 @@ class DetectTechTool:
             return Observation(
                 tool=self.name,
                 ok=True,
-                summary=_render(final_url, tech),
-                data={"url": final_url, "tech": [t.model_dump() for t in tech]},
+                summary=_render(final_url, tech, boards),
+                data={"url": final_url, "tech": [t.model_dump() for t in tech], "ats_boards": boards},
                 sources=[final_url],
                 latency_ms=_ms(started),
             )
@@ -352,13 +500,13 @@ class DetectTechTool:
             tool=self.name,
             ok=False,
             summary=f"tech detection failed: {error}",
-            data={"url": url, "tech": []},
+            data={"url": url, "tech": [], "ats_boards": []},
             error=error,
             latency_ms=_ms(started),
         )
 
 
-def _render(url: str, tech: Iterable[TechStack]) -> str:
+def _render(url: str, tech: Iterable[TechStack], boards: Iterable[dict[str, str]] = ()) -> str:
     by_cat: dict[str, list[TechStack]] = {}
     for t in tech:
         by_cat.setdefault(t.category, []).append(t)
@@ -366,6 +514,12 @@ def _render(url: str, tech: Iterable[TechStack]) -> str:
     for cat in sorted(by_cat):
         for t in by_cat[cat]:
             lines.append(f"- [{cat}] {t.name} (confidence {t.confidence:.2f}) — {t.evidence}")
+    for b in boards:
+        # Spelled out for the planner: this is the exact argument fetch_jobs wants.
+        lines.append(
+            f"- [jobs] public {b['ats']} job board '{b['slug']}' at {b['board_url']} — "
+            f"call fetch_jobs with this URL for an exact open-role count."
+        )
     return "\n".join(lines)
 
 

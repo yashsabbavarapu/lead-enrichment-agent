@@ -25,6 +25,10 @@ class ToolName(str, Enum):
     WEB_SEARCH = "web_search"
     FETCH_PAGE = "fetch_page"
     DETECT_TECH = "detect_tech"
+    # Public ATS job boards (Ashby/Greenhouse/Lever/Workable). Open-role counts
+    # are a dated hiring signal and the only reliable public headcount proxy we
+    # have — LinkedIn and Crunchbase are both closed to us.
+    FETCH_JOBS = "fetch_jobs"
     FINISH = "finish"
 
 

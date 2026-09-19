@@ -125,10 +125,13 @@ def wired(monkeypatch):
         # Record the record the loop shows the model each turn (the "steering view"),
         # so tests can tell it apart from the authoritative record.
         steering: list[CompanyRecord] = []
+        budgets: list[dict[str, Any]] = []
         state["steering"] = steering
+        state["budgets"] = budgets
 
         def _build_context(target, record_so_far, trace, remaining, gaps):
             steering.append(record_so_far.model_copy(deep=True))
+            budgets.append(dict(remaining or {}))
             return "CONTEXT"
 
         monkeypatch.setattr(loop_mod, "_get_prompts", lambda: ("SYSTEM", _build_context))
@@ -1059,27 +1062,42 @@ def test_budget_used_reports_the_balance():
     assert used["steps_used"] == "6/12"
 
 
-def test_budget_view_exposes_unread_urls_to_the_prompt():
+def test_budget_view_carries_spend_without_duplicating_the_prompt():
     b = Budget(max_steps=12, max_searches=5, max_fetches=6, total_timeout_s=60)
     b.consume(ToolName.WEB_SEARCH)
     trace = [_search_step(1, "q", "https://a.example", "https://b.example")]
 
     view = loop_mod.budget_view(b, trace)
 
-    assert view["urls_found"] == 2
-    assert view["urls_unread"] == 2
-    assert view["unread_urls"] == ["https://a.example", "https://b.example"]
-    # the plain budget keys survive for whoever already reads them
+    # remaining keys survive for whoever already reads them
     assert view["searches"] == 4 and view["fetches"] == 6
+    # spend comes from the Budget, not the trace: a guard bounce is a step that
+    # spends no search, so the trace alone would miscount
     assert view["searches_used"] == "1/5"
+    assert view["fetches_used"] == "0/6"
+    # prompts.py derives and formats the unread set from the trace itself; passing
+    # it here too put a raw list repr in every prompt beside that block
+    assert "unread_urls" not in view
 
 
-def test_budget_view_caps_the_url_list():
-    b = Budget(total_timeout_s=60)
-    urls = [f"https://e{i}.example" for i in range(20)]
-    view = loop_mod.budget_view(b, [_search_step(1, "q", *urls)])
-    assert view["urls_unread"] == 20
-    assert len(view["unread_urls"]) == 8
+def test_budget_view_reaches_the_prompt(wired):
+    """The spend numbers must actually arrive in build_agent_context, and must
+    climb as the run proceeds — a static 0/4 would steer nothing."""
+    search = FakeTool(ToolName.WEB_SEARCH)
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "s", query="acme corp overview"),
+        act(ToolName.FETCH_PAGE, "f", url="https://acme.com/about"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    state = wired(llm, registry_of(search, FakeTool(ToolName.FETCH_PAGE)))
+
+    loop_mod.run_agent("acme", make_settings())
+
+    seen = state["budgets"]
+    assert seen, "build_agent_context was never called"
+    assert seen[0]["searches_used"] == "0/4"
+    assert seen[1]["searches_used"] == "1/4"
+    assert seen[2]["fetches_used"] == "1/4"
 
 
 def test_search_guard_fires_on_back_to_back_searches_with_unread_urls():
@@ -1217,3 +1235,40 @@ def test_rate_limit_is_not_reported_as_a_broken_setup(wired):
     assert "quota problem" in reason
     assert "nothing is wrong with your setup" in reason
     assert "authentication" not in reason
+
+
+# --------------------------------------------------------------------------
+# End-to-end on fixtures (no network, no LLM: the deterministic stub brain)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target, tier, score, industry",
+    [
+        # Re-pinned when growth_signals gained recency weighting (Agent D): the
+        # fixtures' signals are undated or >1y old, so they now count for less.
+        # Tiers are unchanged; only the weighted scores moved.
+        ("Vanta", "A", 87.9, "Security & Compliance"),
+        ("Ramp", "B", 64.4, "Fintech"),
+    ],
+)
+def test_stub_pipeline_on_fixtures_does_not_regress(target, tier, score, industry):
+    """The keyless baseline every change is measured against.
+
+    Real tools, real extraction, real ICP scoring — only the brain is the stub and
+    every HTTP call is served from examples/fixtures. If a policy change makes the
+    agent research differently, this is what notices.
+    """
+    settings = Settings(llm_provider="stub", search_provider="fixture", offline=True)
+    result = loop_mod.run_agent(target, settings)
+
+    rec = result.record
+    assert rec.icp_fit is not None, "the stub path must always produce a score"
+    assert rec.icp_fit.tier == tier
+    assert rec.icp_fit.score == pytest.approx(score, abs=0.05)
+    assert rec.industry == industry
+    assert rec.signals and rec.tech_stack
+    assert stop_class(result.stats.stop_reason) == "complete"
+    # and it stays cheap: no runaway searching
+    assert result.stats.searches <= settings.max_searches
+    assert result.stats.fetches <= settings.max_fetches
