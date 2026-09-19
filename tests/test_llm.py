@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from typing import Optional
 
@@ -1085,10 +1086,15 @@ def test_llm_scope_does_not_import_agent_enrich_or_cli():
 import respx  # noqa: E402
 
 from lea.llm.openai_compat import (  # noqa: E402
+    AUTH_BREAKER_THRESHOLD,
+    MAX_ATTEMPTS,
     Capability,
     OpenAICompatClient,
+    classify_auth_failure,
+    rank_models,
+    resolve_model,
     list_models,
-    reset_capability_cache,
+    reset_provider_state,
 )
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -1096,11 +1102,11 @@ GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 
 @pytest.fixture(autouse=True)
-def _clean_capability_cache():
-    """The rung cache is process-global: isolate every test from its neighbours."""
-    reset_capability_cache()
+def _clean_provider_state():
+    """Rung cache and auth counters are process-global: isolate every test."""
+    reset_provider_state()
     yield
-    reset_capability_cache()
+    reset_provider_state()
 
 
 @pytest.fixture(autouse=True)
@@ -1361,6 +1367,257 @@ def test_connection_errors_degrade_cleanly():
     assert "LLM error" in action.thought
 
 
+# --- auth: intermittent 403s from a half-provisioned key ---------------------
+#
+# Measured live on the user's Google key: 8 identical requests -> 3x 403, 5x 200.
+# A 403 that is really a provisioning race must not fail the step.
+
+GOOGLE_403_PERMISSION = {
+    "error": {"code": 403, "message": "The caller does not have permission", "status": "PERMISSION_DENIED"}
+}
+GOOGLE_403_DISABLED = {
+    "error": {
+        "code": 403,
+        "message": (
+            "Gemini API has not been used in project 1039824369945 before or it is disabled. "
+            "Enable it by visiting https://console.developers.google.com/apis/api/..."
+        ),
+        "status": "PERMISSION_DENIED",
+    }
+}
+TERMINAL_403 = {"error": {"code": 403, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT"}}
+
+
+@pytest.mark.parametrize(
+    "status,message,expected",
+    [
+        (403, "The caller does not have permission", "transient"),
+        (403, "Gemini API has not been used in project 1039824369945 before or it is disabled.", "transient"),
+        (403, "The service is not enabled for this project", "transient"),
+        (403, "Changes may take a few minutes to propagate", "transient"),
+        (403, "API key not valid. Please pass a valid API key.", "terminal"),
+        (403, "Permission denied for model gemini-3.6-flash", "terminal"),
+        (403, "This API key has been revoked", "terminal"),
+        (401, "Invalid authentication credentials", "terminal"),
+        (401, "something we have never seen", "terminal"),
+        (403, "something we have never seen", "transient"),  # when in doubt, retry
+    ],
+)
+def test_auth_failures_are_classified(status, message, expected):
+    body = json.dumps({"error": {"code": status, "message": message}})
+    assert classify_auth_failure(status, body) == expected
+
+
+@respx.mock
+def test_a_transient_403_is_retried_and_succeeds():
+    """The exact live failure: 403, 403, then a 200 with the same request."""
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(403, json=GOOGLE_403_PERMISSION),
+            httpx.Response(403, json=GOOGLE_403_DISABLED),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    action, usage = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH, "an intermittent 403 must not lose the step"
+    assert action.args == {"query": "Acme Robotics"}
+    assert usage.tokens_in == 120
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_a_transient_403_lets_extract_keep_the_record():
+    """The regression that cost industry, HQ, founded_year and every signal."""
+    payload = {"input": "Vanta", "company_name": "Vanta", "industry": "Security & Compliance", "founded_year": 2018}
+    respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(403, json=GOOGLE_403_PERMISSION),
+            httpx.Response(200, json=_tool_response("record_companyrecord", payload)),
+        ]
+    )
+    record, _ = _oa_client().extract(prompts.EXTRACTION_SYSTEM, "ctx", CompanyRecord)
+    assert record.industry == "Security & Compliance"
+    assert record.founded_year == 2018
+
+
+@respx.mock
+def test_a_terminal_403_fails_fast_without_burning_attempts():
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=TERMINAL_403))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert route.call_count == 1, "a revoked key must not cost four attempts on every call"
+
+
+@respx.mock
+def test_a_persistent_transient_403_exhausts_attempts_then_degrades():
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=GOOGLE_403_PERMISSION))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert route.call_count == MAX_ATTEMPTS
+
+
+@respx.mock
+def test_the_auth_breaker_stops_retrying_after_repeated_failures():
+    """A dead key must not turn a 12-step run into minutes of backoff."""
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=GOOGLE_403_PERMISSION))
+    client = _oa_client()
+
+    for _ in range(AUTH_BREAKER_THRESHOLD):
+        assert client.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.FINISH
+    spent = route.call_count
+    assert spent == AUTH_BREAKER_THRESHOLD * MAX_ATTEMPTS
+
+    # Breaker is now open: every later step costs exactly one request.
+    for _ in range(5):
+        action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+        assert action.tool is ToolName.FINISH
+    assert route.call_count == spent + 5
+
+
+@respx.mock
+def test_a_success_resets_the_auth_breaker():
+    respx.post(GROQ_URL).mock(
+        side_effect=[
+            *[httpx.Response(403, json=GOOGLE_403_PERMISSION)] * MAX_ATTEMPTS,
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+            httpx.Response(403, json=GOOGLE_403_PERMISSION),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _oa_client()
+    assert client.decide("sys", "T: A", TOOL_SPECS)[0].tool is ToolName.FINISH  # 1 failure recorded
+    assert client.decide("sys", "T: A", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH  # clears it
+    # Still retrying, because the counter was reset by the success.
+    assert client.decide("sys", "T: A", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "body,expected_word",
+    [(GOOGLE_403_PERMISSION, "transient"), (TERMINAL_403, "wrong")],
+)
+def test_the_trace_text_says_which_kind_of_auth_failure_it_was(body, expected_word):
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=body))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert expected_word in action.thought.lower()
+    assert "provisioning" in action.thought or "API key" in action.thought
+
+
+@respx.mock
+def test_auth_error_text_is_one_clean_line_without_json_braces():
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=GOOGLE_403_DISABLED))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    thought = action.thought
+    assert "\n" not in thought, "a multi-line error breaks the rendered trace"
+    assert "{" not in thought and "}" not in thought, "the raw JSON payload must not reach the trace"
+    assert "has not been used in project" in thought, "but the useful part must survive"
+    assert len(thought) < 400
+
+
+@respx.mock
+def test_google_array_wrapped_error_bodies_are_unwrapped():
+    """Google's OpenAI-compat layer returns `[{"error": {...}}]`, not `{...}`.
+
+    Seen live: an object-only parse leaked `[{ "error": { "code": 401, "mess`
+    into the middle of the rendered trace.
+    """
+    body = [{"error": {"code": 401, "message": "API key not valid. Please pass a valid API key.", "status": "UNAUTHENTICATED"}}]
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(401, json=body))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert "API key not valid" in action.thought
+    assert "{" not in action.thought and "[" not in action.thought
+    assert "code" not in action.thought
+
+
+def test_error_message_handles_every_body_shape():
+    from lea.llm.openai_compat import _error_message
+
+    assert _error_message('{"error": {"message": "plain object"}}') == "plain object"
+    assert _error_message('[{"error": {"message": "array wrapped"}}]') == "array wrapped"
+    assert _error_message('{"message": "bare message"}') == "bare message"
+    assert _error_message('{"error": "string error"}') == "string error"
+    assert _error_message("not json at all") == "not json at all"
+    assert _error_message("") == ""
+    assert "\n" not in _error_message('{"error": {"message": "one\\ntwo\\nthree"}}')
+    assert len(_error_message('{"error": {"message": "' + "x" * 500 + '"}}')) <= 200
+
+
+@respx.mock
+def test_http_error_text_is_trimmed_too():
+    respx.post(GROQ_URL).mock(
+        return_value=httpx.Response(500, json={"error": {"message": "internal\nerror\nwith newlines"}})
+    )
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert "\n" not in action.thought
+    assert "{" not in action.thought
+
+
+# --- the failure path must stay silent on stdout/stderr ----------------------
+
+
+@respx.mock
+def test_no_bare_prints_on_the_failure_path(capsys):
+    """Anything written directly to stdout/stderr interleaves with the rich trace."""
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=GOOGLE_403_PERMISSION))
+    _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    _oa_client().extract("sys", "ctx", CompanyRecord)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@respx.mock
+def test_per_attempt_retry_noise_is_debug_not_warning(caplog):
+    """Retry chatter at WARNING lands on stderr mid-trace, because the CLI
+    installs no logging handler and Python's lastResort handler kicks in."""
+    respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(503, text="upstream unavailable"),
+            httpx.Response(429, headers={"Retry-After": "1"}, text="slow down"),
+            httpx.Response(403, json=GOOGLE_403_PERMISSION),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    with caplog.at_level("DEBUG", logger="lea.llm.openai_compat"):
+        action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [], f"a recovered request must stay quiet, got: {[r.message for r in warnings]}"
+    assert any("attempt" in r.getMessage() for r in caplog.records), "the detail still belongs at DEBUG"
+
+
+@respx.mock
+def test_a_step_that_ultimately_fails_logs_exactly_one_warning_line(caplog):
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(500, text="boom"))
+    with caplog.at_level("WARNING", logger="lea.llm.openai_compat"):
+        _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"one failed step, one line — got {[r.message for r in warnings]}"
+    assert "\n" not in warnings[0].getMessage()
+
+
+@respx.mock
+def test_a_failed_auth_step_also_logs_exactly_one_warning_line(caplog):
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(403, json=GOOGLE_403_PERMISSION))
+    with caplog.at_level("WARNING", logger="lea.llm.openai_compat"):
+        _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"auth failures must not log twice — got {[r.message for r in warnings]}"
+    assert "transient" in warnings[0].getMessage()
+
+
 # --- extract ----------------------------------------------------------------
 
 
@@ -1455,6 +1712,352 @@ def test_ollama_sends_no_authorization_header():
     assert action.tool is ToolName.WEB_SEARCH
     assert "authorization" not in route.calls[0].request.headers
     assert client.api_key is None
+
+
+# --- model retirement: the adapter repairs a dead model id -------------------
+#
+# Two ids died inside a single session (gemini-2.0-flash, then gemini-2.5-flash),
+# so this is tested against the real list the user's endpoint returned rather
+# than invented ids.
+
+LIVE_GOOGLE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-image",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash-native-audio-latest",
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-pro",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-image",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-live-preview",
+    "gemini-3.1-flash-tts-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-transcribe",
+    "gemini-omni-flash-preview",
+    "gemini-pro-latest",
+    "gemma-4-31b-it",
+    "veo-3.1-fast-generate-preview",
+]
+
+GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/openai/models"
+
+
+def _dead_model_404(message: str) -> httpx.Response:
+    return httpx.Response(404, json={"error": {"code": 404, "message": message, "status": "NOT_FOUND"}})
+
+
+def _google_client(model: str = "gemini-2.0-flash") -> OpenAICompatClient:
+    return OpenAICompatClient(Settings(llm_provider="google", llm_api_key="k", model=model), provider="google")
+
+
+def _models_route(ids=None):
+    return respx.get(GOOGLE_MODELS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": f"models/{m}"} for m in (ids or LIVE_GOOGLE_MODELS)]})
+    )
+
+
+def test_ranking_picks_the_newest_plain_flash_from_the_live_list():
+    assert rank_models(LIVE_GOOGLE_MODELS, provider="google", configured="gemini-2.0-flash")[0] == "gemini-3.5-flash"
+
+
+def test_ranking_prefers_flash_then_lite_then_preview():
+    assert rank_models(LIVE_GOOGLE_MODELS, provider="google", configured="gemini-2.0-flash")[:7] == [
+        "gemini-3.5-flash",        # plain flash, newest
+        "gemini-2.5-flash",        # plain flash, older
+        "gemini-3.5-flash-lite",   # lite, newest
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3-flash-preview",  # preview last
+        "gemini-omni-flash-preview",
+    ]
+
+
+@pytest.mark.parametrize(
+    "decoy",
+    [
+        "gemini-2.5-flash-image",
+        "gemini-2.5-flash-preview-tts",
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-3.1-flash-live-preview",
+        "gemini-3.1-flash-tts-preview",
+        "gemini-3.5-transcribe",
+        "gemini-3-pro-image",
+        "veo-3.1-fast-generate-preview",
+    ],
+)
+def test_ranking_excludes_non_text_decoys(decoy):
+    """`flash-image` and `flash-tts` rank high on a naive substring match."""
+    assert decoy not in rank_models(LIVE_GOOGLE_MODELS, provider="google", configured="gemini-2.0-flash")
+
+
+def test_ranking_prefers_the_configured_model_when_it_is_actually_available():
+    ranked = rank_models(LIVE_GOOGLE_MODELS, provider="google", configured="gemini-2.5-flash-lite")
+    assert ranked[0] == "gemini-2.5-flash-lite", "never override a model that works"
+
+
+def test_ranking_higher_version_wins():
+    assert rank_models(["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3-flash"], provider="google")[0] == "gemini-3.5-flash"
+
+
+def test_ranking_falls_back_to_generic_order_for_other_providers():
+    groq = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "whisper-large-v3", "llama-guard-4-12b"]
+    ranked = rank_models(groq, provider="groq", configured="llama-3.3-70b-versatile")
+    assert ranked[0] == "llama-3.3-70b-versatile"
+    assert "llama-guard-4-12b" not in ranked  # a safety classifier cannot run an agent
+
+
+def test_ranking_handles_an_empty_or_useless_list():
+    assert rank_models([], provider="google") == []
+    assert rank_models(["gemini-2.5-flash-image"], provider="google") == []
+
+
+@respx.mock
+def test_a_404_naming_a_replacement_uses_that_replacement():
+    """Google's 404 literally says 'please update to models/gemini-3.6-flash'."""
+    models = _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404(
+                "models/gemini-2.5-flash is not found for API version v1beta. This model is "
+                "no longer available to new users, please update to models/gemini-3.6-flash"
+            ),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _google_client("gemini-2.5-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.model == "gemini-3.6-flash"
+    assert json.loads(route.calls[1].request.content)["model"] == "gemini-3.6-flash"
+    assert not models.called, "the provider named the successor — no need to list models"
+
+
+@respx.mock
+def test_a_404_without_a_replacement_falls_back_to_the_models_endpoint():
+    models = _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404("models/gemini-2.0-flash is not found for API version v1beta"),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.model == "gemini-3.5-flash"
+    assert models.call_count == 1
+    assert json.loads(route.calls[1].request.content)["model"] == "gemini-3.5-flash"
+
+
+@respx.mock
+def test_model_resolution_is_cached_for_the_whole_run():
+    models = _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404("models/gemini-2.0-flash is not found for API version v1beta"),
+            *[httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)) for _ in range(5)],
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    for _ in range(5):
+        assert client.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+
+    assert models.call_count == 1, "one /models lookup per run, not one per call"
+    assert route.call_count == 6  # the dead first attempt, then five good calls
+    for call in route.calls[1:]:
+        assert json.loads(call.request.content)["model"] == "gemini-3.5-flash"
+
+
+@respx.mock
+def test_a_second_client_reuses_the_resolved_model_without_probing():
+    models = _models_route()
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404("models/gemini-2.0-flash is not found for API version v1beta"),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    _google_client("gemini-2.0-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    fresh = _google_client("gemini-2.0-flash")
+    assert fresh.model == "gemini-3.5-flash", "a new client starts from the repaired id"
+    assert fresh.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+    assert models.call_count == 1
+
+
+@respx.mock
+def test_the_substitution_logs_exactly_one_warning(caplog):
+    _models_route()
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404("models/gemini-2.0-flash is not found for API version v1beta"),
+            *[httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)) for _ in range(3)],
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    with caplog.at_level("WARNING", logger="lea.llm.openai_compat"):
+        for _ in range(3):
+            client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"tell the user once, not per call: {[r.message for r in warnings]}"
+    text = warnings[0].getMessage()
+    assert "gemini-2.0-flash" in text and "gemini-3.5-flash" in text
+    assert "LEA_MODEL" in text
+
+
+@respx.mock
+def test_an_unresolvable_model_degrades_with_the_doctor_hint():
+    _models_route(["gemini-2.5-flash-image", "veo-3.1-fast-generate-preview"])  # nothing usable
+    route = respx.post(GOOGLE_URL).mock(
+        return_value=_dead_model_404("models/gemini-2.0-flash is not found for API version v1beta")
+    )
+    action, _ = _google_client("gemini-2.0-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert "lea doctor --models" in action.thought
+    assert "LEA_MODEL" in action.thought
+    assert route.call_count == 1, "a dead model must not be retried four times"
+
+
+@respx.mock
+def test_a_replacement_that_is_also_dead_degrades_instead_of_looping():
+    """Guards the resolution loop: never re-probe, never chain substitutions."""
+    models = _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        return_value=_dead_model_404("this model is not found for API version v1beta")
+    )
+    action, _ = _google_client("gemini-2.0-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert "lea doctor --models" in action.thought
+    assert models.call_count == 1, "one lookup, even when the replacement is dead too"
+    assert route.call_count == 2, "the original call plus exactly one substitution attempt"
+
+
+@respx.mock
+def test_a_working_model_never_triggers_resolution():
+    models = _models_route()
+    respx.post(GOOGLE_URL).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    client = _google_client("gemini-2.0-flash")
+    for _ in range(3):
+        client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert not models.called, "do not go shopping for models while the configured one works"
+    assert client.model == "gemini-2.0-flash"
+
+
+@respx.mock
+def test_a_capability_404_still_demotes_instead_of_swapping_the_model():
+    """A genuine tools-unsupported error must NOT be read as a dead model."""
+    models = _models_route()
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "tool_choice is not supported for this model"}}),
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.capability == Capability.JSON_OBJECT
+    assert client.model == "gemini-2.0-flash", "a capability gap is not a dead model"
+    assert not models.called
+
+
+@respx.mock
+def test_a_dead_model_404_that_also_says_not_supported_resolves_the_model():
+    """The exact live Google wording — 'is not found ... or is not supported' —
+    which the capability probe would otherwise swallow."""
+    _models_route()
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404(
+                "models/gemini-2.0-flash is not found for API version v1beta, "
+                "or is not supported for generateContent."
+            ),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.model == "gemini-3.5-flash"
+    assert client.capability == Capability.TOOLS, "the ladder must not be demoted by a dead model"
+
+
+@respx.mock
+def test_extract_also_recovers_from_a_retired_model():
+    _models_route()
+    payload = {"input": "Vanta", "company_name": "Vanta", "industry": "Security & Compliance"}
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404("models/gemini-2.0-flash is not found for API version v1beta"),
+            httpx.Response(200, json=_tool_response("record_companyrecord", payload)),
+        ]
+    )
+    record, _ = _google_client("gemini-2.0-flash").extract("sys", "ctx", CompanyRecord)
+    assert record.company_name == "Vanta"
+    assert record.industry == "Security & Compliance"
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("please update to models/gemini-3.6-flash", "gemini-3.6-flash"),
+        ("Update your code to use gemini-3.5-flash instead", "gemini-3.5-flash"),
+        ("This model has been replaced by models/gemini-3.5-flash.", "gemini-3.5-flash"),
+        ("use `llama-3.3-70b-versatile` instead", "llama-3.3-70b-versatile"),
+        ("models/gemini-2.0-flash is not found for API version v1beta", None),
+        ("please update to models/gemini-3.5-flash-image", None),  # a decoy suggestion
+    ],
+)
+def test_replacement_extraction_from_error_bodies(message, expected):
+    from lea.llm.openai_compat import _replacement_from_error
+
+    body = json.dumps({"error": {"code": 404, "message": message}})
+    assert _replacement_from_error(body, exclude="gemini-2.0-flash") == expected
+
+
+@respx.mock
+def test_resolve_model_is_exposed_for_doctor():
+    models = _models_route()
+    settings = Settings(llm_provider="google", llm_api_key="k", model="gemini-2.0-flash")
+
+    assert resolve_model(settings, provider="google") == "gemini-3.5-flash"
+    assert resolve_model(settings, provider="google") == "gemini-3.5-flash"
+    assert models.call_count == 1, "doctor and the agent share one lookup"
+
+
+@respx.mock
+def test_resolve_model_returns_the_configured_id_when_it_is_served():
+    _models_route()
+    settings = Settings(llm_provider="google", llm_api_key="k", model="gemini-3.5-flash-lite")
+    assert resolve_model(settings, provider="google") == "gemini-3.5-flash-lite"
+
+
+@respx.mock
+def test_resolve_model_returns_none_when_nothing_is_available():
+    respx.get(GOOGLE_MODELS_URL).mock(return_value=httpx.Response(500, text="down"))
+    settings = Settings(llm_provider="google", llm_api_key="k", model="gemini-2.0-flash")
+    assert resolve_model(settings, provider="google") is None
+
+
+def test_reset_provider_state_clears_the_model_cache():
+    from lea.llm.openai_compat import _MODEL_RESOLUTION
+
+    _MODEL_RESOLUTION[("https://x/v1", "old")] = "new"
+    reset_provider_state()
+    assert _MODEL_RESOLUTION == {}
 
 
 # --- model discovery --------------------------------------------------------

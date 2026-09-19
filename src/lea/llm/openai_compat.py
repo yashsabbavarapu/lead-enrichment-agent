@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import time
 from typing import Any, Optional, TypeVar
 
@@ -52,7 +53,16 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-__all__ = ["OpenAICompatClient", "list_models", "Capability", "reset_capability_cache"]
+__all__ = [
+    "OpenAICompatClient",
+    "list_models",
+    "resolve_model",
+    "rank_models",
+    "Capability",
+    "reset_capability_cache",
+    "reset_provider_state",
+    "classify_auth_failure",
+]
 
 DECIDE_TOOL_NAME = "next_action"
 
@@ -63,6 +73,10 @@ BASE_BACKOFF_S = 1.0
 MAX_BACKOFF_S = 20.0
 #: Never honour an absurd Retry-After — better to degrade than hang a run.
 MAX_RETRY_AFTER_S = 30.0
+#: After this many whole steps burned entirely on auth failures, stop retrying
+#: them. A half-provisioned key deserves patience; a dead one must not turn a
+#: 12-step run into minutes of backoff.
+AUTH_BREAKER_THRESHOLD = 2
 
 
 class Capability:
@@ -79,10 +93,26 @@ class Capability:
 #: it is a performance cache, not state worth persisting.
 _CAPABILITY_CACHE: dict[tuple[str, str], str] = {}
 
+#: base_url -> consecutive steps lost entirely to auth failures. Feeds the
+#: circuit breaker below; cleared by any successful response.
+_AUTH_FAILURES: dict[str, int] = {}
 
-def reset_capability_cache() -> None:
-    """Forget probed capabilities. Exposed for tests and for `lea doctor`."""
+#: (base_url, configured_model) -> the model we actually ended up using. Free
+#: model lineups are retired on a timescale of weeks, so a shipped default WILL
+#: go stale; one lookup per run repairs it instead of failing every call.
+_MODEL_RESOLUTION: dict[tuple[str, str], str] = {}
+
+
+def reset_provider_state() -> None:
+    """Forget probed capabilities, auth counters and resolved models."""
     _CAPABILITY_CACHE.clear()
+    _AUTH_FAILURES.clear()
+    _MODEL_RESOLUTION.clear()
+
+
+#: Backwards-compatible alias: the cache reset has always cleared everything
+#: process-local, and callers already import this name.
+reset_capability_cache = reset_provider_state
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +128,46 @@ _UNSUPPORTED_MARKERS = (
     "does not support", "invalid_type", "unexpected keyword", "no body",
 )
 
+#: A 403 whose body talks about provisioning, propagation or an API that is not
+#: switched on yet is a *timing* problem: the same request succeeds moments
+#: later. Observed live on a freshly issued Google AI Studio key, which returned
+#: 403 on 3 of 8 identical requests. Retrying is the difference between a full
+#: record and an empty one.
+_TRANSIENT_AUTH_MARKERS = (
+    "caller does not have permission",
+    "has not been used in project",
+    "before or it is disabled",
+    "is disabled",
+    "not enabled",
+    "service is not enabled",
+    "enable it by visiting",
+    "propagat",            # "changes may take a few minutes to propagate"
+    "wait a few minutes",
+    "try again",
+    "temporarily",
+    "retry",
+)
+
+#: A 401/403 that says the credential itself is wrong. Retrying cannot help, so
+#: fail fast rather than burning four attempts on every call in the run.
+_TERMINAL_AUTH_MARKERS = (
+    "api key not valid",
+    "api_key_invalid",
+    "invalid api key",
+    "incorrect api key",
+    "invalid authentication",
+    "invalid_api_key",
+    "unauthorized",
+    "api key expired",
+    "expired",
+    "revoked",
+    "permission denied for model",
+    "does not have access to model",
+    "billing",
+    "account is not active",
+    "suspended",
+)
+
 
 def _looks_unsupported(status: int, body: str) -> bool:
     """A 4xx that means "drop down a rung", not "give up"."""
@@ -107,8 +177,238 @@ def _looks_unsupported(status: int, body: str) -> bool:
     return any(marker in lowered for marker in _UNSUPPORTED_MARKERS)
 
 
+def classify_auth_failure(status: int, body: str) -> str:
+    """``"transient"`` or ``"terminal"`` for a 401/403 body.
+
+    Terminal wording wins over transient wording, because "permission denied for
+    model X" and "the caller does not have permission" read almost alike but mean
+    opposite things. When nothing matches, a 403 is assumed transient and a 401
+    terminal: a wasted retry costs a second, a wrongly-failed extraction costs
+    the whole record.
+    """
+    lowered = (body or "").lower()
+    if any(marker in lowered for marker in _TERMINAL_AUTH_MARKERS):
+        return "terminal"
+    if any(marker in lowered for marker in _TRANSIENT_AUTH_MARKERS):
+        return "transient"
+    return "terminal" if status == 401 else "transient"
+
+
+# --- model retirement ------------------------------------------------------
+#
+# Two ids shipped in this project went dead inside one session
+# (`gemini-2.0-flash`, then `gemini-2.5-flash`), so the adapter repairs itself
+# rather than trusting any hardcoded default.
+
+_MODEL_NOT_FOUND_MARKERS = (
+    "is not found", "not found for api version", "no longer available",
+    "model not found", "model_not_found", "model_decommissioned",
+    "does not exist", "unknown model", "invalid model", "no endpoints found",
+    "update your code to use", "please update to", "has been deprecated",
+    "is deprecated", "decommissioned", "retired",
+)
+
+#: Words that mean "this is about a capability, not a dead model". A body
+#: saying "this model does not support tools" must demote the ladder, not go
+#: shopping for a different model.
+_CAPABILITY_WORDS = ("tool", "function", "response_format", "json_object", "json_schema", "json mode")
+
+#: Strong model-death phrases that outrank the capability words above.
+_DEFINITELY_DEAD = ("not found", "no longer available", "does not exist", "decommission", "deprecat", "retired")
+
+#: Google's 404 helpfully names the successor:
+#: "... is not found ... please update to models/gemini-3.6-flash".
+_REPLACEMENT_RES = (
+    re.compile(r"(?:please\s+)?(?:update|switch|migrate|move)\s+(?:your\s+code\s+)?to\s+(?:use\s+)?['\"`]?(?:models/)?([A-Za-z][\w.:-]{2,120})"),
+    re.compile(r"use\s+['\"`]?(?:models/)?([A-Za-z][\w.:-]{2,120})['\"`]?\s+instead"),
+    re.compile(r"(?:replaced|superseded)\s+by\s+['\"`]?(?:models/)?([A-Za-z][\w.:-]{2,120})"),
+    re.compile(r"(?:try|recommend(?:ed)?)\s+['\"`]?(?:models/)?([A-Za-z][\w.:-]{2,120})['\"`]?\s+instead"),
+)
+
+#: Non-text modalities and specialist variants. These rank high on a naive
+#: "contains flash" match but cannot run a research agent: `gemini-*-flash-image`
+#: generates pictures, `-tts` speaks, `-live`/`-native-audio` are realtime audio
+#: sessions, `-embedding` returns vectors. Excluding them is the whole reason
+#: this ranking is a named function and not a `sorted(..., key=len)`.
+_MODEL_EXCLUDE_SEGMENTS = frozenset(
+    {
+        "image", "images", "imagen", "vision", "draw",
+        "tts", "audio", "speech", "transcribe", "voice", "dialog",
+        "live", "realtime", "bidi",
+        "video", "veo",
+        "embedding", "embeddings", "embed", "gecko",
+        "robotics", "computer", "cua",
+        "guard", "safety", "moderation", "rerank",
+    }
+)
+
+_VERSION_RE = re.compile(r"(?:^|[-_/])(\d+(?:\.\d+)?)(?=[-_/]|$)")
+
+
+def _segments(model_id: str) -> list[str]:
+    return [s for s in re.split(r"[-_./:]+", (model_id or "").lower()) if s]
+
+
+def _model_version(model_id: str) -> float:
+    """The first version-looking number in an id: `gemini-3.5-flash` -> 3.5."""
+    m = _VERSION_RE.search(model_id or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:  # pragma: no cover - regex guarantees a number
+        return 0.0
+
+
+def _is_excluded_model(model_id: str) -> bool:
+    return bool(_MODEL_EXCLUDE_SEGMENTS.intersection(_segments(model_id)))
+
+
+def _google_flash_tier(model_id: str) -> Optional[int]:
+    """Preference among Gemini ids: plain Flash, then Lite, then preview.
+
+    Flash is the free tier, which is the whole point. ``None`` means "not a
+    usable Gemini text-flash model".
+    """
+    segs = _segments(model_id)
+    if "gemini" not in segs or "flash" not in segs or _is_excluded_model(model_id):
+        return None
+    lite = "lite" in segs
+    preview = "preview" in segs or "exp" in segs or "experimental" in segs
+    if lite and preview:
+        return 3
+    if lite:
+        return 1
+    if preview:
+        return 2
+    return 0
+
+
+def _generic_sort_key(model_id: str, configured: str) -> tuple:
+    """Provider-agnostic fallback: closest to what the user asked for, newest first."""
+    segs = set(_segments(model_id))
+    wanted = set(_segments(configured)) if configured else set()
+    preview = 1 if segs & {"preview", "beta", "exp", "experimental", "alpha", "nightly"} else 0
+    return (-len(segs & wanted), preview, -_model_version(model_id), len(model_id), model_id)
+
+
+def rank_models(candidates: list[str], provider: str = "", configured: str = "") -> list[str]:
+    """Order model ids best-first for *provider*, dropping unusable ones.
+
+    Google gets the Flash-first ranking above (free tier, text-capable); every
+    other provider gets `_generic_sort_key`, because Groq, OpenRouter and
+    Cerebras retire ids too and deserve the same self-healing path.
+    """
+    usable = [c for c in dict.fromkeys(candidates or []) if c and not _is_excluded_model(c)]
+    if not usable:
+        return []
+
+    head: list[str] = []
+    if configured and configured in usable:
+        head.append(configured)  # what the user asked for always wins
+    rest = [c for c in usable if c != configured]
+
+    is_gemini = provider.strip().lower() == "google" or any("gemini" in _segments(c) for c in rest)
+    if is_gemini:
+        flash = [c for c in rest if _google_flash_tier(c) is not None]
+        if flash:
+            flash.sort(key=lambda m: (_google_flash_tier(m), -_model_version(m), m))
+            others = [c for c in rest if c not in set(flash)]
+            others.sort(key=lambda m: _generic_sort_key(m, configured))
+            return head + flash + others
+
+    rest.sort(key=lambda m: _generic_sort_key(m, configured))
+    return head + rest
+
+
+def _looks_model_not_found(status: int, body: str, current_model: str = "") -> bool:
+    """A 4xx that means "this model id is dead", not "this request was wrong"."""
+    if status not in (400, 404):
+        return False
+    lowered = (body or "").lower()
+    if not any(marker in lowered for marker in _MODEL_NOT_FOUND_MARKERS):
+        return False
+    # "this model does not support tools" is a capability gap. Only let the
+    # capability words win when nothing says the model itself is gone.
+    if any(word in lowered for word in _CAPABILITY_WORDS):
+        if not any(dead in lowered for dead in _DEFINITELY_DEAD):
+            return False
+    return "model" in lowered or bool(current_model and current_model.lower() in lowered)
+
+
+def _replacement_from_error(body: str, exclude: str = "") -> Optional[str]:
+    """The successor id the provider named in its own error, if any.
+
+    Highest-signal source there is, and free to parse: Google's 404 says
+    "please update to models/gemini-3.6-flash".
+    """
+    text = _error_message(body, limit=1000) or (body or "")
+    for pattern in _REPLACEMENT_RES:
+        m = pattern.search(text)
+        if not m:
+            continue
+        candidate = m.group(1).strip().strip("'\"`.,;:)")
+        if not candidate or candidate.lower() == (exclude or "").lower():
+            continue
+        if _is_excluded_model(candidate):
+            logger.debug("Ignoring suggested replacement %r: not a text model", candidate)
+            continue
+        return candidate
+    return None
+
+
 class _Unsupported(Exception):
     """The endpoint rejected this rung of the ladder."""
+
+
+class _ModelUnavailable(Exception):
+    """The configured model is gone and nothing usable could replace it."""
+
+
+class _AuthFailure(Exception):
+    """Authentication failed. Carries whether it looked transient or terminal."""
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def _error_message(body: str, limit: int = 200) -> str:
+    """The provider's `error.message`, collapsed to one short line.
+
+    Pasting a raw JSON payload into the agent trace is what made a 403 read like
+    a stack dump in the middle of the rendered run.
+    """
+    if not body:
+        return ""
+    text: Any = body
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        data = None
+    # Google's OpenAI-compat layer wraps its error in a one-element ARRAY —
+    # `[{"error": {...}}]` — so an object-only parse leaks raw JSON to the trace.
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            text = err.get("message") or err.get("status") or err.get("type") or body
+        elif isinstance(err, str):
+            text = err
+        elif "message" in data:
+            text = data["message"]
+    flat = " ".join(str(text).split())
+    return flat[: limit - 1] + "…" if len(flat) > limit else flat
+
+
+def _note_auth_failure(base_url: str) -> int:
+    _AUTH_FAILURES[base_url] = _AUTH_FAILURES.get(base_url, 0) + 1
+    return _AUTH_FAILURES[base_url]
+
+
+def _auth_breaker_open(base_url: str) -> bool:
+    return _AUTH_FAILURES.get(base_url, 0) >= AUTH_BREAKER_THRESHOLD
 
 
 def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
@@ -179,7 +479,10 @@ class OpenAICompatClient:
         if not base_url:
             raise ValueError(f"No base_url configured for LLM provider {self.name!r}")
         self.base_url = base_url.rstrip("/")
-        self.model = model
+        self._configured_model = model
+        # A model this process already found dead stays repaired for the rest
+        # of the run, so one retirement costs one lookup, not one per call.
+        self.model = _MODEL_RESOLUTION.get((self.base_url, model), model)
         self.api_key = settings.key_for(self.name)
         self._max_context = MAX_CONTEXT_CHARS
         self._owns_client = client is None
@@ -206,9 +509,11 @@ class OpenAICompatClient:
         except (ValueError, IndexError):
             return None
         _CAPABILITY_CACHE[self._cache_key] = nxt
+        # Happens at most twice per endpoint per process, and materially changes
+        # output quality, so it earns a WARNING — but a one-line one.
         logger.warning(
             "%s/%s does not support %s (%s); falling back to %s for the rest of this run.",
-            self.name, self.model, failed, reason, nxt,
+            self.name, self.model, failed, _error_message(reason, 120) or reason, nxt,
         )
         return nxt
 
@@ -223,8 +528,13 @@ class OpenAICompatClient:
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST /chat/completions with bounded jittered retry.
 
-        Raises `_Unsupported` when the endpoint rejects a capability, and the
-        last transport/HTTP error when retries are exhausted.
+        Raises `_Unsupported` when the endpoint rejects a capability,
+        `_AuthFailure` for 401/403, and the last transport/HTTP error when
+        retries are exhausted.
+
+        Per-attempt noise is logged at DEBUG on purpose: the CLI installs no
+        handler, so anything at WARNING lands on stderr in the middle of the
+        rendered trace. Only the final give-up is worth a WARNING.
         """
         url = f"{self.base_url}/chat/completions"
         last_exc: Optional[Exception] = None
@@ -234,30 +544,66 @@ class OpenAICompatClient:
                 response = self._client.post(url, headers=self._headers(), json=payload)
             except httpx.HTTPError as exc:
                 last_exc = exc
-                logger.warning("%s: transport error on attempt %d/%d: %s", self.name, attempt, MAX_ATTEMPTS, exc)
+                logger.debug("%s: transport error on attempt %d/%d: %s", self.name, attempt, MAX_ATTEMPTS, exc)
+                if attempt == MAX_ATTEMPTS:
+                    break
                 self._sleep(attempt, None)
                 continue
 
             status = response.status_code
             if status < 300:
                 try:
-                    return response.json()
+                    data = response.json()
                 except (json.JSONDecodeError, ValueError) as exc:
                     last_exc = exc
-                    logger.warning("%s: non-JSON body on a %d response: %s", self.name, status, exc)
+                    logger.debug("%s: non-JSON body on a %d response: %s", self.name, status, exc)
+                    if attempt == MAX_ATTEMPTS:
+                        break
                     self._sleep(attempt, None)
                     continue
+                _AUTH_FAILURES.pop(self.base_url, None)  # the credential works
+                return data
 
             body = _safe_body(response)
+            message = _error_message(body)
+
+            # Checked BEFORE the capability probe: Google's dead-model 404 says
+            # "... or is not supported for generateContent", which would
+            # otherwise be misread as "this model cannot do tools" and demote
+            # the ladder forever instead of fixing the model id.
+            if _looks_model_not_found(status, body, self.model):
+                replacement = self._resolve_dead_model(body)
+                if replacement and replacement != payload.get("model"):
+                    payload = {**payload, "model": replacement}
+                    continue
+                raise _ModelUnavailable(
+                    f"model {self.model!r} is not available at {self.name} and no "
+                    f"replacement could be found — run `lea doctor --models` to see "
+                    f"what your key serves, then set LEA_MODEL: {message}"
+                )
+
             if _looks_unsupported(status, body):
-                raise _Unsupported(f"HTTP {status}: {body[:300]}")
+                raise _Unsupported(f"HTTP {status}: {message}")
+
+            if status in (401, 403):
+                raise_now = self._auth_outcome(status, body, message, attempt)
+                if raise_now is not None:
+                    raise raise_now
+                logger.debug(
+                    "%s: HTTP %d looks transient on attempt %d/%d: %s",
+                    self.name, status, attempt, MAX_ATTEMPTS, message,
+                )
+                self._sleep(attempt, _retry_after_seconds(response))
+                continue
 
             if status == 429 or status >= 500:
-                last_exc = httpx.HTTPStatusError(f"HTTP {status}: {body[:300]}", request=response.request, response=response)
+                last_exc = httpx.HTTPStatusError(
+                    f"HTTP {status}: {message}", request=response.request, response=response
+                )
                 if attempt == MAX_ATTEMPTS:
                     break
                 wait = _retry_after_seconds(response)
-                logger.warning(
+                logger.debug(
                     "%s: HTTP %d on attempt %d/%d%s",
                     self.name, status, attempt, MAX_ATTEMPTS,
                     f"; Retry-After {wait}s" if wait is not None else "",
@@ -266,9 +612,82 @@ class OpenAICompatClient:
                 continue
 
             # A 4xx we cannot interpret as a capability gap: not retryable.
-            raise httpx.HTTPStatusError(f"HTTP {status}: {body[:300]}", request=response.request, response=response)
+            raise httpx.HTTPStatusError(f"HTTP {status}: {message}", request=response.request, response=response)
 
+        # The caller logs one WARNING for the failed step; logging here too would
+        # double every failure in the rendered trace.
+        logger.debug("%s: request failed after %d attempts: %s", self.name, MAX_ATTEMPTS, last_exc)
         raise last_exc or RuntimeError(f"{self.name}: request failed after {MAX_ATTEMPTS} attempts")
+
+    def _resolve_dead_model(self, body: str) -> Optional[str]:
+        """Find a live model to replace the configured one. Cached per run.
+
+        Order: the successor the provider named in its own error, else the
+        best-ranked id from `GET /models`. Logs exactly one WARNING, because
+        the user has to know they are not running what they configured.
+        """
+        key = (self.base_url, self._configured_model)
+        cached = _MODEL_RESOLUTION.get(key)
+        if cached:
+            # Already resolved this run. If we are *already* using it, the
+            # replacement is dead too and there is nothing further to try.
+            return None if cached == self.model else cached
+
+        suggested = _replacement_from_error(body, exclude=self.model)
+        source = "named by the provider"
+        if not suggested:
+            available = list_models(self.settings, provider=self.name)
+            ranked = [m for m in rank_models(available, provider=self.name, configured=self._configured_model)
+                      if m != self.model]
+            suggested = ranked[0] if ranked else None
+            source = f"best of {len(available)} models offered by the endpoint"
+
+        if not suggested:
+            logger.debug("%s: no usable replacement for %r", self.name, self.model)
+            return None
+
+        _MODEL_RESOLUTION[key] = suggested
+        logger.warning(
+            "%s: model %r is unavailable; using %r instead (%s). "
+            "Set LEA_MODEL to pin a different one.",
+            self.name, self.model, suggested, source,
+        )
+        self.model = suggested
+        return suggested
+
+    def _auth_outcome(
+        self, status: int, body: str, message: str, attempt: int
+    ) -> Optional[_AuthFailure]:
+        """Decide what to do with a 401/403. ``None`` means "retry"."""
+        kind = classify_auth_failure(status, body)
+
+        if kind == "terminal":
+            _note_auth_failure(self.base_url)
+            return _AuthFailure(
+                f"authentication rejected by {self.name} — the API key looks wrong or "
+                f"lacks access to {self.model}: {message}",
+                kind,
+            )
+
+        # A dead key that merely *sounds* transient must not cost the whole run.
+        if _auth_breaker_open(self.base_url):
+            return _AuthFailure(
+                f"authentication keeps failing at {self.name}; not retrying further "
+                f"this run: {message}",
+                "terminal",
+            )
+
+        if attempt == MAX_ATTEMPTS:
+            # The caller logs one WARNING for the failed step; a second one here
+            # would just double every auth failure in the rendered trace.
+            count = _note_auth_failure(self.base_url)
+            logger.debug("%s: auth failed on all %d attempts (%d step(s) lost)", self.name, MAX_ATTEMPTS, count)
+            return _AuthFailure(
+                f"authentication failed at {self.name} after {MAX_ATTEMPTS} attempts — "
+                f"looks transient, the key may still be provisioning: {message}",
+                "transient",
+            )
+        return None
 
     @staticmethod
     def _sleep(attempt: int, retry_after: Optional[float]) -> None:
@@ -320,7 +739,7 @@ class OpenAICompatClient:
             return raw
         parsed = extract_json(raw) if isinstance(raw, str) else None
         if parsed is None and raw:
-            logger.warning("%s: could not parse tool_call arguments: %r", name, str(raw)[:200])
+            logger.debug("%s: could not parse tool_call arguments: %r", name, str(raw)[:200])
         return parsed
 
     @classmethod
@@ -481,7 +900,7 @@ class OpenAICompatClient:
             )
             return parsed, usage
         except Exception as exc:  # noqa: BLE001 - repair is best-effort by definition
-            logger.warning("%s: repair retry failed: %s: %s", self.name, type(exc).__name__, exc)
+            logger.warning("%s: repair retry failed: %s", self.name, _describe_exception(exc))
             return None, LLMUsage(model=self.model)
 
     # -- LLMClient -------------------------------------------------------
@@ -516,14 +935,16 @@ class OpenAICompatClient:
                 max_tokens=1024,
             )
         except Exception as exc:  # noqa: BLE001 - must never raise into the loop
-            logger.error("decide(): %s call failed: %s: %s", self.name, type(exc).__name__, exc)
+            detail = _describe_exception(exc)
+            logger.warning("decide(): %s call failed: %s", self.name, detail)
             return (
-                AgentAction(tool=ToolName.FINISH, thought=f"LLM error: {type(exc).__name__}: {exc}"),
+                AgentAction(tool=ToolName.FINISH, thought=f"LLM error: {detail}"),
                 LLMUsage(model=self.model),
             )
 
         if not isinstance(payload, dict) or not payload:
-            logger.error("decide(): %s returned no usable action (raw: %r)", self.name, (raw or "")[:200])
+            logger.warning("decide(): %s returned no usable action", self.name)
+            logger.debug("decide(): raw response was %r", (raw or "")[:400])
             return (
                 AgentAction(tool=ToolName.FINISH, thought="LLM error: model returned no action."),
                 usage,
@@ -560,7 +981,7 @@ class OpenAICompatClient:
                 max_tokens=4096,
             )
         except Exception as exc:  # noqa: BLE001 - must never raise into the loop
-            logger.error("extract(): %s call failed: %s: %s", self.name, type(exc).__name__, exc)
+            logger.warning("extract(): %s call failed: %s", self.name, _describe_exception(exc))
             return best_effort_instance(schema_model), LLMUsage(model=self.model)
 
         total = usage
@@ -651,6 +1072,20 @@ def _action_from_payload(
         return AgentAction(tool=ToolName.FINISH, thought="LLM error: invalid action."), usage
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """A single clean line for the agent trace — no JSON braces, no newlines."""
+    if isinstance(exc, (_AuthFailure, _Unsupported)):
+        text = str(exc)
+    elif isinstance(exc, httpx.HTTPStatusError):
+        text = str(exc)
+    elif isinstance(exc, httpx.HTTPError):
+        text = f"network error: {exc}"
+    else:
+        text = f"{type(exc).__name__}: {exc}"
+    flat = " ".join(str(text).split())
+    return flat[:299] + "…" if len(flat) > 300 else flat
+
+
 def _as_int(value: Any) -> int:
     try:
         return max(0, int(value))
@@ -664,6 +1099,34 @@ def _safe_body(response: httpx.Response) -> str:
     except Exception as exc:  # noqa: BLE001 - reading an error body must not raise
         logger.debug("Could not read the response body: %s", exc)
         return ""
+
+
+def resolve_model(settings: Settings, provider: Optional[str] = None) -> Optional[str]:
+    """The model id that should actually be used, or ``None`` if unknowable.
+
+    Returns the configured id when the endpoint really serves it, otherwise the
+    best-ranked live alternative. Cached per (base_url, configured model), so
+    `lea doctor` and the agent agree without paying two lookups.
+    """
+    name = (provider or settings.resolved_llm() or "").strip().lower()
+    try:
+        base_url, configured = settings.endpoint_for(name)
+    except Exception as exc:  # noqa: BLE001 - diagnostics never raise
+        logger.debug("resolve_model: no endpoint for %r: %s", name, exc)
+        return None
+    if not base_url:
+        return None
+
+    key = (base_url.rstrip("/"), configured)
+    if key in _MODEL_RESOLUTION:
+        return _MODEL_RESOLUTION[key]
+
+    available = list_models(settings, provider=name)
+    ranked = rank_models(available, provider=name, configured=configured)
+    if not ranked:
+        return None
+    _MODEL_RESOLUTION[key] = ranked[0]
+    return ranked[0]
 
 
 def list_models(settings: Settings, provider: Optional[str] = None) -> list[str]:
