@@ -434,6 +434,26 @@ _PROVIDER_EFFECT = {
 }
 
 
+def cached_resolved_model(settings: Settings, provider: str) -> Optional[str]:
+    """The self-healed model id, but ONLY if it is already cached.
+
+    `doctor` is the command people run when something is wrong, so it must stay
+    instant and work offline. The plain summary therefore never triggers a lookup:
+    it reports a resolution that `--models` or an earlier run already paid for, and
+    otherwise says nothing. Reaching into the resolution cache is deliberate and
+    guarded — if that internal moves, doctor just shows the configured id.
+    """
+    try:
+        from lea.llm import openai_compat as oc
+
+        base_url, configured = settings.endpoint_for(provider)
+        if not base_url:
+            return None
+        return oc._MODEL_RESOLUTION.get((base_url.rstrip("/"), configured))
+    except Exception:
+        return None
+
+
 def _print_llm_providers(settings: Settings) -> None:
     """The model-provider table: who you could use, who you are using, and why."""
     from lea.config import OPENAI_COMPAT_PRESETS
@@ -477,9 +497,19 @@ def _print_llm_providers(settings: Settings) -> None:
     if settings.is_openai_compat(resolved):
         base, model = settings.endpoint_for(resolved)
         active.append(f"  base_url={base}  model={model}", style="dim")
-        active.append("\n         model ids rotate on free tiers — ", style="dim")
-        active.append("lea doctor --models", style="cyan")
-        active.append(" lists what yours serves today.", style="dim")
+        # Free only: a warm cache means --models or a previous run already looked
+        # this up. Never pay a network round trip for a bare `doctor`.
+        healed = cached_resolved_model(settings, resolved)
+        if healed and healed != model:
+            active.append("\n         will actually use ", style="dim")
+            active.append(healed, style="bold green")
+            active.append(f" — the endpoint does not serve {model}", style="dim")
+        elif healed:
+            active.append("  (confirmed served)", style="green")
+        else:
+            active.append("\n         model ids rotate on free tiers — ", style="dim")
+            active.append("lea doctor --models", style="cyan")
+            active.append(" checks what yours serves today.", style="dim")
     elif resolved == "anthropic":
         active.append(f"  model={settings.model}", style="dim")
     else:
@@ -521,6 +551,14 @@ def _print_models(settings: Settings) -> None:
             box["models"] = list_models(settings) or []
         except Exception as exc:  # diagnostics never raise
             box["error"] = f"{type(exc).__name__}: {exc}"
+        # Resolve inside the same guarded window. It shares its cache with the
+        # agent, so this call also means the next run pays no lookup of its own.
+        try:
+            from lea.llm.openai_compat import resolve_model
+
+            box["resolved"] = resolve_model(settings)
+        except Exception as exc:
+            box.setdefault("error", f"{type(exc).__name__}: {exc}")
 
     worker = threading.Thread(target=_lookup, daemon=True)
     worker.start()
@@ -528,40 +566,49 @@ def _print_models(settings: Settings) -> None:
 
     timed_out = worker.is_alive()
     models: list[str] = box.get("models") or []
+    will_use: Optional[str] = box.get("resolved")
     if box.get("error"):
         console.print(Text(f"  lookup failed: {box['error']}", style="yellow"))
 
+    base, current = settings.endpoint_for(resolved)
+
     if models:
-        base, current = settings.endpoint_for(resolved)
         console.print(Text(f"  {len(models)} available:", style="dim"))
         for m in models:
             line = Text("    ")
-            if m == current:
-                line.append(m, style="bold green")
-                line.append("   <- currently selected", style="dim")
-            else:
-                line.append(m, style="white")
+            style = "bold green" if m == will_use else "white"
+            line.append(m, style=style)
+            if m == will_use:
+                line.append("   <- will be used", style="dim")
             console.print(line)
-        if current not in models:
-            console.print(Text(
-                f"  warning: LEA_MODEL is '{current}', which this endpoint does not list. "
-                "Runs will likely fail with a 404 — pick one above.",
-                style="bold yellow",
-            ))
-        return
 
-    base, current = settings.endpoint_for(resolved)
-    why = (
-        f"the lookup took longer than {MODELS_TIMEOUT_S:g}s"
-        if timed_out
-        else f"{base or 'the endpoint'} was unreachable, or your key was rejected"
-    )
-    console.print(Text(f"  no models returned — {why}.", style="yellow"))
-    console.print(Text(
-        f"  Current model id is '{current}'. If runs fail with a 404, set LEA_MODEL "
-        "to an id your provider lists in its own docs/dashboard.",
-        style="dim",
-    ))
+    # Report what will actually happen. The agent self-heals a stale id, so the old
+    # "runs will fail with a 404" warning would now be a lie in the common case.
+    console.print()
+    if will_use and will_use == current:
+        console.print(Text(f"  {current} — served, will be used.", style="green"))
+    elif will_use:
+        console.print(Text(
+            f"  {current} is not served here. {will_use} will be used automatically.",
+            style="bold green",
+        ))
+        console.print(Text(
+            f"  Nothing to do — runs self-heal. Set LEA_MODEL to pin a different one.",
+            style="dim",
+        ))
+    else:
+        why = (
+            f"the lookup took longer than {MODELS_TIMEOUT_S:g}s"
+            if timed_out
+            else f"{base or 'the endpoint'} was unreachable, or your key was rejected"
+        )
+        console.print(Text(f"  no models returned — {why}.", style="yellow"))
+        console.print(Text(
+            f"  Current model id is '{current}' and no replacement could be found, so runs "
+            "will fail. Check the key, then set LEA_MODEL to an id from your provider's "
+            "dashboard.",
+            style="bold yellow",
+        ))
 
 
 @app.command()

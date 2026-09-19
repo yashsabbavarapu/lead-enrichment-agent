@@ -915,3 +915,94 @@ def test_looks_like_stale_model_discriminates():
     assert looks_like_stale_model("model_not_found")
     assert not looks_like_stale_model("connection refused")
     assert not looks_like_stale_model("HTTP 500: server error")
+
+
+# --------------------------------------------------------------------------
+# Truncation: a cut-off error is one the user cannot search for
+# --------------------------------------------------------------------------
+
+
+def test_truncate_words_cuts_on_a_word_boundary():
+    from lea.agent.policy import truncate_words
+
+    text = "authentication rejected by google: Request had invalid authentication credentials"
+
+    out = truncate_words(text, 60)
+    assert len(out) <= 60
+    assert out.endswith("…")
+    # the defect: never end mid-token
+    assert not out.rstrip("…").endswith("authenticati")
+    assert out.rstrip("…").split()[-1] in text.split()
+
+    # short enough is returned untouched, with no ellipsis
+    assert truncate_words(text, 500) == text
+    assert truncate_words("short", 50) == "short"
+    assert truncate_words("", 50) == ""
+
+
+def test_truncate_words_falls_back_to_a_hard_cut_for_one_long_token():
+    from lea.agent.policy import truncate_words
+
+    url = "https://" + "a" * 300
+    out = truncate_words(url, 40)
+    assert len(out) <= 40
+    assert out.endswith("…")
+
+
+def test_llm_error_stop_reason_is_not_cut_mid_word(wired):
+    """Regression: the stop_reason trimmed B's already-200-char message again at
+    140 and landed mid-token ('...invalid authenticati') — the one string a user
+    would have pasted into a search box verbatim."""
+    detail = (
+        "LLM error: authentication rejected by google — the API key looks wrong or "
+        "lacks access to gemini-3.6-flash: Request had invalid authentication credentials "
+        "expected OAuth 2 access token"
+    )
+    llm = FakeCompatLLM([llm_error(detail)])
+    wired(llm, registry_of(FakeTool(ToolName.WEB_SEARCH)))
+
+    reason = loop_mod.run_agent("Vanta", make_settings(max_steps=8)).stats.stop_reason
+
+    assert "authenticati)" not in reason
+    assert "authenticati…" not in reason
+    # it WAS long enough to trim, and the trim landed between words
+    assert "…" in reason
+    last_word = reason.split("…")[0].split()[-1]
+    assert last_word in detail.split(), f"{last_word!r} is not a whole word from the error"
+
+
+def test_observation_truncation_keeps_whole_words(wired):
+    long_error = "connection reset by peer while contacting " + "example-host-name " * 40
+    boom = FakeTool(ToolName.FETCH_PAGE, raises=RuntimeError(long_error))
+    llm = FakeLLM([
+        act(ToolName.FETCH_PAGE, "try it", url="https://acme.com"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(boom))
+
+    step = loop_mod.run_agent("acme.com", make_settings()).trace[0]
+    shown = step.observation.rstrip("…").strip()
+    assert shown
+    assert not shown.endswith("example-host-nam")
+
+
+def test_auth_failure_is_not_misdiagnosed_as_a_stale_model(wired):
+    """'HTTP 400: Please pass a valid API key' contains '400', but the user's
+    problem is the key — pointing them at --models wastes their time."""
+    from lea.agent.policy import looks_like_auth_failure, looks_like_stale_model
+
+    msg = "LLM error: HTTP 400: Please pass a valid API key"
+    assert looks_like_auth_failure(msg)
+    assert not looks_like_stale_model(msg)
+
+    llm = FakeCompatLLM([llm_error(msg)])
+    wired(llm, registry_of(FakeTool(ToolName.WEB_SEARCH)))
+    reason = loop_mod.run_agent("Vanta", make_settings(max_steps=8)).stats.stop_reason
+
+    assert "authentication problem" in reason
+    assert "check the key" in reason
+    assert "stale" not in reason.lower()
+    assert "--models" not in reason
+
+    # a genuine model-not-found still routes to --models
+    assert looks_like_stale_model("HTTP 404: model 'x' does not exist")

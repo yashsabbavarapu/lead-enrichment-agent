@@ -24,7 +24,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from lea.agent.policy import STOP_BLOCKED, STOP_COMPLETE, STOP_ERROR, stop_class
+from lea.agent.policy import (
+    STOP_BLOCKED,
+    STOP_COMPLETE,
+    STOP_ERROR,
+    stop_class,
+    truncate_words,
+)
 from lea.models import CompanyRecord, EnrichmentResult, ToolName, TraceStep
 
 # Below this, an ICP score is not an assessment — it is a shrug with a number on it.
@@ -68,8 +74,7 @@ def _call_signature(step: TraceStep) -> str:
     if primary is None:
         primary = ", ".join(f"{k}={v!r}" for k, v in list(args.items())[:2])
         return f"{step.tool.value}({primary})"
-    if len(primary) > 78:
-        primary = primary[:77] + "…"
+    primary = truncate_words(primary, 78)
     extras = [k for k in args if k not in ("query", "url", "q", "reason", "page")]
     tail = f", +{len(extras)} arg" + ("s" if len(extras) > 1 else "") if extras else ""
     return f'{step.tool.value}("{primary}"{tail})'

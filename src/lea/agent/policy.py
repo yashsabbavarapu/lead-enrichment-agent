@@ -407,7 +407,37 @@ _STALE_MODEL_MARKERS = (
     "model_not_found", "decommissioned", "unsupported model", "no such model",
 )
 
+# Checked BEFORE the stale-model markers: a bad key very often comes back as a 400,
+# and telling someone their model id is stale when the real problem is the key sends
+# them off fixing the wrong thing.
+_AUTH_MARKERS = (
+    "401", "403", "unauthorized", "authentication", "api key", "api_key",
+    "invalid_api_key", "permission denied", "credential", "forbidden",
+)
+
 MODELS_HINT = "run `lea doctor --models` to see what your provider actually serves, then set LEA_MODEL"
+KEY_HINT = "check the key for that provider (`lea doctor` shows which one is in use)"
+
+
+def truncate_words(text: str, limit: int, ellipsis: str = "…") -> str:
+    """Trim to `limit` chars, cutting on a word boundary.
+
+    A truncated error is the one string a user will paste into a search box
+    verbatim, so "...invalid authenticati" is worse than useless: it turns a
+    findable error into one that matches nothing. Backs off to the last space
+    unless that would discard most of the budget (one long token, e.g. a URL),
+    where a hard cut is the lesser evil.
+    """
+    t = (text or "").strip()
+    if len(t) <= limit:
+        return t
+    if limit <= len(ellipsis):
+        return ellipsis
+    cut = t[: limit - len(ellipsis)]
+    space = cut.rfind(" ")
+    if space >= int((limit - len(ellipsis)) * 0.6):
+        cut = cut[:space]
+    return cut.rstrip(" \t,;:.-—") + ellipsis
 
 
 def llm_error_detail(action: AgentAction) -> Optional[str]:
@@ -418,8 +448,17 @@ def llm_error_detail(action: AgentAction) -> Optional[str]:
     return thought if thought.lower().startswith(_LLM_ERROR_PREFIX) else None
 
 
+def looks_like_auth_failure(text: str) -> bool:
+    return any(m in (text or "").lower() for m in _AUTH_MARKERS)
+
+
 def looks_like_stale_model(text: str) -> bool:
-    return any(m in (text or "").lower() for m in _STALE_MODEL_MARKERS)
+    # Auth wins ties: "HTTP 400: Please pass a valid API key" is a key problem, and
+    # the 400 in it must not make it read as a rotated model id.
+    t = (text or "").lower()
+    if looks_like_auth_failure(t):
+        return False
+    return any(m in t for m in _STALE_MODEL_MARKERS)
 
 
 def llm_failure_stop_reason(details: list[str], provider: str = "", model: str = "") -> str:
@@ -428,14 +467,19 @@ def llm_failure_stop_reason(details: list[str], provider: str = "", model: str =
     Otherwise the run reads as "the agent gave up" and the user never learns that
     their endpoint is 404ing.
     """
-    first = (details[0] if details else "").strip()
+    first = truncate_words((details[0] if details else "").strip(), 180)
     where = "/".join(p for p in (provider, model) if p) or "the configured LLM"
+    if looks_like_auth_failure(first):
+        return (
+            f"{STOP_ERROR}: {where} rejected every request ({first}). "
+            f"That is an authentication problem, not a research one — {KEY_HINT}."
+        )
     if looks_like_stale_model(first):
         return (
-            f"{STOP_ERROR}: {where} rejected every request ({first[:140]}). "
+            f"{STOP_ERROR}: {where} rejected every request ({first}). "
             f"The model id is probably stale — {MODELS_HINT}."
         )
-    return f"{STOP_ERROR}: every LLM call to {where} failed ({first[:140]})."
+    return f"{STOP_ERROR}: every LLM call to {where} failed ({first})."
 
 
 def transient_failure_hint(step: TraceStep) -> str:

@@ -37,6 +37,7 @@ from lea.agent.policy import (
     should_stop,
     stop_class,
     transient_failure_hint,
+    truncate_words,
 )
 from lea.config import Settings
 from lea.models import (
@@ -151,10 +152,9 @@ def _is_aggregator(host: str) -> bool:
 
 
 def _truncate(text: str, limit: int = OBS_PREVIEW_CHARS) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    # Word-boundary: these strings are error messages as often as page text, and a
+    # message cut mid-token is one a user cannot search for.
+    return truncate_words(text, limit)
 
 
 def _stringify_results(results: Iterable[Any]) -> str:
