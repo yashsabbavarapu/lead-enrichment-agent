@@ -606,18 +606,120 @@ _US_STATES = frozenset(
     }
 )
 
-# Lowercase needle -> how it should be written back out. Order matters: the first
-# hit wins, so the more specific labels come first.
-_INDUSTRY_WORDS = {
-    "fintech": "Fintech", "healthtech": "Healthtech", "edtech": "Edtech",
-    "insurtech": "Insurtech", "proptech": "Proptech", "martech": "Martech",
-    "adtech": "Adtech", "cybersecurity": "Cybersecurity", "developer tools": "Developer Tools",
-    "data infrastructure": "Data Infrastructure", "spend management": "Spend Management",
-    "expense management": "Spend Management", "corporate card": "Fintech",
-    "artificial intelligence": "Artificial Intelligence", "machine learning": "Machine Learning",
-    "logistics": "Logistics", "e-commerce": "E-commerce", "ecommerce": "E-commerce",
-    "marketplace": "Marketplace", "analytics": "Analytics", "biotech": "Biotech",
-    "robotics": "Robotics", "compliance": "Compliance", "saas": "SaaS", "security": "Security",
+# --- industry vocabulary --------------------------------------------------
+#
+# Label -> ((needle, weight), ...). Specific phrases ("soc 2", "spend management")
+# are strong evidence of what a company SELLS; bare words ("analytics",
+# "security") are weak, because they show up in anyone's nav, footer and script
+# inventory. Scoring is weighted and region-aware — see `_score_industries` —
+# so dict order carries no meaning at all.
+_INDUSTRY_VOCAB: dict[str, tuple[tuple[str, float], ...]] = {
+    "Security & Compliance": (
+        ("soc 2", 3.5), ("soc2", 3.5), ("iso 27001", 3.5), ("iso27001", 3.5), ("hipaa", 3.0),
+        ("pci dss", 3.0), ("fedramp", 3.0), ("hitrust", 3.0), ("nist", 2.0), ("gdpr", 2.0),
+        ("compliance automation", 3.5), ("security compliance", 3.5), ("trust management", 3.5),
+        ("grc", 3.0), ("governance, risk", 3.0), ("risk and compliance", 3.0),
+        ("security questionnaire", 3.0), ("audit-ready", 2.5), ("audit readiness", 2.5),
+        ("security posture", 2.5), ("vulnerability management", 3.0), ("penetration testing", 3.0),
+        ("zero trust", 2.5), ("siem", 2.5), ("threat detection", 3.0), ("endpoint protection", 3.0),
+        ("identity and access", 2.5), ("cybersecurity", 2.5), ("infosec", 2.0),
+        ("compliance", 1.5), ("security", 0.8),
+    ),
+    "Fintech": (
+        ("fintech", 3.0), ("spend management", 3.5), ("expense management", 3.5),
+        ("corporate card", 3.5), ("finance operations", 3.0), ("financial operations", 3.0),
+        ("accounts payable", 3.0), ("accounting automation", 3.0), ("invoicing", 2.5),
+        ("payments", 2.0), ("payment processing", 3.0), ("treasury", 2.5), ("lending", 2.5),
+        ("banking", 2.0), ("underwriting", 2.0), ("reimbursement", 2.0), ("bill pay", 3.0),
+    ),
+    "Developer Tools & Infrastructure": (
+        ("developer tools", 3.5), ("developer platform", 3.0), ("devtools", 3.0),
+        ("ci/cd", 3.0), ("continuous integration", 3.0), ("observability", 3.0),
+        ("infrastructure as code", 3.0), ("kubernetes", 2.5), ("devops", 2.5),
+        ("api platform", 3.0), ("sdk", 1.5), ("code review", 2.5), ("deployment", 1.5),
+        ("serverless", 2.5), ("developers", 1.0),
+    ),
+    "Data & Analytics": (
+        ("data warehouse", 3.5), ("data infrastructure", 3.5), ("data pipeline", 3.0),
+        ("business intelligence", 3.5), ("product analytics", 3.5), ("analytics platform", 3.0),
+        ("data platform", 2.5), ("etl", 2.5), ("data lake", 3.0), ("dashboards", 1.5),
+        ("reporting", 1.0), ("analytics", 1.0), ("data science", 2.0),
+    ),
+    "HR & Payroll": (
+        ("payroll", 3.5), ("applicant tracking", 3.5), ("hris", 3.5), ("people ops", 3.0),
+        ("benefits administration", 3.0), ("recruiting software", 3.0), ("hr software", 3.5),
+        ("employee onboarding", 2.5), ("performance reviews", 2.5), ("workforce", 1.5),
+    ),
+    "Marketing Technology": (
+        ("marketing automation", 3.5), ("martech", 3.0), ("email marketing", 3.0),
+        ("lifecycle marketing", 3.0), ("customer engagement", 2.5), ("adtech", 3.0),
+        ("demand generation", 2.5), ("crm", 2.0), ("seo", 1.5),
+    ),
+    "Healthtech": (
+        ("healthtech", 3.5), ("electronic health record", 3.5), ("ehr", 3.0), ("telehealth", 3.5),
+        ("clinical", 2.0), ("patient", 1.5), ("medical records", 3.0), ("care delivery", 2.5),
+    ),
+    "E-commerce": (("e-commerce", 3.0), ("ecommerce", 3.0), ("online store", 2.5), ("checkout", 2.0), ("merchants", 2.0)),
+    "Logistics": (("logistics", 3.0), ("supply chain", 3.0), ("freight", 3.0), ("warehouse automation", 3.5), ("fulfilment", 2.5), ("fulfillment", 2.5)),
+    "Insurtech": (("insurtech", 3.5), ("insurance", 2.0), ("claims processing", 3.0), ("policyholder", 3.0)),
+    "Proptech": (("proptech", 3.5), ("real estate", 2.5), ("property management", 3.0)),
+    "Edtech": (("edtech", 3.5), ("learning management", 3.0), ("online courses", 2.5), ("students", 1.5)),
+    "Legaltech": (("legaltech", 3.5), ("contract lifecycle", 3.0), ("legal operations", 3.0), ("e-discovery", 3.0)),
+    "Robotics": (("robotics", 3.0), ("autonomous robots", 3.5), ("robots", 2.0)),
+    "Biotech": (("biotech", 3.0), ("drug discovery", 3.5), ("genomics", 3.0), ("therapeutics", 3.0)),
+    "Marketplace": (("marketplace", 2.5), ("two-sided market", 3.0), ("buyers and sellers", 3.0)),
+    "Artificial Intelligence": (("artificial intelligence", 2.0), ("machine learning", 2.0), ("llm", 2.0), ("foundation model", 3.0)),
+}
+
+#: Winning needle -> a more precise sub_industry, when one applies.
+_SUB_INDUSTRY = {
+    "soc 2": "Compliance Automation", "soc2": "Compliance Automation",
+    "iso 27001": "Compliance Automation", "compliance automation": "Compliance Automation",
+    "security compliance": "Compliance Automation", "trust management": "Trust Management",
+    "grc": "GRC", "security questionnaire": "Compliance Automation",
+    "vulnerability management": "Vulnerability Management", "threat detection": "Threat Detection",
+    "spend management": "Spend Management", "expense management": "Spend Management",
+    "corporate card": "Spend Management", "payments": "Payments",
+    "payment processing": "Payments", "accounts payable": "Accounts Payable",
+    "payroll": "Payroll", "applicant tracking": "Applicant Tracking",
+    "observability": "Observability", "ci/cd": "CI/CD",
+    "data warehouse": "Data Infrastructure", "data infrastructure": "Data Infrastructure",
+    "product analytics": "Product Analytics", "business intelligence": "Business Intelligence",
+    "marketing automation": "Marketing Automation", "warehouse automation": "Warehouse Automation",
+    "telehealth": "Telehealth", "electronic health record": "EHR",
+}
+
+#: A winner must clear this, and beat the runner-up by `_INDUSTRY_MARGIN`.
+#: Below either bar the honest answer is None.
+_INDUSTRY_FLOOR = 4.0
+_INDUSTRY_MARGIN = 1.35
+#: One needle can only vote so many times, so a repeated nav item cannot decide.
+_NEEDLE_OCCURRENCE_CAP = 3
+
+# Region weights: where a term appears matters more than how often.
+_W_LABELLED = 4.0   # an explicit title:/description:/<title> line
+_W_LEAD = 2.5       # the first few lines of a block: title, h1, lead paragraph
+_W_BODY = 1.0       # ordinary prose
+
+#: Lines that are inventory, chrome or boilerplate — they do not get to vote on
+#: what a company sells. "Detected technologies: Google Analytics 4, ..." naming
+#: an analytics vendor is exactly how Vanta got labelled "Analytics".
+_NON_PROSE_LINE_RE = re.compile(
+    r"^\s*(?:detected\s+technolog\w*|tech(?:nolog\w*)?|stack|scripts?|vendors?|cookies?|"
+    r"privacy|terms|copyright|all\s+rights\s+reserved)\s*[:=]|"
+    r"^\s*(?:©|&copy;)|"
+    r"\b(?:googletagmanager|cdn\.|\.js\b|\.css\b|<script|<style|data-w-id|window\.datalayer)\b|"
+    r"\ball\s+rights\s+reserved\b|\bcookie\s+(?:policy|settings|consent)\b",
+    re.IGNORECASE,
+)
+_DESCRIPTION_LINE_RE = re.compile(r"^\s*(?:description|meta[\s_-]?description|summary)\s*[:=]\s*(.+)$", re.IGNORECASE)
+
+#: Needles must match on word boundaries — plain `in` counts "hris" inside
+#: "Chris" and "etl" inside "Bartlett".
+_NEEDLE_RE: dict[str, re.Pattern[str]] = {
+    needle: re.compile(rf"(?<!\w){re.escape(needle)}(?!\w)", re.IGNORECASE)
+    for needles in _INDUSTRY_VOCAB.values()
+    for needle, _ in needles
 }
 
 # Tech names Agent A's detector surfaces, mapped to a category.
@@ -775,6 +877,104 @@ def _first_sentence_about(blocks: list[_Evidence], tokens: list[str]) -> Optiona
     return None
 
 
+def _strip_non_prose(line: str, vendor_names: tuple[str, ...]) -> str:
+    """Remove URLs and known vendor names so they cannot vote on the industry."""
+    cleaned = _URL_RE.sub(" ", line)
+    cleaned = re.sub(r"\b[\w-]+\.(?:com|io|co|net|org|ai|dev)\b", " ", cleaned)
+    for vendor in vendor_names:
+        cleaned = re.sub(re.escape(vendor), " ", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _industry_corpus(blocks: list[_Evidence]) -> list[tuple[str, float]]:
+    """Split the evidence into ``(text, region_weight)`` segments.
+
+    Title/description lines outrank the lead of a block, which outranks ordinary
+    prose. Script inventories, cookie banners and footers are dropped entirely.
+    """
+    vendors = tuple(name for _, (_, name) in _TECH_CATALOG.items())
+    segments: list[tuple[str, float]] = []
+
+    for block in blocks:
+        if not block.ok:
+            continue
+        prose: list[str] = []
+        for line in block.text.splitlines():
+            if not line.strip():
+                continue
+            if _NON_PROSE_LINE_RE.search(line):
+                continue
+            m = _TITLE_LINE_RE.match(line) or _DESCRIPTION_LINE_RE.match(line)
+            if m:
+                value = next((g for g in m.groups() if g), "")
+                segments.append((_strip_non_prose(value, vendors), _W_LABELLED))
+                continue
+            prose.append(_strip_non_prose(line, vendors))
+
+        # The first few prose lines of a page are its title, h1 and lead
+        # paragraph — the part that actually says what the company does.
+        lead, body = prose[:3], prose[3:]
+        if lead:
+            segments.append((" \n".join(lead), _W_LEAD))
+        if body:
+            segments.append((" \n".join(body), _W_BODY))
+    return segments
+
+
+def _score_industries(blocks: list[_Evidence]) -> dict[str, tuple[float, str]]:
+    """Label -> (score, strongest matching needle). Weighted, not first-match."""
+    segments = _industry_corpus(blocks)
+    if not segments:
+        return {}
+
+    scored: dict[str, tuple[float, str]] = {}
+    for label, needles in _INDUSTRY_VOCAB.items():
+        total = 0.0
+        best_needle = ""
+        best_contrib = 0.0
+        for needle, weight in needles:
+            contrib = 0.0
+            pattern = _NEEDLE_RE[needle]
+            for text, region_weight in segments:
+                hits = len(pattern.findall(text))
+                if hits:
+                    contrib += min(hits, _NEEDLE_OCCURRENCE_CAP) * weight * region_weight
+            if contrib > 0:
+                total += contrib
+                if contrib > best_contrib or (contrib == best_contrib and weight > 2.0 and not best_needle):
+                    best_contrib, best_needle = contrib, needle
+        if total > 0:
+            scored[label] = (total, best_needle)
+    return scored
+
+
+def infer_industry(blocks: list[_Evidence]) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(industry, sub_industry)``, or ``(None, None)`` when unsure.
+
+    A single incidental mention never decides an industry: the winner must clear
+    `_INDUSTRY_FLOOR` and beat the runner-up by `_INDUSTRY_MARGIN`. Ties resolve
+    to unknown, which this project treats as a feature rather than a failure.
+    """
+    scored = _score_industries(blocks)
+    if not scored:
+        return None, None
+
+    ranked = sorted(scored.items(), key=lambda kv: (-kv[1][0], kv[0]))
+    label, (score, needle) = ranked[0]
+    if score < _INDUSTRY_FLOOR:
+        logger.debug("Industry %r scored %.1f, below the floor; leaving unknown", label, score)
+        return None, None
+    if len(ranked) > 1:
+        runner_up = ranked[1][1][0]
+        if runner_up > 0 and score < runner_up * _INDUSTRY_MARGIN:
+            logger.debug(
+                "Industry is ambiguous (%s %.1f vs %s %.1f); leaving unknown",
+                label, score, ranked[1][0], runner_up,
+            )
+            return None, None
+    return label, _SUB_INDUSTRY.get(needle)
+
+
 def _extract_tech(blocks: list[_Evidence]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -838,11 +1038,11 @@ def _heuristic_pool(context: str, target: str, today: Optional[date] = None) -> 
     if country:
         pool["hq_country"] = country
 
-    lowered = text.lower()
-    for needle, label in _INDUSTRY_WORDS.items():
-        if needle in lowered:
-            pool["industry"] = label
-            break
+    industry, sub_industry = infer_industry(blocks)
+    if industry:
+        pool["industry"] = industry
+    if sub_industry:
+        pool["sub_industry"] = sub_industry
 
     description = _first_sentence_about(usable, tokens)
     if description:

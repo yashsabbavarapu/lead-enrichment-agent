@@ -318,20 +318,85 @@ def _sort_signals(signals: list[Signal]) -> list[Signal]:
     return [t[2] for t in dated] + undated
 
 
+def _tech_tokens(name: str) -> list[str]:
+    """'Google Analytics 4' -> ['google','analytics','4']; 'Next.js' -> ['next','js']."""
+    return [t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t]
+
+
+def _merge_evidence(*values: str) -> str:
+    """Union of the evidence strings, in order, trimmed so the cell stays readable."""
+    out: list[str] = []
+    for v in values:
+        v = (v or "").strip()
+        if v and v not in out:
+            out.append(v)
+    joined = "; ".join(out)
+    return joined if len(joined) <= 300 else joined[:297] + "..."
+
+
+def _absorb(winner: TechStack, loser: TechStack) -> TechStack:
+    """Fold `loser` into `winner`, keeping the better confidence and both reasons."""
+    merged = winner.model_copy(deep=True)
+    merged.confidence = max(winner.confidence or 0.0, loser.confidence or 0.0)
+    merged.evidence = _merge_evidence(winner.evidence, loser.evidence)
+    return merged
+
+
 def _dedupe_tech(items: Iterable[TechStack]) -> list[TechStack]:
-    """One entry per (category, name); highest confidence wins."""
-    best: dict[tuple[str, str], TechStack] = {}
-    order: list[tuple[str, str]] = []
+    """One row per product.
+
+    Keyed on NAME, not (category, name), in two passes:
+
+      1. Same name, different category -> collapse. Cloudflare detected as both
+         `hosting` and `infra` is one Cloudflare; the category is a label we
+         attached, not a second fact about the company. The higher-confidence
+         detection wins and names the category, and both evidence strings survive.
+      2. A generic name that is a token-prefix of a more specific one -> keep the
+         specific. `Google Analytics` and `Google Analytics 4` are one product
+         detected at two resolutions, and GA4 is the real answer.
+
+    We collapse across categories even for a genuinely multi-category vendor like
+    HubSpot (crm + marketing) rather than special-casing it. The record answers
+    "what does this company run", and a reviewer seeing the same vendor on two
+    rows reads a data-quality bug, not nuance — one rule applied everywhere is
+    easier to trust than a rule with exceptions. The cost is real but small: the
+    secondary category is dropped, while its evidence string is kept.
+    """
+    # Pass 1 - collapse by name, remembering first-seen order.
+    best: dict[str, TechStack] = {}
+    order: list[str] = []
     for t in items or []:
         if not t or not getattr(t, "name", "").strip():
             continue
-        key = ((t.category or "other").strip().lower(), t.name.strip().lower())
+        key = t.name.strip().lower()
         if key not in best:
             best[key] = t
             order.append(key)
-        elif (t.confidence or 0) > (best[key].confidence or 0):
-            best[key] = t
-    return [best[k] for k in order]
+            continue
+        incumbent = best[key]
+        # Whichever detection is more confident keeps its category.
+        if (t.confidence or 0) > (incumbent.confidence or 0):
+            best[key] = _absorb(t, incumbent)
+        else:
+            best[key] = _absorb(incumbent, t)
+
+    # Pass 2 - drop a generic name when a more specific one is also present.
+    tokens = {k: _tech_tokens(best[k].name) for k in order}
+    dropped: set[str] = set()
+    for a in order:
+        if a in dropped:
+            continue
+        for b in order:
+            if a == b or b in dropped:
+                continue
+            ta, tb = tokens[a], tokens[b]
+            if ta and len(ta) < len(tb) and tb[: len(ta)] == ta:
+                # `a` is the generic form of `b`: fold it in and keep `b`.
+                best[b] = _absorb(best[b], best[a])
+                dropped.add(a)
+                break
+
+    return [best[k] for k in order if k not in dropped]
 
 
 def _unique_urls(urls: Iterable[Optional[str]]) -> list[str]:

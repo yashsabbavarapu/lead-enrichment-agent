@@ -228,6 +228,61 @@ def test_extract_record_dedupes_tech_keeping_highest_confidence(settings):
     assert seg.confidence == 0.9
 
 
+def test_tech_dedupe_collapses_generic_and_cross_category_duplicates(settings):
+    """Both duplications seen in the real `lea enrich "Vanta" --offline` output."""
+    rec = CompanyRecord(
+        input="Vanta",
+        company_name="Vanta",
+        tech_stack=[
+            # generic/specific pair: GA4 is the real detection
+            TechStack(category="analytics", name="Google Analytics",
+                      evidence="gtag.js present", confidence=0.6),
+            TechStack(category="analytics", name="Google Analytics 4",
+                      evidence="G- measurement id", confidence=0.9),
+            TechStack(category="analytics", name="Google Tag Manager", confidence=0.9),
+            # same name, two categories: there is only one Cloudflare
+            TechStack(category="hosting", name="Cloudflare",
+                      evidence="server header", confidence=0.7),
+            TechStack(category="infra", name="Cloudflare",
+                      evidence="cf-ray header", confidence=0.95),
+            # multi-category vendor: collapsed by the same rule, deliberately
+            TechStack(category="crm", name="HubSpot", evidence="hs-script", confidence=0.9),
+            TechStack(category="marketing", name="HubSpot",
+                      evidence="hubspot forms", confidence=0.8),
+        ],
+    )
+    llm = FakeLLM({CompanyRecord: rec})
+    out = extract_record("Vanta", [("https://vanta.com", "t")], llm, settings)
+
+    names = [t.name for t in out.tech_stack]
+    assert names == ["Google Analytics 4", "Google Tag Manager", "Cloudflare", "HubSpot"]
+    assert "Google Analytics" not in names       # generic dropped for the specific
+    assert len(names) == len(set(names))         # every product listed exactly once
+
+    by_name = {t.name: t for t in out.tech_stack}
+    # the higher-confidence detection wins and names the surviving category
+    assert by_name["Cloudflare"].category == "infra"
+    assert by_name["Cloudflare"].confidence == 0.95
+    assert by_name["HubSpot"].category == "crm"
+    # evidence from a collapsed row is preserved rather than thrown away
+    assert "cf-ray header" in by_name["Cloudflare"].evidence
+    assert "server header" in by_name["Cloudflare"].evidence
+    assert "hubspot forms" in by_name["HubSpot"].evidence
+    assert "gtag.js present" in by_name["Google Analytics 4"].evidence
+
+
+def test_tech_dedupe_keeps_distinct_products_that_merely_share_a_word():
+    """'Google Analytics 4' must not swallow 'Google Tag Manager'."""
+    from lea.enrich.extract import _dedupe_tech
+
+    out = _dedupe_tech([
+        TechStack(category="analytics", name="Google Analytics 4", confidence=0.9),
+        TechStack(category="tag", name="Google Tag Manager", confidence=0.9),
+        TechStack(category="hosting", name="Google Cloud", confidence=0.8),
+    ])
+    assert [t.name for t in out] == ["Google Analytics 4", "Google Tag Manager", "Google Cloud"]
+
+
 def test_extract_record_populates_unknowns_and_sources(settings):
     llm = FakeLLM({CompanyRecord: _messy_record()})
     rec = extract_record("Ramp", EVIDENCE, llm, settings)

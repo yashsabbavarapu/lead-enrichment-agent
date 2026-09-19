@@ -253,6 +253,7 @@ Design decisions worth naming:
 - **Extraction output is post-processed, not trusted.** Domains are normalized and screened against an aggregator denylist, company names are rejected when they look like page titles, headcounts are bucketed, founding years outside 1800–today are dropped, signals are deduped by normalized headline and sorted most-recent-first, tech is deduped keeping the highest confidence. These normalizers are the last line of defence before a record is rendered and saved, so they assume the model's output is wrong until it passes.
 - **Refusing to answer is a supported outcome.** An unresearched company gets an explicit non-assessment, an unverifiable domain stays `null`, and a hook with no real fact behind it is dropped. A blank field routes the company to a human; a plausible wrong one does not.
 - **Hooks are mechanically filtered.** Anything over 45 words, containing a cliché from a blocklist, or whose `grounded_in` does not match a fact actually present in the record is dropped. If that leaves fewer than two, deterministic hooks are built from the strongest real signal — plain, but true.
+- **The fetcher assumes its own URLs are hostile.** The agent follows URLs an LLM chose out of untrusted search results, which makes it a confused deputy by construction. Every URL and every redirect hop is resolved and refused if it lands on loopback, RFC1918, link-local or a cloud metadata endpoint — so a page that redirects to `169.254.169.254` gets an error, not credentials. The residual DNS-rebinding window is commented in `tools/http.py` rather than pretended away.
 - **Unknowns are a first-class field.** Honest gaps are more useful than confident guesses, and they are what tells you which companies deserve a human pass.
 
 ## Limitations
@@ -264,5 +265,5 @@ Design decisions worth naming:
 - **Headcount is a bucket, not a number.** Public sources disagree constantly; `employee_estimate` is a bucket midpoint and should be treated as an order of magnitude.
 - **Tech detection is shallow.** It reads public page markup and job postings. It sees front-end and analytics tooling well, back-end and data infrastructure barely at all, and it infers rather than asserts — hence the per-entry confidence.
 - **ICP inference reflects the examples you give it.** Three examples from one vertical produce a rubric that overfits to that vertical. It is a starting draft to edit, not an oracle.
-- **No CRM writeback, no dedupe against existing records, no rate-limit backoff beyond a simple timeout.** This is a portfolio project, not a production data platform.
+- **No CRM writeback and no dedupe against existing records.** This is a portfolio project, not a production data platform. Search does pace itself, rotate endpoints and back off, but there is no persistent cross-run rate-limit budget.
 - **Public web only.** No LinkedIn, no paid data vendors, no anything behind a login. `robots.txt` is respected by default.

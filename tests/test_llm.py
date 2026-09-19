@@ -459,7 +459,89 @@ def test_ramp_firmographics_are_parsed():
     assert record.employee_range == "1001-5000"
     assert record.hq_city == "New York"
     assert record.hq_country == "United States"
-    assert record.industry
+    assert record.industry == "Fintech"
+    assert record.sub_industry == "Spend Management"
+
+
+# --- industry inference: scored, region-weighted, willing to say "unknown" -----
+
+
+def _industry_of(*blocks: tuple[str, str]) -> tuple[Optional[str], Optional[str]]:
+    from lea.llm.stub import _evidence_blocks, infer_industry
+
+    return infer_industry(_evidence_blocks(prompts.build_extraction_context("Acme", list(blocks))))
+
+
+def test_compliance_title_beats_an_analytics_vendor_in_the_body():
+    """The Vanta regression: a title saying compliance must outrank a script vendor."""
+    industry, sub = _industry_of(
+        (
+            "https://acme.com/",
+            "<title>Compliance Automation for SOC 2 and ISO 27001</title>\n"
+            "Acme automates security compliance so teams get audit-ready fast.\n"
+            "Detected technologies: Google Analytics 4, Segment, Mixpanel, Amplitude\n"
+            "Powered by Google Analytics and Segment analytics tooling.",
+        )
+    )
+    assert industry == "Security & Compliance"
+    assert sub == "Compliance Automation"
+
+
+def test_a_detected_technologies_line_alone_never_decides_the_industry():
+    """`Detected technologies: Google Analytics 4, ...` is inventory, not positioning."""
+    assert _industry_of(
+        ("https://acme.com/", "Detected technologies: Google Analytics 4, Google Tag Manager, Webflow, HubSpot")
+    ) == (None, None)
+
+
+def test_a_single_incidental_mention_resolves_to_unknown():
+    assert _industry_of(("https://acme.com/", "Acme makes software for teams. We use analytics internally.")) == (
+        None,
+        None,
+    )
+
+
+def test_ramp_like_text_resolves_to_fintech():
+    industry, sub = _industry_of(
+        ("https://ramp.com/", "Ramp's corporate card and spend management software help companies control expenses.")
+    )
+    assert industry == "Fintech"
+    assert sub == "Spend Management"
+
+
+def test_an_ambiguous_page_resolves_to_unknown_rather_than_guessing():
+    assert _industry_of(
+        ("https://acme.com/", "We build payroll software and payment processing tools for small businesses.")
+    ) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Acme is the data warehouse for product analytics and business intelligence.", "Data & Analytics"),
+        ("Acme is an observability and CI/CD platform for developer teams.", "Developer Tools & Infrastructure"),
+        ("Acme is HR software: payroll, HRIS and benefits administration in one.", "HR & Payroll"),
+        ("Acme does marketing automation, email marketing and lifecycle marketing.", "Marketing Technology"),
+        ("Acme is a telehealth platform with an electronic health record for clinics.", "Healthtech"),
+        ("Acme builds warehouse automation robots for supply chain and freight operators.", "Logistics"),
+    ],
+)
+def test_industry_vocabulary_distinguishes_adjacent_categories(text, expected):
+    assert _industry_of(("https://acme.com/", text))[0] == expected
+
+
+def test_industry_needles_match_on_word_boundaries():
+    """`hris` must not match inside "Chris", nor `etl` inside "Bartlett"."""
+    assert _industry_of(("https://acme.com/careers", "Meet Chris Bartlett, who joined us from a startup.")) == (
+        None,
+        None,
+    )
+
+
+def test_urls_and_vendor_names_do_not_vote_on_industry():
+    assert _industry_of(
+        ("https://acme.com/", "Acme makes things.\nhttps://analytics.example.com/tag.js\nSegment and Mixpanel are loaded.")
+    ) == (None, None)
 
 
 def test_ramp_signals_are_deduplicated_not_doubled():
