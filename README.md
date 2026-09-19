@@ -1,6 +1,13 @@
 # lead-enrichment-agent
 
-An autonomous research agent that enriches B2B leads. Give it a company name and it **decides its own research path** — search, read the one page that looks most promising, notice what is still missing, then search again with a different query shaped by what it just learned — and returns a structured record, an ICP fit score with per-criterion reasoning, grounded outreach hooks, and the full trace of how it got there. A conventional enrichment pipeline runs the same fixed sequence of API calls for every company and returns nulls where the data was not in the vendor's database. This one plans, adapts when a step fails, cites a URL for every claim, and tells you what it could not find out.
+[![CI](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-884-brightgreen.svg)](tests/)
+
+**An autonomous research agent for B2B lead enrichment.** Give it a company name; it decides its own research path — search, read the page that looks most promising, pull the company's public job board, search again for what's still missing — and returns a structured record, an ICP fit score with per-criterion reasoning, grounded outreach hooks, and the full trace of how it got there.
+
+A conventional enrichment pipeline runs the same fixed sequence of API calls for every company and returns nulls where the vendor's database was thin. This one plans, adapts when a step fails, cites a URL for every claim, and tells you what it could not find out.
 
 Runs end-to-end with **zero API keys**.
 
@@ -237,6 +244,41 @@ The record from that same `--offline` run (`out/ramp.json`, trimmed):
 Two things in there are deliberate rather than broken. `"employee_range": null` with `"unknowns": ["employee_range"]` is the agent declining to guess a headcount it could not source. And the hooks lean on a stack choice and a hiring line because that is what this evidence actually supports — there is no invented funding round, because the fixtures contain no funding announcement the extractor could date.
 
 ## Architecture
+
+```mermaid
+flowchart LR
+    T(["company name<br/>or CSV"]) --> P
+
+    subgraph LOOP ["agent loop · plan → act → observe"]
+        direction TB
+        P["plan next step<br/>what is still unknown?"]
+        P --> G{"budget ok?<br/>not redundant?"}
+        G -->|blocked| F["feed the reason back<br/>as an observation"]
+        F --> P
+        G -->|allowed| A["act"]
+        A --> O["observe<br/>update the gap list"]
+        O -->|gaps remain| P
+    end
+
+    A -.-> S1["web_search"]
+    A -.-> S2["fetch_page"]
+    A -.-> S3["detect_tech"]
+    A -.-> S4["fetch_jobs"]
+
+    O -->|"gaps closed<br/>or budget spent"| X
+
+    subgraph SYN ["synthesis"]
+        direction TB
+        X["extract record"] --> V["verify every fact<br/>against the evidence"]
+        V --> C["score ICP<br/>model grades, Python computes"]
+        C --> H["draft hooks<br/>drop the ungrounded"]
+    end
+
+    H --> R(["record · trace · CSV"])
+```
+
+Every step is recorded, so a finished run replays with `lea replay`.
+
 
 ```
 src/lea/
