@@ -64,6 +64,44 @@ AGGREGATORS = frozenset(
 # Applicant-tracking hosts: their presence is a hiring signal in itself.
 _ATS_HOSTS = ("greenhouse.io", "lever.co", "ashbyhq.com", "workday", "smartrecruiters.com", "teamtailor.com")
 
+
+def _ats_host_hints() -> tuple[str, ...]:
+    """Agent A owns the canonical list; import it lazily so we cannot drift."""
+    try:
+        from lea.tools.jobs import ATS_HOST_HINTS  # type: ignore
+
+        return tuple(ATS_HOST_HINTS)
+    except Exception as exc:  # noqa: BLE001 - a missing tool must not break the brain
+        logger.debug("Falling back to the local ATS host list: %s", exc)
+        return ("ashbyhq.com", "greenhouse.io", "lever.co", "workable.com")
+
+
+def _ats_mentioned(context: str) -> bool:
+    """Agent A's detect_tech names the board and the tool in its summary."""
+    lowered = (context or "").lower()
+    if "fetch_jobs" in lowered or "ats_boards" in lowered:
+        return True
+    return any(hint in lowered for hint in _ats_host_hints()) or any(h in lowered for h in _ATS_HOSTS)
+
+
+def _domain_of(fetched: set[str], tokens: list[str]) -> Optional[str]:
+    """The company's own host, from a page we already opened."""
+    for url in sorted(fetched):
+        if _score_official(url, tokens) > 0:
+            try:
+                host = _registrable(urlparse(url).netloc)
+            except ValueError:  # pragma: no cover - defensive
+                continue
+            if host:
+                return host
+    return None
+
+
+def _is_ats_url(url: str) -> bool:
+    """True for a job-board URL, which `fetch_jobs` reads far better than `fetch_page`."""
+    lowered = (url or "").lower()
+    return any(hint in lowered for hint in _ats_host_hints())
+
 # URL path/keyword hints for "the interesting second fetch".
 _PROMISING = (
     ("careers", 6), ("jobs", 6), ("/about", 5), ("about-us", 5), ("news", 4), ("press", 4),
@@ -75,6 +113,7 @@ _TARGET_RE = re.compile(r"^\s*TARGET(?: COMPANY)?:\s*(.+?)\s*$", re.MULTILINE)
 _STEPS_LEFT_RE = re.compile(r"steps\s*=\s*(\d+)", re.IGNORECASE)
 _SEARCHES_LEFT_RE = re.compile(r"searches\s*=\s*(\d+)", re.IGNORECASE)
 _FETCHES_LEFT_RE = re.compile(r"fetches\s*=\s*(\d+)", re.IGNORECASE)
+_JOBS_LEFT_RE = re.compile(r"job_boards\s*=\s*(\d+)", re.IGNORECASE)
 _FAILED_STEP_RE = re.compile(r"^\s*\d+\.\s*([a-z_]+)\s*\([^\n]*?\)\s*->\s*FAILED", re.MULTILINE)
 
 _NAME_NOISE = frozenset({"inc", "llc", "ltd", "corp", "the", "com", "www", "gmbh", "sas", "plc"})
@@ -154,7 +193,7 @@ def _fetched_urls(context: str) -> set[str]:
 
 def _tools_used(context: str) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for tool in ("web_search", "fetch_page", "detect_tech", "finish"):
+    for tool in ("web_search", "fetch_page", "detect_tech", "fetch_jobs", "finish"):
         counts[tool] = len(_tool_call_re(tool).findall(context or ""))
     return counts
 
@@ -1120,6 +1159,7 @@ class StubClient:
         steps_left = _int_after(_STEPS_LEFT_RE, ctx)
         searches_left = _int_after(_SEARCHES_LEFT_RE, ctx)
         fetches_left = _int_after(_FETCHES_LEFT_RE, ctx)
+        jobs_left = _int_after(_JOBS_LEFT_RE, ctx)
 
         def act(tool: ToolName, thought: str, args: dict[str, Any]) -> tuple[AgentAction, LLMUsage]:
             return AgentAction(thought=thought, tool=tool, args=args), usage
@@ -1138,6 +1178,13 @@ class StubClient:
         can_search = ToolName.WEB_SEARCH.value in allowed and (searches_left is None or searches_left > 0)
         can_fetch = ToolName.FETCH_PAGE.value in allowed and (fetches_left is None or fetches_left > 0)
         can_tech = ToolName.DETECT_TECH.value in allowed and (fetches_left is None or fetches_left > 0)
+        # One job-board lookup is plenty: it returns exact role counts and a
+        # department split in a single call, and Agent C budgets them separately.
+        can_jobs = (
+            ToolName.FETCH_JOBS.value in allowed
+            and used.get("fetch_jobs", 0) == 0
+            and (jobs_left is None or jobs_left > 0)
+        )
 
         search_arg = self._arg(allowed_tools, ToolName.WEB_SEARCH, ("query", "q", "search"), "query")
         fetch_arg = self._arg(allowed_tools, ToolName.FETCH_PAGE, ("url", "link", "page"), "url")
@@ -1191,6 +1238,33 @@ class StubClient:
                 {self._arg(allowed_tools, ToolName.DETECT_TECH, ("url", "domain", "link"), "url"): homepage},
             )
 
+        # 4b. A job board is the single best public evidence of hiring and org
+        #     shape: exact open-role counts and a department split, where a
+        #     careers page gives prose and the board's HTML shell gives nothing.
+        if can_jobs:
+            ats_url = next((u for u in urls if _is_ats_url(u)), None)
+            ats_seen = ats_url or _ats_mentioned(ctx)
+            hiring_wanted = "hiring" in ctx.lower()
+            if ats_seen or hiring_wanted:
+                jobs_arg = self._arg(
+                    allowed_tools,
+                    ToolName.FETCH_JOBS,
+                    ("company_or_url", "url", "company", "domain", "query"),
+                    "company_or_url",
+                )
+                # The board URL is the best handle; the domain and the bare name
+                # both work as fallbacks, and the tool resolves them itself.
+                handle = ats_url or _domain_of(fetched, tokens) or target
+                if ats_url:
+                    self._fetched.add(ats_url)
+                return act(
+                    ToolName.FETCH_JOBS,
+                    f"{handle} is an applicant-tracking board. Reading it gives the exact number "
+                    "of open roles and which departments are growing — the strongest hiring signal "
+                    "available, and a far better size proxy than anything on the marketing site.",
+                    {jobs_arg: handle},
+                )
+
         # 5. Firmographics covered -> go looking for recent signals.
         if ok_searches < 2 and can_search and attempted_searches < 4:
             query = f"{target} funding OR hiring OR news 2025"
@@ -1206,7 +1280,12 @@ class StubClient:
         #    homepage plus two signal pages is enough for a useful record, and
         #    trawling every remaining link is how budget gets wasted.
         if urls and can_fetch and used.get("fetch_page", 0) < 3:
-            best = max(urls, key=lambda u: _score_promising(u, tokens))
+            # An ATS board's HTML shell carries almost nothing; fetch_jobs reads
+            # its JSON API instead, so never spend a page fetch on one.
+            page_urls = [u for u in urls if not (_is_ats_url(u) and ToolName.FETCH_JOBS.value in allowed)]
+            if not page_urls:
+                page_urls = urls
+            best = max(page_urls, key=lambda u: _score_promising(u, tokens))
             if _score_promising(best, tokens) > 0:
                 self._fetched.add(best)
                 return act(

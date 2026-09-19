@@ -734,13 +734,18 @@ def test_partial_record_still_scores_normally_with_low_confidence(settings):
 
 
 def test_evidence_urls_are_filtered_to_urls_actually_gathered(settings):
+    """An invented citation never survives; a real one may be derived in its place."""
     llm = FakeLLM({ICPFit: _fit_from(
         {"company_type": 8, "company_size": 8, "tech_maturity": 8, "growth_signals": 8},
         urls=["https://hallucinated.example"],
     )})
     fit = score_icp(_known_record(), _icp_4(), [("https://a.example", "t")], llm, settings)
+
     for c in fit.criteria:
-        assert c.evidence_urls == []
+        assert "https://hallucinated.example" not in c.evidence_urls
+        # anything present must be a URL we actually fetched
+        for u in c.evidence_urls:
+            assert u == "https://a.example"
 
 
 def test_score_icp_falls_back_to_the_rubric_when_the_model_fails(settings):
@@ -2017,3 +2022,112 @@ def test_a_stated_headcount_beats_the_band_midpoint(settings):
     rec = extract_record("Vanta", ev, _fabricating_llm(), settings)
     assert rec.employee_range == "201-500"
     assert rec.employee_estimate == 500, "the stated figure, not the 350 midpoint"
+
+
+# --------------------------------------------------------------------------
+# Derived citations + order-preserving penalty
+#
+# The regression: a model that reasons well but emits no evidence_urls had every
+# criterion clamped to an identical 7.0, so the LLM path could not rank at all
+# and scored worse than the keyless one on the headline feature.
+# --------------------------------------------------------------------------
+
+GEMINI_LIKE = {"company_type": 9.0, "gtm_segment": 10.0, "company_size": 6.0,
+               "tech_maturity": 9.0, "growth_signals": 9.0, "geo": 10.0}
+
+
+def _uncited_llm(scores=None, summary="Vanta is an exemplary fit."):
+    """A model with specific, correct reasoning that cites nothing — the live case."""
+    scores = scores or GEMINI_LIKE
+    return FakeLLM({ICPFit: ICPFit(
+        score=96.8, tier="A", summary=summary,
+        criteria=[CriterionScore(key=k, score=v, weight=1.0, evidence_urls=[],
+                                 reasoning=f"Vanta scores {v} on {k} for documented reasons.")
+                  for k, v in scores.items()],
+    )})
+
+
+def _rich_record() -> CompanyRecord:
+    rec = _vanta_like()
+    rec.employee_range = "201-500"
+    return rec
+
+
+def test_citations_are_derived_when_the_model_emits_none(settings):
+    """Provenance is known in code, so it must not depend on model compliance."""
+    rec = _rich_record()
+    fit = score_icp(rec, DEFAULT_ICP, _ev(rec), _uncited_llm(), settings)
+
+    cited = [c for c in fit.criteria if c.evidence_urls]
+    assert len(cited) >= 4, "most criteria should carry a derived citation"
+    for c in cited:
+        for u in c.evidence_urls:
+            assert u in rec.sources, "a derived citation must be a URL we fetched"
+
+
+def test_uncited_criteria_are_no_longer_clamped_to_one_value(settings):
+    """The exact regression: six criteria, all exactly 7.0, ranking destroyed."""
+    rec = _rich_record()
+    fit = score_icp(rec, DEFAULT_ICP, _ev(rec), _uncited_llm(), settings)
+
+    scores = [c.score for c in fit.criteria]
+    assert len(set(scores)) >= 3, f"criteria collapsed to {set(scores)}"
+    assert scores.count(7.0) < len(scores)
+    # the model's ordering survives
+    by_key = {c.key: c.score for c in fit.criteria}
+    assert by_key["gtm_segment"] > by_key["company_size"]
+
+
+def test_the_shrink_penalises_but_preserves_ordering():
+    """An uncited 9 must still outrank an uncited 5."""
+    from lea.enrich.icp import UNCITED_NEUTRAL, UNCITED_SHRINK
+
+    def shrunk(x):
+        return round(UNCITED_NEUTRAL + (x - UNCITED_NEUTRAL) * UNCITED_SHRINK, 1)
+
+    assert shrunk(10.0) < 10.0 and shrunk(9.0) < 9.0        # penalised
+    assert shrunk(10.0) > shrunk(9.0) > shrunk(6.0)          # ordered
+    assert shrunk(5.0) == 5.0                                # unknown is the fixed point
+    assert shrunk(2.0) > 2.0                                 # uncited pessimism also softened
+
+
+def test_the_llm_path_ranks_as_well_as_the_keyless_one(settings):
+    """Sanity bar: the model path must not be worse than the stub at ranking."""
+    rec = _rich_record()
+    ev = _ev(rec)
+    llm_fit = score_icp(rec, DEFAULT_ICP, ev, _uncited_llm(), settings)
+    stub_fit = score_icp(rec, DEFAULT_ICP, ev, _stub_like_llm(), settings)
+
+    assert len({c.score for c in llm_fit.criteria}) >= 3
+    assert llm_fit.tier == stub_fit.tier == "A"
+    assert abs(llm_fit.score - stub_fit.score) < 15
+    assert llm_fit.confidence >= 0.8, "derived citations must lift confidence"
+
+
+def test_thin_evidence_still_scores_visibly_below_rich_evidence(settings):
+    """The penalty must remain real, not be engineered away."""
+    rich = _rich_record()
+    thin = CompanyRecord(input="Mystery", company_name="Mystery", domain="m.com",
+                         industry="SaaS", sources=["https://m.com"])
+
+    rich_fit = score_icp(rich, DEFAULT_ICP, _ev(rich), _uncited_llm(), settings)
+    thin_fit = score_icp(thin, DEFAULT_ICP, [("https://m.com", "Mystery builds SaaS.")],
+                         _uncited_llm(), settings)
+
+    assert thin_fit.score < rich_fit.score - 15
+    assert thin_fit.confidence < rich_fit.confidence
+    assert thin_fit.tier != "A"
+    # and it still ranks its own criteria rather than flattening them
+    assert len({c.score for c in thin_fit.criteria}) >= 3
+
+
+def test_a_bounded_score_leads_with_the_bound_not_the_enthusiasm(settings):
+    """'Exemplary fit' in front of 61/B is the 96.8-at-0.40 contradiction inverted."""
+    thin = CompanyRecord(input="Mystery", company_name="Mystery", domain="m.com",
+                         industry="SaaS", sources=["https://m.com"])
+    fit = score_icp(thin, DEFAULT_ICP, [("https://m.com", "Mystery builds SaaS.")],
+                    _uncited_llm(summary="Mystery is an exemplary fit."), settings)
+
+    assert fit.summary.startswith("Bounded by evidence:")
+    assert f"tier {fit.tier}" in fit.summary
+    assert fit.summary.index("Bounded by evidence") < fit.summary.index("exemplary")

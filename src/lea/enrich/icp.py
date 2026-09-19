@@ -42,9 +42,14 @@ __all__ = [
 ]
 
 TIER_THRESHOLDS: list[tuple[str, float]] = [("A", 80.0), ("B", 60.0), ("C", 40.0)]
-#: A criterion graded without a citation cannot score above this. You may be
-#: right, but "10/10, source: none" is an assertion, not an assessment.
-UNCITED_CRITERION_CAP = 7.0
+#: How far an uncited criterion is pulled toward the neutral 5/10. A hard clamp
+#: was wrong: it collapsed six criteria to an identical 7.0 and destroyed the
+#: ranking the whole feature exists to produce. Shrinking preserves ordering (an
+#: uncited 9 still beats an uncited 6) while saying that without a citation we
+#: are less sure the company sits at an extreme. 5/10 - "unknown" - is the fixed
+#: point, so a genuine gap is not pushed into being a negative.
+UNCITED_SHRINK = 0.75
+UNCITED_NEUTRAL = 5.0
 #: The whole score is capped by how much of it was evidenced. At confidence 0.4
 #: the ceiling is 64, so an uncited record cannot present as tier A. Reaching
 #: A (>=80) needs roughly two thirds of the criteria actually cited.
@@ -985,8 +990,12 @@ def _align_scores(
     out: list[CriterionScore] = []
     for crit in icp.criteria:
         got = by_key.get(crit.key) or by_key.get(snake_case(crit.key))
+        # The rubric scorer's result for this same criterion: used to fill a gap
+        # the model skipped, to supersede an uncited non-answer, and - most
+        # often - to supply the citation the model did not emit.
+        sub = fallback.get(crit.key)
+
         if got is None:
-            sub = fallback.get(crit.key)
             if sub is not None:
                 sub = sub.model_copy(deep=True)
                 sub.reasoning = "The model skipped this criterion; graded from the record. " + sub.reasoning
@@ -1014,11 +1023,23 @@ def _align_scores(
             if canon and canon not in seen_u:
                 seen_u.add(canon)
                 urls.append(canon)      # store the URL we actually fetched
-        if not urls and score > UNCITED_CRITERION_CAP:
-            # Graded high with nothing to point at. Live models did this while
-            # asserting facts the evidence never contained, so the ceiling is
-            # mechanical rather than a matter of trusting the reasoning.
-            score = UNCITED_CRITERION_CAP
+        # Derive the citation rather than depending on the model to emit one.
+        # `verify_record` already established which evidence supports each field,
+        # and the rubric scorer for this same criterion knows which of those
+        # facts it rests on - so the provenance is known in code before scoring
+        # runs. Same reasoning that put the score arithmetic in Python: do not
+        # make a guarantee depend on model compliance.
+        derived = False
+        if not urls and sub is not None and sub.evidence_urls:
+            urls = list(sub.evidence_urls)
+            derived = True
+
+        if not urls:
+            # Genuinely nothing to point at, for a criterion no rubric scorer
+            # could source either. Shrink toward neutral rather than clamp.
+            score = round(
+                UNCITED_NEUTRAL + (score - UNCITED_NEUTRAL) * UNCITED_SHRINK, 1
+            )
         # Narrow override: the model punted to the neutral 5/10 with nothing to
         # cite, while the rubric scorer has an actual citation. Observed live as
         # "Employee range is unknown... using the fallback unknown score of 5",
@@ -1026,7 +1047,6 @@ def _align_scores(
         # grade beats an uncited non-answer. Deliberately does NOT fire when the
         # model made a real judgement (any score but the 5.0 fallback) - an
         # uncited good judgement is still a judgement.
-        sub = fallback.get(crit.key)
         if (
             not urls
             and score == 5.0
@@ -1043,8 +1063,15 @@ def _align_scores(
             continue
 
         reasoning = (got.reasoning or "").strip() or "No reasoning returned."
-        if not urls and "no evidence" not in reasoning.lower():
-            reasoning = reasoning.rstrip(".") + ". (No source URL cited for this criterion.)"
+        if derived:
+            reasoning = reasoning.rstrip(".") + ". (Source attached from the evidence "
+            reasoning += "this criterion rests on.)"
+        elif not urls and "no evidence" not in reasoning.lower():
+            reasoning = (
+                reasoning.rstrip(".")
+                + ". (Uncited: no evidence block supports this, so the score was "
+                  "moved toward neutral.)"
+            )
         out.append(
             CriterionScore(
                 key=crit.key,
@@ -1197,10 +1224,15 @@ def score_icp(
                 "set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
             )
     if capped_by_confidence:
-        summary += (
-            f" Score capped at {score:.0f} by confidence {confidence:.2f}: most criteria "
-            f"were graded without a cited source, so a higher score would overstate what "
-            f"the evidence supports."
+        # Lead with the bound, not the enthusiasm. "Exemplary fit" sitting in
+        # front of 64/B is the same contradiction as a 96.8 at confidence 0.40,
+        # just pointing the other way - the reader takes the adjective and
+        # ignores the number.
+        summary = (
+            f"Bounded by evidence: scored {score:.0f}/100 (tier {tier}), capped by "
+            f"confidence {confidence:.2f} because most criteria were graded without a "
+            f"cited source. The assessment below may well be right, but the evidence "
+            f"gathered does not yet support a higher score. " + summary
         )
     if hits:
         summary = f"DISQUALIFIED — {hits[0]} " + summary

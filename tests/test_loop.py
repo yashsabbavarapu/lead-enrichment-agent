@@ -1274,13 +1274,13 @@ def test_rate_limit_is_not_reported_as_a_broken_setup(wired):
         # product signal rather than funding and growth_signals loses ~0.5 weighted
         # points. The fixture is now honest; the gap is in the funding-language
         # patterns, not here.
-        ("Vanta", "A", 87.9, "Security & Compliance"),
+        ("Vanta", "A", 90.6, "Security & Compliance"),
         # 63.9 -> 68.4 (Agent D): the real TechCrunch headline ("nearly doubles
         # valuation to $13B in secondary share sale") has no raise verb and was
         # being filed as a `product` signal. It is now correctly `funding`,
         # discounted 0.8x because a secondary sale brings no new primary
         # capital. Verified stable across 6 consecutive runs.
-        ("Ramp", "B", 68.4, "Fintech"),
+        ("Ramp", "A", 81.7, "Fintech"),
     ],
 )
 def test_stub_pipeline_on_fixtures_does_not_regress(target, tier, score, industry):

@@ -91,8 +91,9 @@ This is not hypothetical. A live model returned `employee_range: "201-500"` for 
 Three related rules keep the numbers honest rather than merely plausible:
 
 - **`employee_estimate` comes from the evidence or the band midpoint, never the model's arithmetic** — it returned 500 as the midpoint of 201-500. A stated headcount is preferred over a midpoint, and "500+ employees" will not verify a band that tops out at 500.
-- **A criterion graded without a citation is capped at 7/10.** You may well be right, but "10/10, source: none" is an assertion, not an assessment.
-- **The total is capped by confidence** at `40 + 60 x confidence`. A score of 96.8 carrying confidence 0.40 is self-contradictory; reaching tier A now requires roughly two thirds of the criteria to actually cite a source.
+- **Citations are derived, not requested.** The verification pass already knows which evidence block supports which fact, so the pipeline attaches the source URL to each criterion itself rather than depending on the model to remember. Same reasoning that put the score arithmetic in Python: a guarantee should not rest on model compliance. A citation the model invents is still discarded.
+- **A criterion that genuinely cannot be sourced is pulled toward neutral**, not clamped. An uncited 9 becomes 8 and an uncited 6 becomes 5.75 — penalised, but still ranked. An earlier version hard-capped these at 7/10 and six criteria collapsed to an identical score, which destroyed the ranking the feature exists to produce. 5/10 ("unknown") is the fixed point, so a genuine gap is never pushed into being a negative.
+- **The total is capped by confidence** at `40 + 60 x confidence`. A score of 96.8 carrying confidence 0.40 is self-contradictory; reaching tier A requires roughly two thirds of the criteria to actually cite a source. When the cap binds, the summary leads with it — "Bounded by evidence: scored 61/100..." — because "exemplary fit" printed above a 61 is the same contradiction pointing the other way.
 
 ## Example trace
 
