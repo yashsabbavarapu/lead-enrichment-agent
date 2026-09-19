@@ -4,6 +4,7 @@ that has to work without any API key at all; the paid providers are upgrades.
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -20,6 +21,102 @@ DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
 TAVILY_URL = "https://api.tavily.com/search"
 SERPER_URL = "https://google.serper.dev/search"
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
+
+# --- DuckDuckGo anti-bot handling ----------------------------------------
+# DDG trips a bot heuristic after a handful of quick queries. The trip is usually
+# cleared by a different endpoint + UA rather than by waiting alone, so retries
+# rotate both. Module-level so tests can shrink them to zero.
+# Budget tradeoff, tuned against a genuinely blocked DDG: a bot-check does not
+# clear by waiting, and a blocked endpoint tends to HANG rather than refuse
+# quickly, so patience costs a full timeout per attempt and buys nothing. The
+# degraded fixture fallback is good, so failing over FAST beats retrying.
+# Transient faults (resets, 5xx) are a different case and keep a short retry.
+DDG_MAX_ATTEMPTS = 3  # transient path only
+DDG_RETRY_BACKOFF_S: tuple[float, ...] = (0.6, 1.5)
+# A hard bot-check: try the current endpoint and the alternate once each, then
+# stop. Both endpoints challenged means blocked, not unlucky.
+DDG_BLOCK_MAX_ATTEMPTS = 2
+# Deliberately below settings.http_timeout_s: a hanging search should surrender
+# to the cache quickly rather than stall a live demo.
+DDG_REQUEST_TIMEOUT_S = 6.0
+DDG_MIN_REQUEST_GAP_S = 1.0
+DDG_JITTER = 0.25  # +/- fraction applied to every sleep
+
+# Strings DDG serves on its challenge/anomaly page instead of results.
+DDG_BLOCK_MARKERS: tuple[str, ...] = (
+    "anomaly",
+    "unusual traffic",
+    "are you a robot",
+    "blocked",
+    "captcha",
+    "challenge-platform",
+    "please try again later",
+    "detected unusual activity",
+)
+DDG_SHORT_BODY_BYTES = 800  # a real results page is tens of kilobytes
+
+BLOCKED_ADVICE = "retry in a minute, set TAVILY_API_KEY, or run with --offline"
+
+_last_ddg_request_at: float = 0.0
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can neutralize backoff without patching time.sleep globally."""
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def _jittered(seconds: float) -> float:
+    return seconds * random.uniform(1.0 - DDG_JITTER, 1.0 + DDG_JITTER)
+
+
+def reset_pacing() -> None:
+    """Forget the last-request timestamp (tests, and any long-idle process)."""
+    global _last_ddg_request_at
+    _last_ddg_request_at = 0.0
+
+
+def _pace(settings: Settings) -> None:
+    """Self-throttle outbound DDG calls.
+
+    A batch run firing queries back to back is exactly what trips the bot check,
+    so spacing them slightly is cheaper than getting blocked and retrying.
+    """
+    global _last_ddg_request_at
+    if settings.offline or DDG_MIN_REQUEST_GAP_S <= 0:
+        return
+    now = time.monotonic()
+    if _last_ddg_request_at:
+        wait = _jittered(DDG_MIN_REQUEST_GAP_S) - (now - _last_ddg_request_at)
+        if wait > 0:
+            _sleep(wait)
+    _last_ddg_request_at = time.monotonic()
+
+
+def ddg_block_reason(res: "_http.HttpResult") -> Optional[str]:
+    """Name the block if this response is one, else None.
+
+    Distinguishing a block from a genuine zero-result query matters: one is worth
+    retrying on another endpoint, the other is not.
+    """
+    # A blocked DDG often stalls the connection instead of refusing it. Hammering
+    # an unresponsive endpoint costs a full timeout per try and fixes nothing, so
+    # this counts as a block: try the other backend once, then use the cache.
+    if getattr(res, "timed_out", False):
+        return "endpoint did not respond (timed out)"
+    if res.status in (202, 403, 429):
+        label = {202: "HTTP 202 accepted-but-empty", 403: "HTTP 403 forbidden", 429: "HTTP 429 rate limited"}
+        return label[res.status]
+    if res.status >= 500:
+        return f"HTTP {res.status} upstream error"
+    body = res.text or ""
+    head = body[:4000].lower()
+    for marker in DDG_BLOCK_MARKERS:
+        if marker in head:
+            return f"challenge page (matched '{marker}')"
+    if res.ok and len(body.strip()) < DDG_SHORT_BODY_BYTES:
+        return f"suspiciously short response ({len(body.strip())} bytes)"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -59,11 +156,26 @@ def _clean(text: Optional[str]) -> str:
     return " ".join((text or "").split())
 
 
+def _is_usable(url: str) -> bool:
+    """Drop anything still pointing at DuckDuckGo.
+
+    Sponsored slots are `duckduckgo.com/y.js?ad_domain=...` redirects with no uddg
+    parameter to unwrap. They are ads, not research, and their URLs are enormous.
+    """
+    if not url.startswith(("http://", "https://")):
+        return False
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return False
+    return not host.endswith("duckduckgo.com")
+
+
 def _dedupe(results: list[SearchResult], limit: int) -> list[SearchResult]:
     seen: set[str] = set()
     out: list[SearchResult] = []
     for r in results:
-        if not r.url or not r.url.startswith(("http://", "https://")):
+        if not r.url or not _is_usable(r.url):
             continue
         key = r.url.rstrip("/").lower()
         if key in seen:
@@ -80,13 +192,25 @@ def _dedupe(results: list[SearchResult], limit: int) -> list[SearchResult]:
 # --------------------------------------------------------------------------
 
 
+def _result_containers(tree: HTMLParser) -> list:
+    out: list = []
+    for selector in ("div.result", "div.web-result", "div.results_links"):
+        out.extend(tree.css(selector))
+    return out
+
+
 def parse_ddg_html(html: str) -> list[SearchResult]:
     """Parse the html.duckduckgo.com/html/ layout: a.result__a + a.result__snippet."""
     out: list[SearchResult] = []
     if not html:
         return out
     tree = HTMLParser(html)
-    for node in tree.css("div.result, div.web-result, div.results_links"):
+    seen_nodes: set[int] = set()
+    for node in _result_containers(tree):
+        # One container carries several of these classes at once; visit it once.
+        if node.mem_id in seen_nodes:
+            continue
+        seen_nodes.add(node.mem_id)
         link = node.css_first("a.result__a")
         if link is None:
             continue
@@ -229,9 +353,38 @@ class WebSearchTool:
             else:
                 return self._fail(f"unknown search provider '{provider}'", started, {"provider": provider})
 
+            results = _dedupe(results, num) if results else []
+
+            # Last resort before failing: if this query was ever recorded, stale
+            # results beat no results. A blocked demo with a populated cache should
+            # still produce a record.
+            if (err or not results) and provider != "fixture":
+                cached, _ = self._fixture(query, num, settings)
+                cached = _dedupe(cached, num)
+                if cached:
+                    reason = err or f"{provider} returned no results"
+                    note = (
+                        f"[cached] {provider} unavailable ({reason}); "
+                        f"served {len(cached)} result(s) from a recorded fixture."
+                    )
+                    return Observation(
+                        tool=self.name,
+                        ok=True,
+                        summary=note + "\n" + _render(cached, settings.max_snippet_chars),
+                        data={
+                            "provider": provider,
+                            "query": query,
+                            "results": [r.model_dump() for r in cached],
+                            "degraded": True,
+                            "degraded_reason": reason,
+                            "served_from": "fixture",
+                        },
+                        sources=[r.url for r in cached],
+                        latency_ms=_ms(started),
+                    )
+
             if err:
                 return self._fail(err, started, {"provider": provider, "query": query})
-            results = _dedupe(results, num)
             if not results:
                 return self._fail(
                     f"no results for '{query}' via {provider} — try a shorter or differently worded query",
@@ -248,6 +401,7 @@ class WebSearchTool:
                     "provider": provider,
                     "query": query,
                     "results": [r.model_dump() for r in results],
+                    "degraded": False,
                 },
                 sources=urls,
                 latency_ms=_ms(started),
@@ -260,47 +414,83 @@ class WebSearchTool:
     def _duckduckgo(
         self, query: str, num: int, settings: Settings
     ) -> tuple[list[SearchResult], Optional[str]]:
-        form = {"q": query, "kl": "us-en"}
-        res = _http.request(
-            settings,
-            "POST",
-            DDG_HTML_URL,
-            data=form,
-            browser_ua=True,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://duckduckgo.com/",
-            },
-        )
-        results: list[SearchResult] = []
-        first_error: Optional[str] = None
-        if res.ok:
-            results = parse_ddg_html(res.text)
-        else:
-            first_error = res.error
+        """Try up to DDG_MAX_ATTEMPTS times, alternating endpoint and User-Agent.
 
-        if results:
-            return results, None
+        The html and lite endpoints are separate backends with separate layouts and
+        separate bot heuristics, so a trip on one frequently clears on the other.
+        """
+        blocked_reasons: list[str] = []
+        last_error: Optional[str] = None
+        hard_blocks = 0
 
-        # The html endpoint intermittently serves an anomaly/empty page; lite is a
-        # different backend with a different layout and usually still answers.
-        lite = _http.request(
-            settings,
-            "POST",
-            DDG_LITE_URL,
-            data={"q": query},
-            browser_ua=True,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://lite.duckduckgo.com/",
-            },
-        )
-        if lite.ok:
-            results = parse_ddg_lite(lite.text)
+        for attempt in range(DDG_MAX_ATTEMPTS):
+            use_lite = attempt % 2 == 1
+            url = DDG_LITE_URL if use_lite else DDG_HTML_URL
+            # Same index into both lists would pair endpoint and UA forever; the
+            # offset keeps the combinations varying across attempts.
+            ua = _http.BROWSER_UAS[attempt % len(_http.BROWSER_UAS)]
+            form = {"q": query} if use_lite else {"q": query, "kl": "us-en"}
+            referer = "https://lite.duckduckgo.com/" if use_lite else "https://duckduckgo.com/"
+
+            _pace(settings)
+            res = _http.request(
+                settings,
+                "POST",
+                url,
+                data=form,
+                user_agent=ua,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": referer,
+                },
+                record=False,
+                timeout=DDG_REQUEST_TIMEOUT_S,
+            )
+
+            # Parse before judging: a page that yields results is a success no matter
+            # how short it is or what words happen to appear in it.
+            results = parse_ddg_lite(res.text) if use_lite else parse_ddg_html(res.text)
             if results:
+                # Only now is this body worth keeping. Recording unconditionally would
+                # persist challenge pages and poison every later --offline run.
+                if settings.record_fixtures:
+                    _http.write_fixture(settings, url, form, res)
                 return results, None
-            return [], first_error or "duckduckgo returned no parseable results (rate limited?)"
-        return [], first_error or lite.error or "duckduckgo request failed"
+
+            reason = ddg_block_reason(res)
+            if reason is not None:
+                blocked_reasons.append(f"{_host(url)}: {reason}")
+                last_error = reason
+            elif not res.ok:
+                last_error = res.error
+            else:
+                last_error = "no parseable results"
+
+            # Offline runs have no second chance to win — the fixture either matched
+            # or it did not, and sleeping would just stall the demo.
+            if settings.offline:
+                break
+
+            if reason is not None:
+                hard_blocks += 1
+                if hard_blocks >= DDG_BLOCK_MAX_ATTEMPTS:
+                    break  # both endpoints challenged: hand over to the cache now
+                continue  # the alternate endpoint is a different backend — go straight there
+
+            if attempt < DDG_MAX_ATTEMPTS - 1:
+                _sleep(_jittered(DDG_RETRY_BACKOFF_S[min(attempt, len(DDG_RETRY_BACKOFF_S) - 1)]))
+
+        if blocked_reasons:
+            detail = "; ".join(dict.fromkeys(blocked_reasons))
+            return [], (
+                f"duckduckgo temporarily blocked this client (bot check — {detail}) — {BLOCKED_ADVICE}"
+            )
+        if last_error and last_error != "no parseable results":
+            return [], f"duckduckgo request failed: {last_error} — {BLOCKED_ADVICE}"
+        return [], (
+            f"duckduckgo returned no parseable results for '{query}' after "
+            f"{DDG_MAX_ATTEMPTS} attempts across both endpoints — {BLOCKED_ADVICE}"
+        )
 
     def _tavily(self, query: str, num: int, settings: Settings) -> tuple[list[SearchResult], Optional[str]]:
         if not settings.tavily_api_key and not settings.offline:
@@ -385,6 +575,16 @@ class WebSearchTool:
                 results = parse_serper(_json(hit.text) or {})
             if results:
                 return results, None
+
+        # Exact-key lookup missed. An LLM rarely reproduces a recorded query word
+        # for word, so fall back to the closest recorded search for this endpoint —
+        # the difference between a useful offline demo and an empty one.
+        near = _best_recorded_search(settings, query)
+        if near is not None:
+            text, kind = near
+            results = parse_ddg_lite(text) if kind == "ddg_lite" else parse_ddg_html(text)
+            if results:
+                return results, None
         return [], f"fixture: no recorded search results for '{query}'"
 
     # -- plumbing --------------------------------------------------------
@@ -394,10 +594,105 @@ class WebSearchTool:
             tool=self.name,
             ok=False,
             summary=f"search failed: {error}",
-            data={**data, "results": data.get("results", [])},
+            data={**data, "results": data.get("results", []), "degraded": False},
             error=error,
             latency_ms=_ms(started),
         )
+
+
+# Pure grammar: no signal either way.
+_STOPWORDS = frozenset(
+    {"the", "a", "an", "of", "for", "and", "or", "in", "on", "at", "to", "is", "s", "inc", "co", "ltd"}
+)
+
+# Words that describe the KIND of research rather than its subject. Two queries
+# sharing only these — "Ramp careers" vs "vanta careers hiring" — are about
+# different companies and must never match each other.
+_GENERIC_TOKENS = frozenset(
+    {
+        "company", "companies", "overview", "about", "official", "site", "website", "homepage",
+        "profile", "info", "information", "research",
+        "funding", "funded", "raise", "raised", "round", "series", "valuation", "investors",
+        "investment", "capital", "revenue", "arr",
+        "careers", "career", "hiring", "hire", "jobs", "job", "roles", "openings", "recruiting",
+        "employees", "headcount", "team", "leadership", "ceo", "founder", "founders",
+        "news", "announcement", "press", "blog", "latest", "recent", "update", "updates",
+        "headquarters", "hq", "location", "based", "industry", "customers", "pricing", "product",
+        "platform", "software", "startup", "tech", "stack",
+        "2023", "2024", "2025", "2026",
+    }
+)
+
+# The distinctive-token gate below does the real work; this only trims noise.
+_FIXTURE_MATCH_THRESHOLD = 0.2
+
+
+def _tokens(text: str) -> set[str]:
+    return {
+        t
+        for t in "".join(c if c.isalnum() else " " for c in text.lower()).split()
+        if t and t not in _STOPWORDS
+    }
+
+
+def _match_score(wanted: set[str], recorded: set[str]) -> float:
+    """How well a recorded query answers `wanted`. 0.0 means "do not use it".
+
+    Gated on sharing a *distinctive* token — in practice the company name.
+    Scored by overlap coefficient rather than Jaccard, so a short query ("Vanta
+    careers") still matches a longer recorded one ("vanta careers hiring")
+    instead of being punished for the words it did not say.
+    """
+    shared = wanted & recorded
+    if not shared:
+        return 0.0
+    if not (shared - _GENERIC_TOKENS):
+        return 0.0  # only research-verb words in common: different subject
+    score = len(shared) / max(1, min(len(wanted), len(recorded)))
+    return score if score >= _FIXTURE_MATCH_THRESHOLD else 0.0
+
+
+def _best_recorded_search(settings: Settings, query: str) -> Optional[tuple[str, str]]:
+    """Closest recorded DDG search for `query`, as (html_text, parser_kind)."""
+    import json as _json_mod
+    from pathlib import Path as _Path
+
+    wanted = _tokens(query)
+    if not wanted:
+        return None
+    best: Optional[tuple[float, str, str]] = None
+    try:
+        candidates = sorted(_Path(settings.fixture_dir).glob("*.json"))
+    except Exception:
+        return None
+
+    for path in candidates:
+        try:
+            raw = _json_mod.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        url = raw.get("url", "")
+        if url == DDG_LITE_URL:
+            kind = "ddg_lite"
+        elif url == DDG_HTML_URL:
+            kind = "ddg_html"
+        else:
+            continue
+        recorded = _tokens(raw.get("query", ""))
+        if not recorded:
+            continue
+        score = _match_score(wanted, recorded)
+        if score > 0 and (best is None or score > best[0]):
+            best = (score, raw.get("text", ""), kind)
+
+    return (best[1], best[2]) if best else None
+
+
+def _host(url: str) -> str:
+    try:
+        return urlparse(url).netloc or url
+    except Exception:
+        return url
 
 
 def _render(results: list[SearchResult], max_snippet: int) -> str:

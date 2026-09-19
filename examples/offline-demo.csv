@@ -1,0 +1,9 @@
+# Offline demo list. These two companies have recorded page fixtures, so
+#   lea batch examples/offline-demo.csv --offline
+# runs with no network and no API keys and produces full records.
+#
+# examples/companies.csv is the realistic list (8 companies, mixed ICP fit) and
+# needs live search or a search key -- offline it will blank 6 of 8 by design.
+company,note
+Vanta,security/compliance automation -- strong ICP fit
+Ramp,fintech/spend management -- partial fit

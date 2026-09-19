@@ -16,12 +16,31 @@ PROJECT_ROOT = PKG_ROOT.parent.parent
 FIXTURE_DIR = PROJECT_ROOT / "examples" / "fixtures"
 
 DEFAULT_MODEL = "claude-sonnet-5"
-USER_AGENT = "lead-enrichment-agent/0.1 (+research bot; contact: set LEA_CONTACT)"
+PROJECT_URL = "https://github.com/your-handle/lead-enrichment-agent"  # PLACEHOLDER: your repo
+
+
+def build_user_agent(contact: Optional[str] = None) -> str:
+    """Identify the crawler honestly.
+
+    Politeness matters here: these requests land in other people's logs, and a
+    contactable UA is the difference between a research bot and an anonymous
+    scraper. Set LEA_CONTACT to an email or URL you actually read.
+    """
+    who = contact or os.environ.get("LEA_CONTACT") or ""
+    tail = f"; contact: {who}" if who else ""
+    return f"lead-enrichment-agent/0.1 (+{PROJECT_URL}{tail})"
+
+
+USER_AGENT = build_user_agent()
 
 
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(key)
     return v if v else default
+
+
+def _env_flag(key: str) -> bool:
+    return os.environ.get(key, "").strip().lower() not in ("", "0", "false", "no")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -53,7 +72,7 @@ class Settings:
     http_timeout_s: float = 15.0
     max_page_chars: int = 12_000
     max_snippet_chars: int = 1_200
-    user_agent: str = USER_AGENT
+    user_agent: str = field(default_factory=build_user_agent)
     respect_robots: bool = True
 
     # --- offline / demo --------------------------------------------------
@@ -78,7 +97,9 @@ class Settings:
             max_steps=_env_int("LEA_MAX_STEPS", 12),
             max_searches=_env_int("LEA_MAX_SEARCHES", 5),
             max_fetches=_env_int("LEA_MAX_FETCHES", 6),
-            offline=_env("LEA_OFFLINE", "") not in ("", "0", "false"),
+            offline=_env_flag("LEA_OFFLINE"),
+            record_fixtures=_env_flag("LEA_RECORD_FIXTURES"),
+            user_agent=build_user_agent(),
         )
 
     # --- resolution helpers ---------------------------------------------

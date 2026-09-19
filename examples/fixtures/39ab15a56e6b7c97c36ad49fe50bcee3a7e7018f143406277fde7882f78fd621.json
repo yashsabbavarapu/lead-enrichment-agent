@@ -1,0 +1,13 @@
+{
+  "url": "https://lite.duckduckgo.com/lite/",
+  "status": 200,
+  "headers": {
+    "content-type": "text/html; charset=UTF-8",
+    "server": "nginx"
+  },
+  "text": "<!DOCTYPE html>\n<html><head><title>ramp careers hiring at DuckDuckGo</title></head><body>\n<form action=\"/lite/\" method=\"post\"><input type=\"text\" name=\"q\" value=\"ramp careers hiring\"></form>\n<table>\n    <tr><td valign=\"top\">1.&nbsp;</td>\n      <td><a rel=\"nofollow\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Framp.com%2Fcareers&rut=3f8a1c\" class=\"result-link\">Careers - Change How Businesses Run | Ramp</a></td></tr>\n    <tr><td></td><td class=\"result-snippet\">We only hire builders. Come here to solve hard problems, build without permission, and ship work you're proud of. See open positions in New York and Miami.</td></tr>\n    <tr><td></td><td><span class=\"link-text\">ramp.com/careers</span></td></tr>\n    <tr class=\"result-sep\"><td></td><td>&nbsp;</td></tr>\n    <tr><td valign=\"top\">2.&nbsp;</td>\n      <td><a rel=\"nofollow\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Framp.com%2F&rut=3f8a1c\" class=\"result-link\">Spend Management, Corporate Cards & Accounts Payable Solutions | Ramp</a></td></tr>\n    <tr><td></td><td class=\"result-snippet\">Make expense management easy with Ramp's spend management platform. Combine global corporate cards, travel, expenses and accounts payable to automate finance operations.</td></tr>\n    <tr><td></td><td><span class=\"link-text\">ramp.com</span></td></tr>\n    <tr class=\"result-sep\"><td></td><td>&nbsp;</td></tr>\n    <tr><td valign=\"top\">3.&nbsp;</td>\n      <td><a rel=\"nofollow\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.crunchbase.com%2Forganization%2Framp-6b26&rut=3f8a1c\" class=\"result-link\">Ramp - Crunchbase Company Profile & Funding</a></td></tr>\n    <tr><td></td><td class=\"result-snippet\">Ramp is a finance automation platform offering corporate cards, bill pay and expense management. Headquarters: New York, New York. Founded: 2019.</td></tr>\n    <tr><td></td><td><span class=\"link-text\">www.crunchbase.com/organization/ramp-6b26</span></td></tr>\n    <tr class=\"result-sep\"><td></td><td>&nbsp;</td></tr>\n</table>\n</body></html>\n",
+  "recorded_at": "2026-09-19T00:00:00+00:00",
+  "query": "ramp careers hiring",
+  "synthetic": true,
+  "note": "hand-authored demo fixture in real DDG markup; not a live capture"
+}
