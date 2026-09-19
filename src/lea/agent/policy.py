@@ -34,6 +34,11 @@ RESEARCH_TOOLS = (
     ToolName.WEB_SEARCH, ToolName.FETCH_PAGE, ToolName.DETECT_TECH, ToolName.FETCH_JOBS,
 )
 
+# Tools that OPEN a document. web_search is deliberately absent: it returns a list
+# of links, and a link that was returned is not a link that was read. Only these
+# three can put a URL into `record.sources`.
+READING_TOOLS = (ToolName.FETCH_PAGE, ToolName.DETECT_TECH, ToolName.FETCH_JOBS)
+
 # fetch_jobs gets its own small allowance rather than drawing on the page budget.
 # It is one authless JSON call (a couple, when the slug needs probing), not a
 # crawl, and it is now the highest-value call in the set — it fixed company_size

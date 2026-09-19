@@ -24,6 +24,7 @@ from lea.agent.policy import (
     STOP_COMPLETE,
     STOP_ERROR,
     Budget,
+    READING_TOOLS,
     allowed_tools,
     derive_gaps,
     gap_labels,
@@ -35,6 +36,7 @@ from lea.agent.policy import (
     llm_failure_stop_reason,
     looks_like_stale_model,
     missing_required_args,
+    normalize_url,
     premature_finish_reason,
     search_without_reading_reason,
     should_stop,
@@ -198,6 +200,16 @@ def _evidence_from(obs: Observation, action: AgentAction) -> Evidence:
 
     results = data.get("results") or data.get("hits") or data.get("items")
     if isinstance(results, list) and results:
+        # One block PER RESULT, attributed to that result's own URL. Previously the
+        # whole list was flattened into a single block credited to sources[0] —
+        # whichever result happened to sort first — so a fact from result #4 was
+        # filed under result #1's URL. That is how a citation ends up pointing at
+        # an unrelated page. Per-result attribution is simply true: this snippet
+        # did come from this URL. Reading it still requires fetch_page, and only a
+        # read puts the URL in record.sources.
+        per_result = _per_result_evidence(results)
+        if per_result:
+            return per_result
         text = _stringify_results(results)
         if text.strip():
             return [(source, text)]
@@ -209,6 +221,25 @@ def _evidence_from(obs: Observation, action: AgentAction) -> Evidence:
     if obs.summary.strip():
         return [(source, obs.summary)]
     return []
+
+
+def _per_result_evidence(results: Iterable[Any]) -> Evidence:
+    """Each search hit as its own evidence block, keyed to its own URL."""
+    out: Evidence = []
+    seen: set[str] = set()
+    for r in results:
+        if isinstance(r, dict):
+            url = str(r.get("url") or r.get("link") or "").strip()
+            parts = [r.get("title"), r.get("snippet"), r.get("content"), r.get("description")]
+        else:
+            url = str(getattr(r, "url", "") or "").strip()
+            parts = [getattr(r, "title", None), getattr(r, "snippet", None)]
+        text = "\n".join(str(p).strip() for p in parts if p and str(p).strip())
+        if not url or not text or url in seen:
+            continue
+        seen.add(url)
+        out.append((url, text))
+    return out
 
 
 def _stringify_tech(items: Iterable[Any]) -> str:
@@ -315,7 +346,7 @@ def _update_record(record: CompanyRecord, action: AgentAction, obs: Observation)
     Only two things qualify, and both are safe under `merge_records` because it
     unions lists instead of letting the base win:
 
-      sources     — URLs we actually read.
+      sources     — URLs we actually READ, and only those.
       tech_stack  — detect_tech matched real markers in real HTML and carries its
                     own evidence string, which beats anything extraction infers.
 
@@ -325,9 +356,15 @@ def _update_record(record: CompanyRecord, action: AgentAction, obs: Observation)
     """
     data = obs.data or {}
 
-    for url in obs.sources:
-        if url and url not in record.sources:
-            record.sources.append(url)
+    # Only document-reading tools may cite. web_search sets `sources` to every
+    # result URL, so appending them unconditionally turned a result list into
+    # citations: one live run cited ten URLs — irs.gov, four youtube.com, an
+    # author's homepage — having opened zero pages. The docstring above always
+    # claimed "URLs we actually read"; this is the line that makes it true.
+    if action.tool in READING_TOOLS:
+        for url in obs.sources:
+            if url and url not in record.sources:
+                record.sources.append(url)
 
     if action.tool == ToolName.DETECT_TECH and obs.ok:
         source = obs.sources[0] if obs.sources else str(action.args.get("url", ""))
@@ -425,6 +462,7 @@ def run_agent(
     pushbacks = 0  # times we've refused an empty-handed FINISH
     search_pushbacks = 0  # times we've asked it to read before searching again
     tentative_domain = ""  # a guess, for steering only — never written to the record
+    read_urls: set[str] = set()  # normalized URLs this run actually opened
     llm_errors: list[str] = []  # failed LLM calls, for diagnosing a dead endpoint
     registry: dict[ToolName, Any] = {}
     llm: Any = None
@@ -657,6 +695,11 @@ def run_agent(
                 if text and text.strip():
                     evidence.append((src, text))
             _update_record(record, action, obs)
+            if action.tool in READING_TOOLS:
+                read_urls.update(normalize_url(u) for u in obs.sources if u)
+                requested = str(action.args.get("url") or action.args.get("company_or_url") or "")
+                if requested:
+                    read_urls.add(normalize_url(requested))
             if not tentative_domain:
                 tentative_domain = _tentative_domain(obs)
 
@@ -723,9 +766,15 @@ def run_agent(
         # Honesty pass: whatever is still missing goes on the record, not into a guess.
         if not record.unknowns:
             record.unknowns = gap_labels(derive_gaps(record))
-        for src, _ in evidence:
-            if src and not src.startswith("search:") and src not in record.sources:
-                record.sources.append(src)
+
+    # Citation invariant, enforced last because extraction rebuilds `sources` from
+    # the evidence list and would otherwise re-add every search hit. Whatever any
+    # layer proposes, a citation survives only if this run actually opened it.
+    # That makes `sources` true by construction rather than by everyone upstream
+    # remembering the rule. Per-signal `source_url` is left alone on purpose: it
+    # answers a different question ("where did this claim come from"), and a
+    # snippet's own URL is a truthful answer to it.
+    record.sources = [u for u in record.sources if normalize_url(u) in read_urls]
 
     # Synthesis deliberately runs OUTSIDE the loop's deadline: extraction, scoring
     # and hooks are the deliverable, and truncating them to hit a soft default

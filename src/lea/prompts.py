@@ -57,6 +57,12 @@ open the company's /about or /company page, or open the article you already foun
 collected links and never opened them.
 
 WRITING A SEARCH QUERY — short, and anchored on the brand
+YOUR FIRST SEARCH IS THE BARE COMPANY NAME. Nothing else. Not the name plus "software", \
+not plus "company", not plus "app", not plus what they do. You do not know the domain \
+yet, so the name is your only anchor, and every extra word weakens it. Search "Linear". \
+Search "Notion". Search "Datadog". Then read the domain out of the results and anchor \
+everything afterwards on THAT.
+
 Search engines collapse on long, keyword-stuffed queries. Adding descriptive words to \
 "help" does the opposite: it dilutes the brand anchor, and you get pages about the WORDS \
 instead of pages about the COMPANY. Measured against this project's own search provider:

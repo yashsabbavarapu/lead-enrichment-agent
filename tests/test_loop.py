@@ -1599,3 +1599,152 @@ def test_schema_guard_does_not_block_well_formed_or_unknown_schemas(wired):
     result = loop_mod.run_agent("Vanta", make_settings())
     assert result.trace[0].ok is True
     assert len(odd.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# Citations: a URL earns one by being opened, not by being returned
+# --------------------------------------------------------------------------
+
+
+_JUNK_HITS = [
+    {"title": "Help - IRS", "url": "https://irs.gov/help/app", "snippet": "tax help"},
+    {"title": "App Store", "url": "https://apple.com/app-store", "snippet": "apps"},
+    {"title": "J.K. Rowling", "url": "https://jkrowling.com", "snippet": "author"},
+    {"title": "Linear", "url": "https://linear.app", "snippet": "issue tracking for teams"},
+]
+
+
+def _search_only_registry():
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[
+        Observation(
+            tool=ToolName.WEB_SEARCH, ok=True, summary="4 hits",
+            data={"results": list(_JUNK_HITS)},
+            sources=[h["url"] for h in _JUNK_HITS],
+        )
+    ])
+    return search
+
+
+def test_a_search_only_run_cites_nothing(wired):
+    """The invariant the docstring always claimed.
+
+    A live Linear run reported 2 searches, 0 fetches and TEN cited sources —
+    irs.gov, youtube, J.K. Rowling's homepage — none of which were ever opened.
+    """
+    search = _search_only_registry()
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "look it up", query="Linear issue tracking company"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("Linear", make_settings())
+
+    assert result.stats.searches == 1 and result.stats.fetches == 0
+    assert result.record.sources == [], (
+        f"opened nothing, so must cite nothing; got {result.record.sources}"
+    )
+    for junk in ("irs.gov", "apple.com", "jkrowling.com"):
+        assert junk not in " ".join(result.record.sources)
+
+
+def test_only_the_opened_url_becomes_a_citation(wired):
+    """Search surfaces four links, the agent opens one. One citation."""
+    search = _search_only_registry()
+    fetch = FakeTool(ToolName.FETCH_PAGE, observations=[
+        Observation(
+            tool=ToolName.FETCH_PAGE, ok=True, summary="Linear homepage",
+            data={"text": "Linear is issue tracking for software teams.", "url": "https://linear.app"},
+            sources=["https://linear.app"],
+        )
+    ])
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "look it up", query="Linear issue tracking company"),
+        act(ToolName.FETCH_PAGE, "read the real one", url="https://linear.app"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search, fetch))
+
+    result = loop_mod.run_agent("Linear", make_settings())
+
+    assert result.record.sources == ["https://linear.app"]
+    assert "jkrowling.com" not in " ".join(result.record.sources)
+
+
+@pytest.mark.parametrize("tool, args, url", [
+    (ToolName.FETCH_PAGE, {"url": "https://acme.com/about"}, "https://acme.com/about"),
+    (ToolName.DETECT_TECH, {"url": "https://acme.com"}, "https://acme.com"),
+    (ToolName.FETCH_JOBS, {"company_or_url": "acme.com"}, "https://jobs.ashbyhq.com/acme"),
+])
+def test_every_reading_tool_still_contributes_its_url(wired, tool, args, url):
+    """detect_tech and fetch_jobs read documents, so they must still cite."""
+    reader = FakeTool(tool, observations=[
+        Observation(tool=tool, ok=True, summary="read it",
+                    data={"text": "some real page text", "tech": []}, sources=[url])
+    ])
+    llm = FakeLLM([
+        AgentAction(tool=tool, thought="read", args=args),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(reader))
+
+    result = loop_mod.run_agent("Acme", make_settings())
+    assert url in result.record.sources, f"{tool.value} reads a document and must cite it"
+
+
+def test_search_snippets_are_attributed_per_result_not_to_the_first_hit(wired):
+    """A fact from result #4 must not be filed under result #1's URL."""
+    search = _search_only_registry()
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "look it up", query="Linear issue tracking company"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    state = wired(llm, registry_of(search))
+
+    loop_mod.run_agent("Linear", make_settings())
+
+    evidence = state["evidence"]
+    assert len(evidence) == len(_JUNK_HITS), "one evidence block per result"
+    by_url = dict(evidence)
+    # each snippet sits under its OWN url
+    assert "issue tracking" in by_url["https://linear.app"]
+    assert "author" in by_url["https://jkrowling.com"]
+    # nothing is lumped under whichever result sorted first
+    assert "author" not in by_url["https://irs.gov/help/app"]
+
+
+def test_snippets_still_reach_extraction(wired):
+    """Snippets inform the record — they just never become citations."""
+    search = _search_only_registry()
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "look it up", query="Linear issue tracking company"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    state = wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("Linear", make_settings())
+
+    assert state["evidence"], "search snippets must still reach extraction"
+    # ...but contribute no citations
+    assert result.record.sources == []
+
+
+def test_a_url_invented_downstream_cannot_become_a_citation(wired):
+    """Belt and braces: the invariant holds whatever extraction proposes."""
+    fetch = FakeTool(ToolName.FETCH_PAGE, observations=[
+        Observation(tool=ToolName.FETCH_PAGE, ok=True, summary="page",
+                    data={"text": "real text"}, sources=["https://acme.com"])
+    ])
+    forged = CompanyRecord(
+        input="Acme", company_name="Acme", industry="fintech",
+        sources=["https://acme.com", "https://jkrowling.com", "https://never-opened.example"],
+    )
+    llm = FakeLLM([
+        act(ToolName.FETCH_PAGE, "read", url="https://acme.com"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(fetch), extract=forged)
+
+    result = loop_mod.run_agent("Acme", make_settings())
+
+    assert result.record.sources == ["https://acme.com"]
