@@ -114,11 +114,10 @@ bare one-per-line list.
 of every outbound request so a site owner can reach you instead of guessing.
 Blank means the crawler is anonymous, which is legal and rude.
 
-## 6. `PROJECT_URL` — cosmetic
+## 6. `PROJECT_URL` — already set
 
-**Where:** `src/lea/config.py`, currently
-`https://github.com/your-handle/lead-enrichment-agent`. Also appears in the
-User-Agent. Point it at your repo once you publish.
+**Where:** `src/lea/config.py`. Points at this repo and appears in the
+User-Agent of every outbound request, so a site owner can see who is crawling.
 
 ---
 

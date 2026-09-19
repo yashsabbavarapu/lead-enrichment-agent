@@ -16,7 +16,7 @@ PROJECT_ROOT = PKG_ROOT.parent.parent
 FIXTURE_DIR = PROJECT_ROOT / "examples" / "fixtures"
 
 DEFAULT_MODEL = "claude-sonnet-5"
-PROJECT_URL = "https://github.com/your-handle/lead-enrichment-agent"  # PLACEHOLDER: your repo
+PROJECT_URL = "https://github.com/yashsabbavarapu/lead-enrichment-agent"
 
 
 def build_user_agent(contact: Optional[str] = None) -> str:

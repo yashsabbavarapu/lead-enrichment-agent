@@ -2077,7 +2077,7 @@ BAD_KEY_401 = httpx.Response(
     401, json={"error": {"code": 401, "message": "API key not valid. Please pass a valid API key.", "status": "UNAUTHENTICATED"}}
 )
 
-SECRET = "AQ.Ab8RN6super-secret-value"
+SECRET = "AQ.EXAMPLE-fake-key-for-tests"
 
 
 def _keyed_google_client(key: str = SECRET) -> OpenAICompatClient:
