@@ -97,101 +97,78 @@ Three related rules keep the numbers honest rather than merely plausible:
 
 ## Example trace
 
-Real output from `./.venv/bin/lea enrich "Ramp" --offline`, trimmed for length — observation bodies shortened, `#` lines added as annotation. Run the command and you should get this shape.
+Real output from `LEA_LLM_PROVIDER=stub ./.venv/bin/lea enrich "Ramp" --offline`, trimmed —
+observation bodies shortened, `#` lines added as annotation. Run it and you get this shape.
 
 ```
 researching Ramp   [llm=stub search=fixture offline]
 
-  1 > search  ok  21ms
+  1 > search  ok  43ms
       Nothing is known yet about Ramp. A broad overview search should surface
       the official site and a one-line description to anchor everything else.
       web_search("Ramp company overview")
-      | 1. Spend Management, Corporate Cards & Accounts Payable Solutions |
-      | Ramp - https://ramp.com/ ...
+      | 1. Spend Management, Corporate Cards & Accounts Payable ...
       | https://ramp.com/, https://ramp.com/about-us (+2 more)
 
-  2 v fetch   ok  8ms
+  2 v fetch   ok  10ms
       The search results point at https://ramp.com/ as Ramp's own site.
       Firmographics (what they sell, size, HQ, founding year) belong on the
       company's own pages.
       fetch_page("https://ramp.com/")
-      | Spend Management, Corporate Cards & Accounts Payable Solutions | Ramp ...
+# A snippet is an index card. Firmographics live in the page body, so the
+# agent reads rather than searching again.
 
-  3 # tech    ok  11ms
+  3 # tech    ok  49ms
       Ramp's homepage is fetched but its stack is unknown. Detected technology
       is a cheap, concrete qualification signal and a hook to lean on later.
       detect_tech("https://ramp.com/")
-      | - [framework] Next.js (0.95) - header 'x-powered-by: Next.js'
-      | - [hosting]   Vercel  (0.95) - header 'x-vercel-id: ...'
+      | [framework] Next.js (0.95) - header 'x-powered-by: Next.js'
+      | [hosting] Vercel (0.95) - header 'x-vercel-id: ...'
 
-  4 > search  ok  21ms
-      #  <- the agent changes objective here. Firmographics are covered, so it
-      #     stops reading the site and goes hunting for a dated event instead.
+  4 & jobs    ok  44ms
+      ramp.com is an applicant-tracking board. Reading it gives the exact number
+      of open roles and which departments are growing - the strongest hiring
+      signal available, and a far better size proxy than the marketing site.
+      fetch_jobs(company_or_url='ramp.com')
+      | Ramp - 148 open roles on Ashby across Sales (63), Engineering (31),
+      | People & Talent (11); 136 remote; 49 posted in the last 30 days
+      | https://jobs.ashbyhq.com/ramp
+# The detector saw an ATS in step 3; the agent then reads its public JSON API
+# rather than scraping the board's HTML shell.
+
+  5 > search  ok  27ms
       Firmographics are covered but there is no dated signal yet. Funding,
       hiring and news are what an outreach hook can actually lean on.
       web_search("Ramp funding OR hiring OR news 2025")
-      | 1. Careers - Change How Businesses Run | Ramp - https://ramp.com/careers ...
 
-  5 v fetch   ok  8ms
-      https://ramp.com/about-us looks like the highest-value unread page (news /
-      about / careers) for turning the search snippets into a citable, dated signal.
-      fetch_page("https://ramp.com/about-us")
+  6 v fetch   ok   8ms   fetch_page("https://ramp.com/about-us")
+  7 v fetch   ok   7ms   fetch_page("https://ramp.com/careers")
 
-  6 v fetch   ok  7ms
-      https://ramp.com/careers looks like the highest-value unread page ...
-      fetch_page("https://ramp.com/careers")
-
-  7 * synth   ok
-      #  <- gap-driven stop: 2 of 12 steps and 3 of 5 searches still unspent.
+  8 * synth   ok
       Firmographics, technology and signal searches are all done and no unread
       page looks worth the remaining budget. Stopping here rather than padding
       the trace.
       finish()
+# Gap-driven, not counter-driven: it stops because the gaps are closed, with
+# budget still unspent.
 
-  8 * synth   ok  10ms   | resolved 4 core field(s); 5 signal(s), 4 tech entries.
-  9 * synth   ok   5ms   | tier B - 68/100 across 6 criteria.
- 10 * synth   ok   6ms   | 2 hook(s) kept.
-
-10 steps - 2 searches - 4 pages - 0.2s - llm=stub search=fixture
-outcome: COMPLETE - complete: agent called finish
-wrote out/ramp.json
-wrote out/ramp.trace.md
+  9 * synth   ok  62ms   resolved 4 core fields; 5 signals, 4 tech entries
+ 10 * synth   ok  50ms   tier A - 82/100 across 6 criteria
+ 11 * synth   ok  39ms   drafted 2 hooks: 63 open GTM roles; $13 billion secondary
 ```
 
-Steps 4 and 7 are the ones worth reading. A fixed pipeline fetches a preset list and stops when the list runs out. This run switched from firmographics to signal-hunting because the first objective was met, then stopped with budget still on the table because nothing unread justified spending it.
+Every step is recorded, so `lea replay out/ramp.json` re-renders the whole run
+with no network, and `out/ramp.trace.md` is the same log in Markdown.
 
-The per-criterion scoring from that same run — this reasoning is generated from the record, not canned:
+Two things to notice in the scoring. `company_size` grades on the open-role
+count as a *stage* proxy - "148 open roles, 63 of them in Sales" - while still
+refusing to invent an `employee_range` no page stated. And `growth_signals` is
+**weighted by age**: a two-year-old funding round is history, a launch from
+last week is a reason to call this week, and the score reflects the difference.
 
-```
-  criterion        score    wt   reasoning
- ----------------------------------------------------------------------------
-  company_type       8.0     2   Industry/description mentions 'fintech',
-                                 consistent with a B2B product.
-  gtm_segment        5.0     2   The company is actively hiring - "See open
-                                 positions".
-  company_size       5.0   1.5   Neither a headcount band nor a public job
-                                 board could be found, so size is genuinely
-                                 unknown and scored mid rather than penalised.
-  tech_maturity      6.6   1.5   Detected 3 technologies across 3 categories;
-                                 cloud-native infrastructure (Cloudflare and
-                                 Vercel).
-  growth_signals     7.7   1.5   Trigger events - funding, secondary:
-                                 "Ramp nearly doubles valuation to $13B in
-                                 secondary share sale" (18 months old);
-                                 hiring: "See open positions" (1.3 years old).
-                                 Signals are weighted by age, so older
-                                 events count for less.
-  geo               10.0     1   Headquartered in New York, United States - a
-                                 core market we sell into today.
-
-  -> tier B - 68.4/100 - confidence 0.85 - unknowns: employee_range
-```
-
-Two things to notice. `company_size` scores 5.0 with the reason stated rather than 0 — an unknown is not a negative, and `confidence` is where missing evidence is accounted for. And `growth_signals` is **weighted by age**: the hiring line here is 1.3 years old, so it contributes a fraction of what a signal from last week would. A two-year-old funding round is history; a nine-day-old launch is a reason to call this week, and the score says so.
-
-When the agent reaches a company's public ATS board (Ashby, Greenhouse, Lever, Workable), `company_size` stops guessing entirely and grades on the open-role count as a *stage* proxy — "93 open roles on their Ashby board, 36 of them in GTM functions" — while still refusing to invent an `employee_range` it never read. That is also the best hook material in the record: what someone is hiring for this quarter says more about budget than a round they closed two years ago.
-
-With no model key these scores come from the deterministic rubric described above, which grades each criterion off the record. It is not model reasoning and the summary line says so — but two different companies get two different explainable scores instead of a constant.
+That hiring breakdown is also the best hook material in the record. What a
+company is hiring for this quarter says more about budget than a round it
+closed two years ago.
 
 ## Example output
 
@@ -231,17 +208,17 @@ The record from that same `--offline` run (`out/ramp.json`, trimmed):
     { "category": "infra",     "name": "Cloudflare", "evidence": "header 'server: cloudflare'", "confidence": 0.95 }
   ],
   "icp_fit": {
-    "score": 68.4,
-    "tier": "B",
-    "confidence": 0.85,
-    "summary": "Tier B (68/100). Strongest: company_type 8/10, growth_signals 8/10. Graded by the deterministic rubric (no LLM judgement available) - set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
+    "score": 81.7,
+    "tier": "A",
+    "confidence": 0.95,
+    "summary": "Tier A (82/100). Strongest: gtm_segment 8/10, company_type 8/10. Freshest signal (today): \"148 open roles (63 in Sales, 31 in Engineering, 11 in People & Talent)\". Graded by the deterministic rubric ("
   },
   "hooks": [
     {
-      "angle": "stack choice",
-      "hook": "Next.js, Vercel and Cloudflare is a deliberate stack, not an accident - someone there has opinions about GTM data. Those are usually the teams that notice the seam between them first.",
-      "grounded_in": "framework Next.js",
-      "source_url": "https://ramp.com/"
+      "angle": "63 open GTM roles",
+      "hook": "148 roles open at Ramp right now, 63 in sales. Hiring 63 go-to-market people at once is usually a number someone had to defend \u2014 what breaks first when they all land?",
+      "grounded_in": "148 open roles",
+      "source_url": "https://jobs.ashbyhq.com/ramp"
     }
   ],
   "unknowns": ["employee_range"],

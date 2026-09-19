@@ -48,6 +48,7 @@ _TOOL_STYLE: dict[str, tuple[str, str, str]] = {
     ToolName.WEB_SEARCH.value: ("search", "cyan", ">"),
     ToolName.FETCH_PAGE.value: ("fetch", "blue", "v"),
     ToolName.DETECT_TECH.value: ("tech", "magenta", "#"),
+    ToolName.FETCH_JOBS.value: ("jobs", "yellow", "&"),
     ToolName.FINISH.value: ("synth", "green", "*"),
 }
 
