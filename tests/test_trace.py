@@ -386,3 +386,43 @@ def test_summary_table_sorts_by_icp_score_descending():
 
     order = [out.index(n) for n in ("High", "Mid", "Low", "None")]
     assert order == sorted(order)
+
+
+# --------------------------------------------------------------------------
+# Capability rung in the footer
+# --------------------------------------------------------------------------
+
+
+def _with_provider(label: str) -> EnrichmentResult:
+    r = full_result()
+    r.stats.llm_provider = label
+    return r
+
+
+def test_footer_shows_the_capability_rung():
+    console, buf = cap()
+    trace_mod.render_result(_with_provider("google:gemini-2.0-flash (json_object)"), console)
+    out = buf.getvalue()
+    assert "llm=google:gemini-2.0-flash (json_object)" in out
+    # json_object is a fine rung; no scolding note
+    assert "neither tool-calling nor JSON mode" not in out
+
+
+def test_prose_rung_gets_a_visible_warning():
+    """The weakest rung predicts flat ICP reasoning, so it must not be silent."""
+    console, buf = cap()
+    trace_mod.render_result(_with_provider("groq:llama-3.3-70b (prose)"), console)
+    out = buf.getvalue()
+    assert "llm=groq:llama-3.3-70b (prose)" in out
+    assert "neither tool-calling nor JSON mode" in out
+    assert "weaker ICP reasoning" in out
+    assert "lea doctor --models" in out
+
+
+def test_plain_providers_get_no_rung_note():
+    for label in ("stub", "anthropic", "fake"):
+        console, buf = cap()
+        trace_mod.render_result(_with_provider(label), console)
+        out = buf.getvalue()
+        assert f"llm={label}" in out
+        assert "neither tool-calling nor JSON mode" not in out

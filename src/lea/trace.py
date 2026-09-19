@@ -447,6 +447,16 @@ def _stats_line(result: EnrichmentResult) -> Text:
     # The class is spelled out so "finished" is never confused with "gave up".
     t.append(label, style=f"bold {color}")
     t.append(f" — {s.stop_reason}", style="dim italic")
+    if "(prose)" in (s.llm_provider or ""):
+        # Bottom rung: the endpoint honoured neither tool-calling nor JSON mode, so
+        # every structured field was scraped back out of free text. Flat ICP
+        # reasoning here is a property of the endpoint, not of the company.
+        t.append(
+            "\nnote: this model supports neither tool-calling nor JSON mode, so structured "
+            "output was parsed from prose — expect weaker ICP reasoning and hooks. "
+            "`lea doctor --models` lists stronger ids your provider serves.",
+            style="yellow",
+        )
     return t
 
 

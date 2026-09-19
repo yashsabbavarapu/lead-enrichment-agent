@@ -394,6 +394,50 @@ def last_failure(history: Iterable[TraceStep]) -> Optional[TraceStep]:
     return None
 
 
+# The OpenAI-compatible client never raises into the loop: it reports a failed call
+# by returning FINISH with a thought starting "LLM error:" (see openai_compat.decide).
+# Without recognising that, a dead endpoint looks exactly like an agent that calmly
+# decided it was finished — which is how a stale model id becomes invisible.
+_LLM_ERROR_PREFIX = "llm error:"
+
+# Substrings meaning "the endpoint rejected this outright", which on a free provider
+# is nearly always a model id that has rotated out from under the preset.
+_STALE_MODEL_MARKERS = (
+    "404", "400", "not found", "does not exist", "invalid model", "unknown model",
+    "model_not_found", "decommissioned", "unsupported model", "no such model",
+)
+
+MODELS_HINT = "run `lea doctor --models` to see what your provider actually serves, then set LEA_MODEL"
+
+
+def llm_error_detail(action: AgentAction) -> Optional[str]:
+    """The error text when this 'action' is really a failed LLM call, else None."""
+    if action.tool != ToolName.FINISH:
+        return None
+    thought = (action.thought or "").strip()
+    return thought if thought.lower().startswith(_LLM_ERROR_PREFIX) else None
+
+
+def looks_like_stale_model(text: str) -> bool:
+    return any(m in (text or "").lower() for m in _STALE_MODEL_MARKERS)
+
+
+def llm_failure_stop_reason(details: list[str], provider: str = "", model: str = "") -> str:
+    """A stop_reason naming the real cause when every LLM call failed.
+
+    Otherwise the run reads as "the agent gave up" and the user never learns that
+    their endpoint is 404ing.
+    """
+    first = (details[0] if details else "").strip()
+    where = "/".join(p for p in (provider, model) if p) or "the configured LLM"
+    if looks_like_stale_model(first):
+        return (
+            f"{STOP_ERROR}: {where} rejected every request ({first[:140]}). "
+            f"The model id is probably stale — {MODELS_HINT}."
+        )
+    return f"{STOP_ERROR}: every LLM call to {where} failed ({first[:140]})."
+
+
 def transient_failure_hint(step: TraceStep) -> str:
     """Appended to a failed step's observation so the model reacts to the *specific*
     error instead of treating any failure as a dead end.

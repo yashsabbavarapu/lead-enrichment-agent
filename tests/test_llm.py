@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from typing import Optional
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -1058,6 +1060,7 @@ def test_llm_scope_does_not_import_agent_enrich_or_cli():
         root / "llm" / "stub.py",
         root / "llm" / "factory.py",
         root / "llm" / "json_utils.py",
+        root / "llm" / "openai_compat.py",
         root / "prompts.py",
     ]
     import ast
@@ -1073,6 +1076,495 @@ def test_llm_scope_does_not_import_agent_enrich_or_cli():
         for module in imported:
             for forbidden in ("lea.agent", "lea.enrich", "lea.cli"):
                 assert not module.startswith(forbidden), f"{path.name} must not import {forbidden}"
+
+
+# ---------------------------------------------------------------------------
+# OpenAICompatClient — free providers. Network fully mocked with respx.
+# ---------------------------------------------------------------------------
+
+import respx  # noqa: E402
+
+from lea.llm.openai_compat import (  # noqa: E402
+    Capability,
+    OpenAICompatClient,
+    list_models,
+    reset_capability_cache,
+)
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+
+
+@pytest.fixture(autouse=True)
+def _clean_capability_cache():
+    """The rung cache is process-global: isolate every test from its neighbours."""
+    reset_capability_cache()
+    yield
+    reset_capability_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleeping(monkeypatch):
+    """Retry backoff must not make the suite slow.
+
+    Patch the client's own hook rather than `time.sleep` — the module-level
+    `time` object is the global one, and neutering it would reach far outside
+    these tests.
+    """
+    monkeypatch.setattr(OpenAICompatClient, "_sleep", staticmethod(lambda attempt, retry_after: None))
+
+
+def _oa_client(provider: str = "groq", **kw) -> OpenAICompatClient:
+    settings = Settings(llm_provider=provider, llm_api_key=kw.pop("key", "test-key"), **kw)
+    return OpenAICompatClient(settings, provider=provider)
+
+
+def _tool_response(name: str, arguments: dict, prompt_tokens: int = 120, completion_tokens: int = 30) -> dict:
+    """OpenAI shape: function.arguments is a JSON *string*, not an object."""
+    return {
+        "model": "llama-3.3-70b-versatile",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+                    ],
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+    }
+
+
+def _text_response(text: str, prompt_tokens: int = 100, completion_tokens: int = 25) -> dict:
+    return {
+        "model": "llama-3.3-70b-versatile",
+        "choices": [{"message": {"role": "assistant", "content": text}}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+    }
+
+
+def _unsupported_tools(request) -> httpx.Response:
+    return httpx.Response(
+        400, json={"error": {"message": "tool_choice is not supported for this model", "type": "invalid_request_error"}}
+    )
+
+
+DECIDE_ARGS = {"thought": "need the official site", "tool": "web_search", "args": {"query": "Acme Robotics"}}
+
+
+# --- rung a: forced function call ------------------------------------------
+
+
+@respx.mock
+def test_forced_function_call_is_parsed_into_an_agent_action():
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    client = _oa_client()
+    action, usage = client.decide(prompts.AGENT_SYSTEM, "TARGET: Acme Robotics", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert action.args == {"query": "Acme Robotics"}
+    assert action.thought == "need the official site"
+    assert usage.tokens_in == 120 and usage.tokens_out == 30
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["tool_choice"] == {"type": "function", "function": {"name": "next_action"}}
+    fn = sent["tools"][0]["function"]
+    assert fn["name"] == "next_action"
+    assert fn["parameters"]["properties"]["tool"]["enum"] == ["web_search", "fetch_page", "detect_tech", "finish"]
+    assert route.calls[0].request.headers["authorization"] == "Bearer test-key"
+
+
+@respx.mock
+def test_out_of_range_tool_name_is_coerced_and_noted():
+    payload = {"thought": "search", "tool": "websearch", "args": {"query": "x"}}
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=_tool_response("next_action", payload)))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+    assert "coerced" in action.thought
+
+
+# --- rung b: json_object ----------------------------------------------------
+
+
+@respx.mock
+def test_tools_unsupported_falls_back_to_json_object_mode():
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[_unsupported_tools, httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS)))]
+    )
+    client = _oa_client()
+    action, usage = client.decide("sys", "TARGET: Acme Robotics", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH, "a tools-less model must still produce a valid action"
+    assert action.args == {"query": "Acme Robotics"}
+    assert route.call_count == 2
+
+    second = json.loads(route.calls[1].request.content)
+    assert second["response_format"] == {"type": "json_object"}
+    assert "tools" not in second and "tool_choice" not in second
+    # The schema has to travel in the prompt now that nothing enforces it.
+    assert "thought" in second["messages"][-1]["content"]
+    assert client.capability == Capability.JSON_OBJECT
+
+
+@respx.mock
+def test_a_200_that_ignores_tool_choice_also_demotes():
+    """Some models accept `tools` and then answer in prose anyway."""
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_text_response("I think we should search.")),
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+        ]
+    )
+    action, _ = _oa_client().decide("sys", "TARGET: Acme Robotics", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 2
+
+
+# --- rung c: prose + repair -------------------------------------------------
+
+
+@respx.mock
+def test_json_object_unsupported_falls_back_to_prose_and_tolerant_parsing():
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            _unsupported_tools,
+            lambda r: httpx.Response(400, json={"error": {"message": "response_format is not supported"}}),
+            httpx.Response(
+                200,
+                json=_text_response(
+                    "Sure! Here is my decision:\n```json\n"
+                    '{"thought": "t", "tool": "fetch_page", "args": {"url": "https://acme.com",},}\n```'
+                ),
+            ),
+        ]
+    )
+    client = _oa_client()
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FETCH_PAGE, "fenced, trailing-comma JSON must still parse"
+    assert action.args == {"url": "https://acme.com"}
+    assert route.call_count == 3
+    assert client.capability == Capability.PROSE
+
+    last = json.loads(route.calls[2].request.content)
+    assert "tools" not in last and "response_format" not in last
+
+
+# --- capability caching -----------------------------------------------------
+
+
+@respx.mock
+def test_the_working_rung_is_cached_and_not_reprobed():
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            _unsupported_tools,
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+        ]
+    )
+    client = _oa_client()
+    for _ in range(3):
+        action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+        assert action.tool is ToolName.WEB_SEARCH
+
+    assert route.call_count == 4, "the tools probe must be paid once, not once per call"
+    for call in route.calls[1:]:
+        assert "tools" not in json.loads(call.request.content)
+
+
+@respx.mock
+def test_an_endpoint_that_starts_rejecting_tools_is_demoted_and_stays_demoted():
+    """A cached TOOLS rung must be overwritten, not merely left in place."""
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),  # works: cache TOOLS
+            _unsupported_tools,                                                    # provider changes its mind
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),     # json_object
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),     # must stay demoted
+        ]
+    )
+    client = _oa_client()
+
+    client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert client.capability == Capability.TOOLS
+
+    client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert client.capability == Capability.JSON_OBJECT, "the cached rung must be overwritten"
+
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 4
+    assert "tools" not in json.loads(route.calls[3].request.content)
+
+
+@respx.mock
+def test_the_capability_cache_is_shared_across_clients_for_one_endpoint():
+    respx.post(GROQ_URL).mock(
+        side_effect=[
+            _unsupported_tools,
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+            httpx.Response(200, json=_text_response(json.dumps(DECIDE_ARGS))),
+        ]
+    )
+    _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    second = _oa_client()
+    assert second.capability == Capability.JSON_OBJECT
+    action, _ = second.decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+
+
+# --- rate limiting and transport errors -------------------------------------
+
+
+@respx.mock
+def test_429_with_retry_after_is_retried_then_succeeds():
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "1"}, json={"error": {"message": "rate limited"}}),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_persistent_429_degrades_to_finish_without_raising():
+    route = respx.post(GROQ_URL).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "1"}, json={"error": {"message": "quota"}})
+    )
+    action, usage = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert action.thought.startswith("LLM error:")
+    assert usage.tokens_in == 0
+    assert route.call_count == 4  # MAX_ATTEMPTS, then degrade
+
+
+@respx.mock
+def test_server_errors_are_retried_then_degrade():
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(503, text="upstream unavailable"))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.FINISH
+
+
+@respx.mock
+def test_connection_errors_degrade_cleanly():
+    respx.post(GROQ_URL).mock(side_effect=httpx.ConnectError("no route to host"))
+    action, _ = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.FINISH
+    assert "LLM error" in action.thought
+
+
+# --- extract ----------------------------------------------------------------
+
+
+@respx.mock
+def test_extract_returns_a_valid_company_record():
+    payload = {"input": "Acme", "company_name": "Acme Robotics", "founded_year": 2019, "hq_city": "Austin"}
+    route = respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=_tool_response("record_companyrecord", payload)))
+    record, usage = _oa_client().extract(prompts.EXTRACTION_SYSTEM, "ctx", CompanyRecord, hint="firmographics")
+
+    assert isinstance(record, CompanyRecord)
+    assert record.company_name == "Acme Robotics"
+    assert record.founded_year == 2019
+    assert usage.tokens_in == 120
+
+    sent = json.loads(route.calls[0].request.content)
+    fn = sent["tools"][0]["function"]
+    assert fn["name"] == "record_companyrecord"
+    assert "company_name" in fn["parameters"]["properties"]
+    assert "firmographics" in sent["messages"][-1]["content"]
+
+
+@respx.mock
+def test_extract_returns_a_valid_icp_fit():
+    payload = {"score": 74, "tier": "B", "summary": "decent fit"}
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=_tool_response("record_icpfit", payload)))
+    fit, _ = _oa_client().extract(prompts.ICP_SCORING_SYSTEM, "ctx", ICPFit)
+    assert isinstance(fit, ICPFit) and fit.score == 74 and fit.tier == "B"
+
+
+@respx.mock
+def test_extract_does_one_repair_retry_then_succeeds():
+    route = respx.post(GROQ_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_tool_response("record_icpfit", {"score": 900, "tier": "Z"})),
+            httpx.Response(200, json=_tool_response("record_icpfit", {"score": 61, "tier": "C"})),
+        ]
+    )
+    fit, usage = _oa_client().extract("sys", "ctx", ICPFit)
+
+    assert isinstance(fit, ICPFit) and fit.score == 61
+    assert route.call_count == 2
+    repair_text = json.loads(route.calls[1].request.content)["messages"][-1]["content"]
+    assert "did not validate" in repair_text
+    assert "score" in repair_text
+    assert usage.tokens_in == 240  # both calls accumulated
+
+
+@respx.mock
+def test_truncated_json_degrades_to_a_best_effort_instance_without_raising():
+    route = respx.post(GROQ_URL).mock(
+        return_value=httpx.Response(200, json=_text_response('{"input": "Acme", "company_name": "Acme Rob'))
+    )
+    record, _ = _oa_client().extract("sys", "ctx", CompanyRecord)
+    assert isinstance(record, CompanyRecord)
+    assert route.call_count >= 1
+
+
+@respx.mock
+def test_extract_never_raises_when_everything_fails():
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(500, text="boom"))
+    record, usage = _oa_client().extract("sys", "ctx", CompanyRecord)
+    assert isinstance(record, CompanyRecord)
+    assert usage.tokens_in == 0
+
+
+@respx.mock
+def test_extract_salvages_prose_wrapped_json():
+    body = 'Here is the record:\n```json\n{"input": "Acme", "company_name": "Acme Robotics"}\n```'
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=_text_response(body)))
+    record, _ = _oa_client().extract("sys", "ctx", CompanyRecord)
+    assert record.company_name == "Acme Robotics"
+
+
+@respx.mock
+def test_usage_is_zero_when_the_provider_omits_it():
+    body = {"choices": [{"message": {"content": json.dumps(DECIDE_ARGS)}}]}
+    respx.post(GROQ_URL).mock(return_value=httpx.Response(200, json=body))
+    _, usage = _oa_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert usage.tokens_in == 0 and usage.tokens_out == 0
+
+
+# --- ollama: no key, no Authorization header --------------------------------
+
+
+@respx.mock
+def test_ollama_sends_no_authorization_header():
+    url = "http://localhost:11434/v1/chat/completions"
+    route = respx.post(url).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    client = OpenAICompatClient(Settings(llm_provider="ollama"), provider="ollama")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert "authorization" not in route.calls[0].request.headers
+    assert client.api_key is None
+
+
+# --- model discovery --------------------------------------------------------
+
+
+@respx.mock
+def test_list_models_returns_sorted_ids():
+    respx.get(GROQ_MODELS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "llama-3.3-70b-versatile"}, {"id": "gemma2-9b-it"}]})
+    )
+    models = list_models(Settings(llm_provider="groq", llm_api_key="k"), provider="groq")
+    assert models == ["gemma2-9b-it", "llama-3.3-70b-versatile"]
+
+
+@respx.mock
+def test_list_models_strips_the_google_models_prefix():
+    url = "https://generativelanguage.googleapis.com/v1beta/openai/models"
+    respx.get(url).mock(return_value=httpx.Response(200, json={"data": [{"id": "models/gemini-2.0-flash"}]}))
+    assert list_models(Settings(llm_provider="google", llm_api_key="k"), provider="google") == ["gemini-2.0-flash"]
+
+
+@respx.mock
+def test_list_models_returns_empty_on_any_failure():
+    respx.get(GROQ_MODELS_URL).mock(return_value=httpx.Response(401, text="bad key"))
+    assert list_models(Settings(llm_provider="groq", llm_api_key="k"), provider="groq") == []
+
+
+@respx.mock
+def test_list_models_returns_empty_on_connection_error():
+    respx.get(GROQ_MODELS_URL).mock(side_effect=httpx.ConnectError("down"))
+    assert list_models(Settings(llm_provider="groq", llm_api_key="k"), provider="groq") == []
+
+
+def test_factory_list_models_is_empty_for_non_compat_providers():
+    from lea.llm.factory import list_models as factory_list_models
+
+    assert factory_list_models(Settings(llm_provider="stub")) == []
+    assert factory_list_models(Settings(llm_provider="anthropic", anthropic_api_key="sk-ant-x")) == []
+
+
+# --- factory routing --------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", ["google", "groq", "openrouter", "cerebras"])
+def test_factory_routes_keyed_openai_compat_providers(provider, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client = get_llm(Settings(llm_provider=provider, llm_api_key="test-key"))
+    assert client.name == provider
+    assert isinstance(client, OpenAICompatClient)
+    assert client.base_url.startswith("http")
+    assert client.model
+
+
+def test_factory_routes_ollama_without_any_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client = get_llm(Settings(llm_provider="ollama"))
+    assert isinstance(client, OpenAICompatClient)
+    assert client.name == "ollama"
+    assert client.api_key is None
+
+
+@pytest.mark.parametrize("provider", ["google", "groq", "openrouter", "cerebras"])
+def test_factory_falls_back_to_stub_without_a_key(provider, monkeypatch):
+    for preset_env in ("GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "LEA_LLM_API_KEY"):
+        monkeypatch.delenv(preset_env, raising=False)
+    client = get_llm(Settings(llm_provider=provider))
+    assert client.name == "stub"
+
+
+def test_factory_falls_back_to_stub_on_a_bad_base_url(monkeypatch, caplog):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with caplog.at_level("WARNING"):
+        client = get_llm(Settings(llm_provider="groq", llm_api_key="k", llm_base_url="not-a-url"))
+    assert client.name == "stub"
+    assert any("base URL" in r.message for r in caplog.records)
+
+
+def test_factory_honours_a_custom_endpoint_via_base_url(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(llm_provider="my-gateway", llm_base_url="https://llm.internal/v1", llm_api_key="k")
+    client = get_llm(settings)
+    assert isinstance(client, OpenAICompatClient)
+    assert client.base_url == "https://llm.internal/v1"
+
+
+def test_openai_compat_clients_satisfy_the_llm_protocol():
+    from lea.llm.base import LLMClient
+
+    client = get_llm(Settings(llm_provider="groq", llm_api_key="k"))
+    assert isinstance(client, LLMClient)
+    assert callable(client.decide) and callable(client.extract)
+
+
+def test_auto_resolution_prefers_a_free_provider_over_the_stub(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    settings = Settings.from_env()
+    assert settings.resolved_llm() == "groq"
+    assert get_llm(settings).name == "groq"
+
+
+def test_a_keyless_clone_still_gets_the_stub(monkeypatch):
+    for name in (
+        "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY",
+        "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "LEA_LLM_API_KEY",
+        "LEA_LLM_BASE_URL", "LEA_LLM_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    client = get_llm(Settings.from_env())
+    assert client.name == "stub"
 
 
 if __name__ == "__main__":  # pragma: no cover

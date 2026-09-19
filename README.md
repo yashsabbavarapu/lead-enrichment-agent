@@ -39,7 +39,20 @@ python3 -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
 - `--offline` is the **guaranteed** path. It serves every HTTP call from `examples/fixtures/` and always works: no network, no rate limits, no flakiness. Use it to evaluate this project, and in CI. Every example in this README comes from an `--offline` run.
 - **Live keyless search works, but can be rate-limited.** The default provider is DuckDuckGo with no key. It bot-blocks after a handful of queries, returning 429 or an empty result set — it was blocking our own build machine outright while this was written. The agent degrades gracefully (the failed search becomes an observation and it re-plans), but a batch run without a search key will be unreliable.
 - **A search key removes that risk entirely.** `TAVILY_API_KEY`, `SERPER_API_KEY` or `BRAVE_API_KEY` — any one of them — and live search becomes dependable.
-- `ANTHROPIC_API_KEY` is separate and also optional. Without it the planner is a deterministic stub that follows a sensible research policy, and ICP scoring falls back to a deterministic rubric. With it, planning and extraction become real Claude reasoning: the agent chooses genuinely non-obvious next steps and the extracted record gets noticeably richer.
+- **A model key is optional, and free options exist.** Without one the planner is a deterministic stub following a sensible research policy, and ICP scoring falls back to a deterministic rubric. With one, planning and extraction become real reasoning: the agent chooses genuinely non-obvious next steps and the record gets noticeably richer. The planner talks to an `LLMClient` with two methods, so the provider is a swap, not a rewrite:
+
+  | Provider | Cost | Set |
+  |---|---|---|
+  | Google AI Studio (Gemini) | free | `GOOGLE_API_KEY` |
+  | Groq | free | `GROQ_API_KEY` |
+  | OpenRouter | free tier | `OPENROUTER_API_KEY` |
+  | Cerebras | free tier | `CEREBRAS_API_KEY` |
+  | Ollama (local) | free | nothing — `--provider ollama` |
+  | Anthropic | paid, best output | `ANTHROPIC_API_KEY` |
+
+  Any other OpenAI-compatible endpoint works via `LEA_LLM_BASE_URL`, no code change. `lea doctor` shows which resolved and why.
+
+> **Model ids go stale.** Free lineups rotate, and each provider's default model id is an educated guess that may already be retired. If calls fail, run `lea doctor --models` to list what your key actually serves, then set `LEA_MODEL`. The OpenAI-compatible adapter is tested against mocked endpoints but has **not** been exercised against a live one — the first real key is the first real proof.
 
 Keys are picked up automatically; `lea doctor` prints exactly which provider resolved and why. See **[SETUP.md](SETUP.md)** for the placeholder checklist and key setup.
 
@@ -158,7 +171,7 @@ The per-criterion scoring from that same run — this reasoning is generated fro
 
 Note `company_size` scoring 5.0 with the reason stated rather than 0. An unknown is not a negative, and `confidence` is where missing evidence is accounted for.
 
-With no `ANTHROPIC_API_KEY` these scores come from the deterministic rubric described above, which grades each criterion off the record. It is not model reasoning and the summary line says so — but two different companies get two different explainable scores instead of a constant.
+With no model key these scores come from the deterministic rubric described above, which grades each criterion off the record. It is not model reasoning and the summary line says so — but two different companies get two different explainable scores instead of a constant.
 
 ## Example output
 
@@ -246,6 +259,7 @@ src/lea/
 
 Design decisions worth naming:
 
+- **The model is a swap, not a dependency.** `LLMClient` is two methods, so Anthropic, any OpenAI-compatible endpoint and a keyless deterministic planner are peers behind one interface. The OpenAI-compatible adapter degrades through forced function-calling → JSON mode → a prose repair loop, because free models vary wildly in how well they honour a schema and the agent should produce weaker output rather than none.
 - **The LLM never does arithmetic on the score.** It grades each criterion 0–10 and writes the reasoning; the weighted roll-up, the tier thresholds and the disqualifier override are computed in Python. A model that quietly adds wrong is far more dangerous than one that reasons badly, because nothing about the output looks off — you only find out after someone has worked the list.
 - **The model's weights are discarded at scoring time.** Criterion weights always come from the profile, so the model cannot silently reweight the rubric it was asked to apply.
 - **Tools never raise into the loop.** Every tool returns an `Observation` with `ok=False` and an error string. A 404 is not an exception, it is evidence — and it has to reach the planner as context so the next decision can react to it. Exceptions would abort the run; observations change its mind.
@@ -260,8 +274,8 @@ Design decisions worth naming:
 
 - **Keyless live search is rate-limited, not merely worse.** DuckDuckGo without a key bot-blocks after a handful of queries. `--offline` always works and a search key always works; live keyless sits between them and should not be relied on for a batch run.
 - **The offline search fixtures are synthetic.** The page fixtures are real recordings, but the search results are hand-written. An offline run shows real extraction over real HTML with a scripted set of links — it demonstrates the loop honestly, but it is not evidence that live search returns those same links.
-- **The stub planner is a policy, not a planner.** With no `ANTHROPIC_API_KEY` tool selection follows a fixed heuristic. It runs and it demonstrates the loop, but genuinely adaptive behaviour needs a real model.
-- **Keyless ICP scoring is a rubric, not judgement.** Without a model key, criteria are graded by the deterministic scorer in `enrich/icp.py` — keyword and count heuristics over the record. It discriminates between companies and explains itself, but it cannot read nuance the way a model does, and the summary line says which mode produced the score. Its segment inference is only as good as the extracted `industry` string.
+- **The stub planner is a policy, not a planner.** With no model key at all, tool selection follows a fixed heuristic. It runs and it demonstrates the loop, but genuinely adaptive behaviour needs a real model — and a free one is enough to get it.
+- **Keyless ICP scoring is a rubric, not judgement.** Without any model key, criteria are graded by the deterministic scorer in `enrich/icp.py` — keyword and count heuristics over the record. It discriminates between companies and explains itself, but it cannot read nuance the way a model does, and the summary line says which mode produced the score. Its segment inference is only as good as the extracted `industry` string.
 - **Headcount is a bucket, not a number.** Public sources disagree constantly; `employee_estimate` is a bucket midpoint and should be treated as an order of magnitude.
 - **Tech detection is shallow.** It reads public page markup and job postings. It sees front-end and analytics tooling well, back-end and data infrastructure barely at all, and it infers rather than asserts — hence the per-entry confidence.
 - **ICP inference reflects the examples you give it.** Three examples from one vertical produce a rubric that overfits to that vertical. It is a starting draft to edit, not an oracle.

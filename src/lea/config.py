@@ -50,12 +50,61 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+
+# OpenAI-compatible providers. One adapter serves all of them: they differ only
+# in base URL, auth env var and model naming. Free tiers exist for google, groq,
+# openrouter and cerebras; ollama is local and needs no key at all.
+#
+# Default models are a starting point, not a guarantee — free lineups rotate.
+# `lea doctor --models` lists what the configured provider will actually serve.
+OPENAI_COMPAT_PRESETS: dict[str, dict[str, str]] = {
+    "google": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "env": "GOOGLE_API_KEY",
+        "model": "gemini-2.0-flash",
+        "label": "Google AI Studio (Gemini)",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "env": "GROQ_API_KEY",
+        "model": "llama-3.3-70b-versatile",
+        "label": "Groq",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "env": "OPENROUTER_API_KEY",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "label": "OpenRouter",
+    },
+    "cerebras": {
+        "base_url": "https://api.cerebras.ai/v1",
+        "env": "CEREBRAS_API_KEY",
+        "model": "llama-3.3-70b",
+        "label": "Cerebras",
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "env": "",  # local, no key
+        "model": "qwen2.5:7b",
+        "label": "Ollama (local)",
+    },
+}
+
+# Tried in order when llm_provider is "auto".
+_AUTO_LLM_ORDER = ("anthropic", "google", "groq", "openrouter", "cerebras")
+
+
 @dataclass
 class Settings:
     # --- providers -------------------------------------------------------
-    llm_provider: str = "auto"  # auto | anthropic | stub
+    # auto | anthropic | google | groq | openrouter | cerebras | ollama | stub
+    llm_provider: str = "auto"
     model: str = DEFAULT_MODEL
     anthropic_api_key: Optional[str] = None
+    # Any OpenAI-compatible endpoint. Set explicitly to override a preset,
+    # or to point at a provider this build has never heard of.
+    llm_base_url: Optional[str] = None
+    llm_api_key: Optional[str] = None
     search_provider: str = "auto"  # auto | tavily | serper | brave | duckduckgo | fixture
     tavily_api_key: Optional[str] = None
     serper_api_key: Optional[str] = None
@@ -90,6 +139,8 @@ class Settings:
             llm_provider=_env("LEA_LLM_PROVIDER", "auto"),
             model=_env("LEA_MODEL", DEFAULT_MODEL),
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
+            llm_base_url=_env("LEA_LLM_BASE_URL"),
+            llm_api_key=_env("LEA_LLM_API_KEY"),
             search_provider=_env("LEA_SEARCH_PROVIDER", "auto"),
             tavily_api_key=_env("TAVILY_API_KEY"),
             serper_api_key=_env("SERPER_API_KEY"),
@@ -104,9 +155,44 @@ class Settings:
 
     # --- resolution helpers ---------------------------------------------
     def resolved_llm(self) -> str:
+        """Which brain will actually run.
+
+        A key is never required: every path falls through to the deterministic
+        stub rather than erroring, so a keyless clone still works.
+        """
         if self.llm_provider != "auto":
             return self.llm_provider
-        return "anthropic" if self.anthropic_api_key else "stub"
+        for candidate in _AUTO_LLM_ORDER:
+            if self.key_for(candidate):
+                return candidate
+        return "stub"
+
+    def key_for(self, provider: str) -> Optional[str]:
+        """The API key for *provider*, or None. Ollama legitimately has none."""
+        if provider == "anthropic":
+            return self.anthropic_api_key or _env("ANTHROPIC_API_KEY")
+        if self.llm_api_key and provider == self.llm_provider:
+            return self.llm_api_key
+        preset = OPENAI_COMPAT_PRESETS.get(provider)
+        if not preset:
+            return None
+        env_name = preset.get("env") or ""
+        return _env(env_name) if env_name else None
+
+    def endpoint_for(self, provider: str) -> tuple[str, str]:
+        """(base_url, model) for an OpenAI-compatible provider.
+
+        An explicit LEA_LLM_BASE_URL / LEA_MODEL always wins, so an unknown or
+        self-hosted endpoint needs no code change.
+        """
+        preset = OPENAI_COMPAT_PRESETS.get(provider, {})
+        base = self.llm_base_url or preset.get("base_url", "")
+        model = self.model if self.model != DEFAULT_MODEL else preset.get("model", self.model)
+        return base, model
+
+    def is_openai_compat(self, provider: Optional[str] = None) -> bool:
+        p = provider or self.resolved_llm()
+        return p in OPENAI_COMPAT_PRESETS or bool(self.llm_base_url and p not in ("anthropic", "stub"))
 
     def resolved_search(self) -> str:
         if self.search_provider != "auto":

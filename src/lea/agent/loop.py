@@ -27,8 +27,12 @@ from lea.agent.policy import (
     allowed_tools,
     derive_gaps,
     gap_labels,
+    MODELS_HINT,
     is_redundant,
     learned_anything,
+    llm_error_detail,
+    llm_failure_stop_reason,
+    looks_like_stale_model,
     premature_finish_reason,
     should_stop,
     stop_class,
@@ -329,6 +333,23 @@ def _update_record(record: CompanyRecord, action: AgentAction, obs: Observation)
                 record.tech_stack.append(entry)
 
 
+def provider_label(llm: Any, settings: Settings) -> str:
+    """What to show as the LLM in the footer stats.
+
+    For an OpenAI-compatible provider this carries the capability rung the client
+    actually settled on — `google:gemini-2.0-flash (json_object)`. The rung is the
+    single best predictor of output quality on free models, so hiding it means a
+    user reads flat ICP reasoning as the agent's judgement rather than as the
+    endpoint refusing tool-calling. getattr-guarded so anthropic/stub are untouched.
+    """
+    name = getattr(llm, "name", None) or settings.resolved_llm()
+    rung = getattr(llm, "capability", None)
+    if not rung:
+        return str(name)
+    model = getattr(llm, "model", "") or ""
+    return f"{name}:{model} ({rung})" if model else f"{name} ({rung})"
+
+
 def _steering_view(record: CompanyRecord, tentative_domain: str) -> CompanyRecord:
     """What the model is shown: the record plus the loop's working guesses.
 
@@ -385,6 +406,7 @@ def run_agent(
     stop_reason = ""
     pushbacks = 0  # times we've refused an empty-handed FINISH
     tentative_domain = ""  # a guess, for steering only — never written to the record
+    llm_errors: list[str] = []  # failed LLM calls, for diagnosing a dead endpoint
     registry: dict[ToolName, Any] = {}
     llm: Any = None
 
@@ -453,6 +475,25 @@ def run_agent(
                     thought="decide next step",
                     observation=f"the model failed to produce a usable action: {exc}",
                     error=str(exc),
+                ),
+                trace, on_step,
+            )
+            continue
+
+        # A failed LLM call arrives disguised as a calm decision to FINISH. Unmask it
+        # before the finish handling below, or a 404ing endpoint reads as "the agent
+        # judged the evidence sufficient" — the most confusing failure in the system.
+        llm_error = llm_error_detail(action)
+        if llm_error:
+            llm_errors.append(llm_error)
+            budget.consume(None)
+            note = f" — {MODELS_HINT}." if looks_like_stale_model(llm_error) else ""
+            _emit(
+                TraceStep(
+                    n=len(trace) + 1, tool=ToolName.FINISH, ok=False,
+                    thought="decide next step",
+                    observation=f"{llm_error}{note}", error=llm_error,
+                    tokens_in=tokens_in, tokens_out=tokens_out,
                 ),
                 trace, on_step,
             )
@@ -565,6 +606,16 @@ def run_agent(
             step.observation = _truncate(step.observation + transient_failure_hint(step), 900)
         _emit(step, trace, on_step)
 
+    # If the brain never answered, say so specifically. "The agent gave up" and "your
+    # model id 404s" look identical from the outside, and only one of them is the
+    # user's to fix.
+    if llm_errors and not learned_anything(trace) and stop_class(stop_reason) != STOP_ERROR:
+        stop_reason = llm_failure_stop_reason(
+            llm_errors,
+            provider=str(getattr(llm, "name", "") or settings.resolved_llm()),
+            model=str(getattr(llm, "model", "") or ""),
+        )
+
     # --- synthesis -------------------------------------------------------
     # Gated on evidence. Scoring an empty record produces a neutral-looking tier that
     # reads as a real assessment of the company; refusing to score is the honest
@@ -616,7 +667,7 @@ def run_agent(
         tokens_out=sum(s.tokens_out for s in trace),
         wall_ms=int((time.monotonic() - t0) * 1000),
         stop_reason=stop_reason or f"{STOP_COMPLETE}: run finished",
-        llm_provider=getattr(llm, "name", None) or settings.resolved_llm(),
+        llm_provider=provider_label(llm, settings),
         search_provider=settings.resolved_search(),
     )
 

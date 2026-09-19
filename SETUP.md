@@ -9,23 +9,60 @@ Ordered by how much each one changes the result.
 
 ---
 
-## 1. `ANTHROPIC_API_KEY` — the one that matters
+## 1. A model key — free options exist, and one of them is the default
 
-**Where:** `.env` (copy from `.env.example`)
-**Without it:** the planner falls back to `StubClient`, a deterministic heuristic
-brain. It genuinely searches, fetches, detects tech, extracts and scores — the
-whole pipeline runs — but its research policy is close to fixed, so the trace is
-less impressive than the pitch implies.
-**With it:** Claude chooses each next step from what it has just read. This is
-what makes the "real agent, not a script" claim land in a demo.
+The agent runs without any model key: the planner falls back to `StubClient`, a
+deterministic heuristic. It genuinely searches, fetches, extracts and scores —
+but its research policy is close to fixed, and on companies it has no recorded
+fixtures for it tends to return `unknown` for industry, HQ and headcount.
+
+A real model fixes both. You have three routes.
+
+### Free — Google AI Studio (the documented default)
+
+No credit card, no spend. Get a key at <https://aistudio.google.com/apikey>.
 
 ```bash
 cp .env.example .env
-# then set ANTHROPIC_API_KEY=sk-ant-...
-./.venv/bin/lea doctor        # confirms it was picked up
+# set GOOGLE_API_KEY=...
+./.venv/bin/lea doctor        # confirms which provider resolved
 ```
 
-## 2. A search key — optional, but fixes the demo-day failure mode
+Also supported, same adapter, all free tiers: `GROQ_API_KEY`, `OPENROUTER_API_KEY`,
+`CEREBRAS_API_KEY`, or a local Ollama at `http://localhost:11434/v1` needing no key
+at all. Pick with `--provider`, or let `auto` take the first key it finds.
+
+Caveat worth knowing: free models vary in how well they honour a forced JSON
+schema. The adapter falls back through function-calling → JSON mode → a repair
+loop, so output stays valid, but the ICP reasoning and outreach hooks read
+flatter than a frontier model produces.
+
+Free model lineups rotate. If a default model name 404s, run
+`./.venv/bin/lea doctor --models` to list what your key actually serves.
+
+### Paid — Anthropic, if you want the best output
+
+Billed pay-as-you-go at <https://console.anthropic.com/>, **separately from any
+Claude Pro/Max subscription** — a subscription includes no API credits.
+
+Measured on a real run: one company is ~22,400 input and ~4,000 output tokens
+(7 planning decisions + 3 synthesis calls).
+
+| Model | Per company | 100 companies | 1,000 |
+|---|---|---|---|
+| Haiku 4.5 | $0.04 | $4.22 | $42 |
+| Sonnet 5 *(default)* | $0.08 | $8.44 | $84 |
+| Opus 5 | $0.21 | $21.10 | $211 |
+
+Demoing a portfolio project costs under $2. Set `ANTHROPIC_API_KEY`; it wins over
+the free providers when both are present.
+
+### Free and offline — change nothing
+
+`lea enrich "Vanta" --offline` works on a cold clone with no key and no network.
+Good enough to show the loop; not good enough to claim the agent reasons.
+
+## 2. A search key — optional, fixes the demo-day failure mode
 
 **Where:** `.env`, one of `TAVILY_API_KEY` / `SERPER_API_KEY` / `BRAVE_API_KEY`.
 **Why it matters:** the keyless DuckDuckGo default works, but DDG bot-blocks a

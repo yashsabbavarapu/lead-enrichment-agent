@@ -805,3 +805,113 @@ def test_run_batch_isolates_failures(monkeypatch):
     assert [r.record.input for r in results] == ["a", "bad", "c"]
     assert "kaboom" in results[1].stats.stop_reason
     assert seen == ["a", "bad", "c"]
+
+
+# --------------------------------------------------------------------------
+# Provider capability + stale model diagnosis
+# --------------------------------------------------------------------------
+
+
+class FakeCompatLLM(FakeLLM):
+    """Stands in for OpenAICompatClient: has .capability, and reports a failed call
+    by RETURNING a FINISH whose thought starts 'LLM error:' rather than raising."""
+
+    def __init__(self, script, *, name="google", model="gemini-2.0-flash", capability="json_object"):
+        super().__init__(script)
+        self.name = name
+        self.model = model
+        self.capability = capability
+
+
+def llm_error(detail: str) -> AgentAction:
+    return AgentAction(tool=ToolName.FINISH, thought=f"LLM error: {detail}")
+
+
+def test_provider_label_carries_the_capability_rung():
+    s = make_settings()
+    assert loop_mod.provider_label(FakeCompatLLM([], capability="tools"), s) == \
+        "google:gemini-2.0-flash (tools)"
+    assert loop_mod.provider_label(FakeCompatLLM([], capability="prose"), s) == \
+        "google:gemini-2.0-flash (prose)"
+    # anthropic/stub/fakes have no .capability and must be untouched
+    assert loop_mod.provider_label(FakeLLM([]), s) == "fake"
+
+    class Bare:
+        pass
+
+    assert loop_mod.provider_label(Bare(), s) == s.resolved_llm()
+
+
+def test_capability_rung_reaches_the_stats(wired):
+    search = FakeTool(ToolName.WEB_SEARCH)
+    llm = FakeCompatLLM([
+        act(ToolName.WEB_SEARCH, "s", query="acme corp overview"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ], capability="prose")
+    wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("acme", make_settings())
+    assert result.stats.llm_provider == "google:gemini-2.0-flash (prose)"
+
+
+def test_stale_model_id_is_named_as_the_cause(wired):
+    """A 404ing model id used to look like an agent that calmly decided it was done."""
+    detail = "HTTPStatusError: HTTP 404: model 'gemini-1.0-pro' not found"
+    llm = FakeCompatLLM([llm_error(detail)])
+    wired(llm, registry_of(FakeTool(ToolName.WEB_SEARCH)))
+
+    result = loop_mod.run_agent("acme", make_settings(max_steps=8))
+
+    assert stop_class(result.stats.stop_reason) == "error"
+    reason = result.stats.stop_reason
+    assert "404" in reason
+    assert "stale" in reason.lower()
+    assert "lea doctor --models" in reason
+    assert "LEA_MODEL" in reason
+
+    # the failed calls are visible as failed steps, not as a tidy finish
+    failed = [s for s in result.trace if s.error and "404" in s.error]
+    assert failed, "the LLM error must appear in the trace"
+    assert all(not s.ok for s in failed)
+    assert "lea doctor --models" in failed[0].observation
+    # and no score is invented on top of it
+    assert result.record.icp_fit is None
+
+
+def test_non_stale_llm_failure_still_names_the_llm(wired):
+    llm = FakeCompatLLM([llm_error("ConnectError: connection refused")])
+    wired(llm, registry_of(FakeTool(ToolName.WEB_SEARCH)))
+
+    result = loop_mod.run_agent("acme", make_settings(max_steps=8))
+
+    assert stop_class(result.stats.stop_reason) == "error"
+    assert "every LLM call" in result.stats.stop_reason
+    assert "connection refused" in result.stats.stop_reason
+    # not misdiagnosed as a stale model
+    assert "stale" not in result.stats.stop_reason.lower()
+
+
+def test_an_llm_error_does_not_mask_a_successful_run(wired):
+    """One transient LLM error then real work: the run is complete, not an error."""
+    search = FakeTool(ToolName.WEB_SEARCH)
+    llm = FakeCompatLLM([
+        llm_error("HTTP 429: rate limited"),
+        act(ToolName.WEB_SEARCH, "retry", query="acme corp overview"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("acme", make_settings())
+
+    assert stop_class(result.stats.stop_reason) == "complete"
+    assert result.record.icp_fit is not None
+
+
+def test_looks_like_stale_model_discriminates():
+    from lea.agent.policy import looks_like_stale_model
+
+    assert looks_like_stale_model("HTTP 404: model not found")
+    assert looks_like_stale_model("invalid model id")
+    assert looks_like_stale_model("model_not_found")
+    assert not looks_like_stale_model("connection refused")
+    assert not looks_like_stale_model("HTTP 500: server error")

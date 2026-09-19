@@ -47,6 +47,10 @@ err_console = Console(stderr=True)
 # caller can tell "the agent failed to research" from "the agent found a bad fit".
 EXIT_UNGROUNDED = 2
 
+# Backstop for `doctor --models`: list_models has its own HTTP timeout, but a DNS
+# black hole can outlast it and doctor must never hang.
+MODELS_TIMEOUT_S = 12.0
+
 
 # --------------------------------------------------------------------------
 # .env + settings
@@ -152,7 +156,7 @@ def enrich(
     json_out: bool = typer.Option(False, "--json", help="Print only the JSON record to stdout."),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the step budget."),
     offline: bool = typer.Option(False, "--offline", help="Serve all HTTP from examples/fixtures."),
-    provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | stub."),
+    provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | google | groq | openrouter | cerebras | ollama | stub."),
     model: Optional[str] = typer.Option(None, "--model", help="Model id for the LLM provider."),
     quiet: bool = typer.Option(False, "--quiet", help="Suppress the live trace."),
 ) -> None:
@@ -209,7 +213,7 @@ def batch(
     out: Optional[Path] = typer.Option(None, "--out", help="Output directory (default ./out)."),
     limit: Optional[int] = typer.Option(None, "--limit", help="Only process the first N targets."),
     offline: bool = typer.Option(False, "--offline", help="Serve all HTTP from examples/fixtures."),
-    provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | stub."),
+    provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | google | groq | openrouter | cerebras | ollama | stub."),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the step budget."),
 ) -> None:
     """Research MANY companies from a CSV and write a scored results table."""
@@ -335,7 +339,7 @@ def _load_icp(path: Optional[Path], settings: Settings):
 def icp_infer(
     examples: str = typer.Option(..., "--examples", help='Comma-separated best customers, e.g. "Ramp,Brex,Deel".'),
     out: Optional[Path] = typer.Option(None, "--out", help="Where to write the profile (default icp.yaml)."),
-    provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | stub."),
+    provider: Optional[str] = typer.Option(None, "--provider", help="LLM provider: anthropic | google | groq | openrouter | cerebras | ollama | stub."),
 ) -> None:
     """Derive an ICP profile from a handful of your best customers."""
     settings = build_settings(provider=provider)
@@ -418,8 +422,154 @@ def _mark(ok: bool, yes: str = "present", no: str = "absent") -> Text:
     return Text(yes, style="green") if ok else Text(no, style="yellow")
 
 
+# One line each, aimed at someone deciding which key to go get. "free" is the word
+# that matters most here, so it leads.
+_PROVIDER_EFFECT = {
+    "anthropic": ("paid", "best quality"),
+    "google": ("FREE", "generous limits"),
+    "groq": ("FREE", "fastest"),
+    "openrouter": ("FREE", "many models"),
+    "cerebras": ("FREE", "very fast"),
+    "ollama": ("FREE", "runs on your box"),
+}
+
+
+def _print_llm_providers(settings: Settings) -> None:
+    """The model-provider table: who you could use, who you are using, and why."""
+    from lea.config import OPENAI_COMPAT_PRESETS
+
+    resolved = settings.resolved_llm()
+
+    # An aligned list, not a rich Table: five columns of this content wrap into
+    # confetti at 80 chars, and `doctor` has to be readable in a default terminal.
+    console.print(Text("model providers — any ONE of these powers the agent", style="bold white"))
+
+    rows: list[tuple[str, str, str]] = [("anthropic", "Anthropic (Claude)", "ANTHROPIC_API_KEY")]
+    for name, preset in OPENAI_COMPAT_PRESETS.items():
+        rows.append((name, preset.get("label", name), preset.get("env", "") or "(no key)"))
+    rows.append(("stub", "stub (built in)", "(no key)"))
+
+    for name, label, env in rows:
+        active = name == resolved
+        cost, note = _PROVIDER_EFFECT.get(name, ("FREE", "heuristics only"))
+        # Ollama needs no key, so "absent" would be a lie; the stub always works.
+        if name == "ollama":
+            status, style = "local", "cyan"
+        elif name == "stub":
+            status, style = "always", "green"
+        elif settings.key_for(name):
+            status, style = "present", "green"
+        else:
+            status, style = "absent", "yellow"
+
+        line = Text()
+        line.append("  > " if active else "    ", style="bold green")
+        line.append(f"{label[:25]:<26}", style="bold green" if active else "white")
+        line.append(f"{env:<19}", style="dim")
+        line.append(f"{status:<8}", style=style)
+        line.append(f"{cost:<5}", style="bold green" if cost == "FREE" else "dim")
+        line.append(note, style="dim")
+        console.print(line)
+
+    active = Text()
+    active.append("active: ", style="dim")
+    active.append(resolved, style="bold green")
+    if settings.is_openai_compat(resolved):
+        base, model = settings.endpoint_for(resolved)
+        active.append(f"  base_url={base}  model={model}", style="dim")
+        active.append("\n         model ids rotate on free tiers — ", style="dim")
+        active.append("lea doctor --models", style="cyan")
+        active.append(" lists what yours serves today.", style="dim")
+    elif resolved == "anthropic":
+        active.append(f"  model={settings.model}", style="dim")
+    else:
+        active.append("  no LLM — reasoning is heuristic", style="dim")
+    console.print(active)
+
+
+def _print_models(settings: Settings) -> None:
+    """What the configured endpoint actually serves today.
+
+    Every default model id in the presets is an educated guess against a lineup that
+    rotates, so this is the difference between "it's broken" and "set LEA_MODEL".
+    """
+    resolved = settings.resolved_llm()
+    console.print()
+    console.print(Text(f"models served by {resolved}", style="bold white"))
+
+    if resolved in ("anthropic", "stub"):
+        console.print(Text(
+            f"  {resolved} does not expose a model list. "
+            + ("Model ids are in Anthropic's docs." if resolved == "anthropic"
+               else "The stub has no models — it is deterministic heuristics."),
+            style="dim",
+        ))
+        return
+
+    # A hung endpoint must not wedge doctor. list_models has its own HTTP timeout;
+    # this is the backstop for a DNS black hole that outlasts it. A daemon thread
+    # (not an executor) on purpose: an executor's shutdown joins its workers, so a
+    # stuck lookup would block the very exit this is meant to protect.
+    import threading
+
+    from lea.llm.factory import list_models
+
+    box: dict[str, Any] = {}
+
+    def _lookup() -> None:
+        try:
+            box["models"] = list_models(settings) or []
+        except Exception as exc:  # diagnostics never raise
+            box["error"] = f"{type(exc).__name__}: {exc}"
+
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(timeout=MODELS_TIMEOUT_S)
+
+    timed_out = worker.is_alive()
+    models: list[str] = box.get("models") or []
+    if box.get("error"):
+        console.print(Text(f"  lookup failed: {box['error']}", style="yellow"))
+
+    if models:
+        base, current = settings.endpoint_for(resolved)
+        console.print(Text(f"  {len(models)} available:", style="dim"))
+        for m in models:
+            line = Text("    ")
+            if m == current:
+                line.append(m, style="bold green")
+                line.append("   <- currently selected", style="dim")
+            else:
+                line.append(m, style="white")
+            console.print(line)
+        if current not in models:
+            console.print(Text(
+                f"  warning: LEA_MODEL is '{current}', which this endpoint does not list. "
+                "Runs will likely fail with a 404 — pick one above.",
+                style="bold yellow",
+            ))
+        return
+
+    base, current = settings.endpoint_for(resolved)
+    why = (
+        f"the lookup took longer than {MODELS_TIMEOUT_S:g}s"
+        if timed_out
+        else f"{base or 'the endpoint'} was unreachable, or your key was rejected"
+    )
+    console.print(Text(f"  no models returned — {why}.", style="yellow"))
+    console.print(Text(
+        f"  Current model id is '{current}'. If runs fail with a 404, set LEA_MODEL "
+        "to an id your provider lists in its own docs/dashboard.",
+        style="dim",
+    ))
+
+
 @app.command()
-def doctor() -> None:
+def doctor(
+    models: bool = typer.Option(
+        False, "--models", help="Also list the model ids the configured provider serves."
+    ),
+) -> None:
     """Show what is configured, what will happen with the keys you have, and what is missing."""
     loaded = load_dotenv()
     settings = Settings.from_env()
@@ -431,23 +581,31 @@ def doctor() -> None:
     t.add_column("k", style="dim", no_wrap=True)
     t.add_column("v", overflow="fold")
     t.add_row(".env", f"{PROJECT_ROOT / '.env'} ({loaded} vars loaded)" if loaded else "not found (optional)")
-    t.add_row("llm provider", f"{settings.resolved_llm()}  [dim](configured: {settings.llm_provider})[/dim]")
-    t.add_row("model", settings.model)
+    _resolved = settings.resolved_llm()
+    t.add_row("llm provider", f"{_resolved}  [dim](configured: {settings.llm_provider})[/dim]")
+    if _resolved == "stub":
+        t.add_row("model", "[dim]n/a — the stub uses no model[/dim]")
+    elif settings.is_openai_compat(_resolved):
+        t.add_row("model", settings.endpoint_for(_resolved)[1])
+    else:
+        t.add_row("model", settings.model)
     t.add_row("search provider", f"{settings.resolved_search()}  [dim](configured: {settings.search_provider})[/dim]")
     t.add_row("offline mode", "ON — all HTTP served from fixtures" if settings.offline else "off")
     t.add_row("out dir", str(settings.out_dir))
     console.print(t)
     console.print()
 
-    keys = Table(show_header=True, header_style="bold dim", title="API keys", title_justify="left")
+    _print_llm_providers(settings)
+    console.print()
+
+    keys = Table(show_header=True, header_style="bold dim", title="search keys", title_justify="left")
     keys.add_column("key", no_wrap=True)
     keys.add_column("status")
     keys.add_column("effect", style="dim", overflow="fold")
-    keys.add_row("ANTHROPIC_API_KEY", _mark(bool(settings.anthropic_api_key)),
-                 "real reasoning; without it the deterministic stub brain is used")
     keys.add_row("TAVILY_API_KEY", _mark(bool(settings.tavily_api_key)), "best search quality (first choice)")
     keys.add_row("SERPER_API_KEY", _mark(bool(settings.serper_api_key)), "Google results (second choice)")
     keys.add_row("BRAVE_API_KEY", _mark(bool(settings.brave_api_key)), "Brave results (third choice)")
+    keys.add_row("(none)", _mark(True, "always", ""), "DuckDuckGo, keyless — works but gets rate-limited")
     console.print(keys)
     console.print("[dim]values are never printed, only presence.[/dim]")
     console.print()
@@ -494,26 +652,49 @@ def doctor() -> None:
         for m in missing:
             console.print(Text("  " + m, style="red"))
 
+    if models:
+        _print_models(settings)
+
     console.print()
+    resolved = settings.resolved_llm()
     verdict = Text()
-    if settings.anthropic_api_key:
-        verdict.append("Ready. ", style="bold green")
-        verdict.append(
-            f"The agent will reason with {settings.model} and search via "
-            f"{settings.resolved_search()}.",
-        )
-    else:
+    if resolved == "stub":
         verdict.append("Ready, keyless. ", style="bold yellow")
         verdict.append(
-            "With no ANTHROPIC_API_KEY the run uses the deterministic stub brain: it still "
-            "searches, fetches and produces a full record and trace, but the step-by-step "
-            "reasoning is heuristic rather than model-driven. Set ANTHROPIC_API_KEY to turn "
-            "it into a real reasoning agent.",
+            "With no model-provider key the run uses the built-in stub brain: it still "
+            "searches, fetches, scores and produces a full record and trace, but the "
+            "step-by-step reasoning is heuristic rather than model-driven.\n\n",
+        )
+        verdict.append("To get real reasoning without paying, grab ONE free key ", style="bold white")
+        verdict.append("and the agent picks it up automatically:\n", style="bold white")
+        verdict.append("  GOOGLE_API_KEY      aistudio.google.com/apikey        (free tier)\n", style="green")
+        verdict.append("  GROQ_API_KEY        console.groq.com/keys             (free tier)\n", style="green")
+        verdict.append("  OPENROUTER_API_KEY  openrouter.ai/keys                (free models)\n", style="green")
+        verdict.append("  CEREBRAS_API_KEY    cloud.cerebras.ai                 (free tier)\n", style="green")
+        verdict.append("  or run Ollama locally and use --provider ollama       (no key at all)\n", style="green")
+        verdict.append("Put it in .env or export it, then re-run `lea doctor`.", style="dim")
+    elif resolved == "anthropic":
+        verdict.append("Ready. ", style="bold green")
+        verdict.append(
+            f"The agent will reason with {settings.model} (Anthropic) and search via "
+            f"{settings.resolved_search()}."
+        )
+    else:
+        base, model = settings.endpoint_for(resolved)
+        verdict.append("Ready. ", style="bold green")
+        verdict.append(
+            f"The agent will reason with {model} via {resolved} and search via "
+            f"{settings.resolved_search()}.\n"
+        )
+        verdict.append(
+            "Free model lineups rotate, so if runs fail with a 404 run `lea doctor --models` "
+            "and set LEA_MODEL to an id listed there.",
+            style="dim",
         )
     if settings.offline:
         verdict.append("\nOffline mode is ON, so no network calls will be made at all.", style="dim")
     console.print(Panel(verdict, border_style="blue"))
-    console.print("\n[dim]try:[/dim] lea enrich ramp.com")
+    console.print("\n[dim]try:[/dim] lea enrich ramp.com --offline")
 
 
 def main() -> None:  # pragma: no cover - console-script shim
