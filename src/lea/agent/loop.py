@@ -527,7 +527,7 @@ def run_agent(
         # Gaps and stop conditions read the steering view, so a domain we've merely
         # inferred still narrows the to-do list without contaminating the output.
         steering = _steering_view(record, tentative_domain)
-        reason = should_stop(steering, budget, trace)
+        reason = should_stop(steering, budget, trace, target)
         if reason:
             stop_reason = reason
             break
@@ -615,7 +615,7 @@ def run_agent(
         # Redundancy guard. We do NOT skip silently: the reason is written into the
         # trace as a failed step, and the trace is what the next prompt shows the
         # model. Blocking without feedback just produces the same action again.
-        redundant = is_redundant(action, trace)
+        redundant = is_redundant(action, trace, target)
         if redundant:
             budget.consume(None)  # costs a step, not a search/fetch
             _emit(
@@ -633,7 +633,8 @@ def run_agent(
         # always wrong — snippets do not carry HQ, founding year or headcount. But
         # it is only *nearly* always, so this pushes back and lets the model insist.
         unread_objection = search_without_reading_reason(
-            action, trace, search_pushbacks, can_fetch=budget.allows(ToolName.FETCH_PAGE)
+            action, trace, search_pushbacks,
+            can_fetch=budget.allows(ToolName.FETCH_PAGE), target=target,
         )
         if unread_objection:
             search_pushbacks += 1

@@ -57,6 +57,11 @@ MAX_CONSECUTIVE_DEAD_STEPS = 3
 # Similarity above which two search queries count as "the same question again".
 QUERY_SIMILARITY_THRESHOLD = 0.8
 
+# Used instead when no search has yet surfaced anything related to the target.
+# Near-exact only: a reword is how an agent escapes a bad first query, but an
+# identical query re-run returns identical junk and is still worth blocking.
+STUCK_SIMILARITY_THRESHOLD = 0.95
+
 # How many times the loop may push back on a FINISH that would produce an empty
 # record. Bounded, because an obstinate model must still be able to stop.
 MAX_FINISH_PUSHBACKS = 2
@@ -364,7 +369,20 @@ def _arg(args: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def is_redundant(action: AgentAction, history: Iterable[TraceStep]) -> Optional[str]:
+def _read_anything_relevant(history: Iterable[TraceStep], target: str = "") -> bool:
+    """Has any page we actually opened plausibly concerned the target?"""
+    relates = _url_relevance_fn(target)
+    if relates is None:
+        return True  # cannot judge -> assume yes, i.e. do not relax anything
+    for s in history:
+        if s.tool in READING_TOOLS and s.ok and any(relates(u) for u in s.sources):
+            return True
+    return False
+
+
+def is_redundant(
+    action: AgentAction, history: Iterable[TraceStep], target: str = ""
+) -> Optional[str]:
     """Return a reason string when `action` repeats work already done, else None.
 
     The caller does NOT drop the action on the floor — it records the reason as a
@@ -411,16 +429,29 @@ def is_redundant(action: AgentAction, history: Iterable[TraceStep]) -> Optional[
         query = _arg(action.args, "query", "q", "search", "text")
         if not query:
             return None
+        # When nothing found so far relates to the target, the agent is trying to
+        # escape a hole rather than circling in one, so only a near-exact repeat is
+        # worth blocking — a rephrase deserves its chance. A genuine repeat is
+        # still caught: the same query returns the same junk.
+        stuck = not relevant_unread_urls(steps, target) and not _read_anything_relevant(steps, target)
+        threshold = STUCK_SIMILARITY_THRESHOLD if stuck else QUERY_SIMILARITY_THRESHOLD
+
         for s in steps:
             if s.tool != ToolName.WEB_SEARCH:
                 continue
             prior = _arg(s.args, "query", "q", "search", "text")
             if not prior:
                 continue
-            if query_similarity(query, prior) >= QUERY_SIMILARITY_THRESHOLD:
+            if query_similarity(query, prior) >= threshold:
+                advice = (
+                    "Re-anchor on something more specific to this company rather than "
+                    "rewording the same question."
+                    if stuck
+                    else "Search for something you do not know yet, or fetch a page."
+                )
                 return (
                     f'redundant: step {s.n} already searched "{prior}", which asks the same '
-                    "question. Search for something you do not know yet, or fetch a page."
+                    f"question. {advice}"
                 )
         return None
 
@@ -482,22 +513,67 @@ def unread_urls(history: Iterable[TraceStep]) -> list[str]:
     return [u for u in seen_urls(steps) if normalize_url(u) not in read]
 
 
+def _url_relevance_fn(target: str):
+    """A `url -> bool` judge for "does this plausibly concern the target?", or None.
+
+    Reuses prompts.py's partitioner — the same judgement the model is already
+    shown — so the guard and the prompt cannot disagree about which links are
+    worth opening. URL-only by necessity: an unread link has no body text, which
+    rules out `enrich.is_relevant_source`. Falls back to a bare token match if
+    that import ever moves.
+    """
+    try:
+        from lea.prompts import _target_tokens, _url_relates  # type: ignore
+
+        tokens = _target_tokens(target)
+        if tokens:
+            return lambda url: _url_relates(url, tokens)
+    except Exception:
+        pass
+
+    tokens = [t for t in _TOKEN_RE.findall((target or "").lower()) if len(t) > 2]
+    if not tokens:
+        return None
+    return lambda url: any(t in (url or "").lower() for t in tokens)
+
+
+def relevant_unread_urls(history: Iterable[TraceStep], target: str = "") -> list[str]:
+    """Unread links that plausibly concern the target.
+
+    The distinction that matters: a pile of unread junk is not a reason to stop
+    searching, it is the reason to search again. On a live Notion run the first
+    query returned a children's play consultancy, and the guard then blocked three
+    correct re-anchors on the grounds that links were "unread".
+
+    With no target, or no usable tokens in it, nothing can be judged and every
+    unread link comes back — callers then behave exactly as they did before.
+    """
+    unread = unread_urls(history)
+    relates = _url_relevance_fn(target)
+    if not unread or relates is None:
+        return unread
+    return [u for u in unread if relates(u)]
+
+
 def search_without_reading_reason(
     action: AgentAction,
     history: Iterable[TraceStep],
     pushbacks: int = 0,
     can_fetch: bool = True,
+    target: str = "",
 ) -> Optional[str]:
     """Reason to reconsider a back-to-back search, or None.
 
     Fires only when all of these hold, so it cannot punish a legitimate re-search:
       - this action is a search,
       - the previous research step was ALSO a search (no fetch in between),
-      - that search left URLs nobody has opened,
+      - that search left unread URLs that plausibly concern the target,
       - and there is fetch budget to open one.
     A second search after an empty first one is exactly right, produces no unread
     URLs, and stays quiet. So does one made with no fetch budget left: advising a
-    fetch the agent cannot afford would just burn its remaining steps.
+    fetch the agent cannot afford would just burn its remaining steps. And so does
+    one made when every link found so far is junk — that is re-anchoring, not
+    dithering, and blocking it cost live runs three of their eight research steps.
     """
     if action.tool != ToolName.WEB_SEARCH:
         return None
@@ -516,7 +592,7 @@ def search_without_reading_reason(
     if prior is None or prior.tool != ToolName.WEB_SEARCH:
         return None
 
-    unread = unread_urls(steps)
+    unread = relevant_unread_urls(steps, target)
     if not unread:
         return None
 
@@ -842,6 +918,7 @@ def should_stop(
     record: CompanyRecord,
     budget: Budget,
     history: list[TraceStep],
+    target: str = "",
 ) -> Optional[str]:
     """Reason to stop researching, or None to keep going.
 
@@ -866,7 +943,7 @@ def should_stop(
     # has never opened and there is fetch budget to open it. Stopping at the normal
     # threshold there ends the run at the exact moment a redirect would have saved
     # it, so the leash gets a bounded extension. max_steps still caps the run.
-    rescuable = bool(unread_urls(history)) and budget.allows(ToolName.FETCH_PAGE)
+    rescuable = bool(relevant_unread_urls(history, target)) and budget.allows(ToolName.FETCH_PAGE)
     limit = MAX_CONSECUTIVE_DEAD_STEPS + (STALL_GRACE_WITH_UNREAD if rescuable else 0)
     if dead >= limit:
         # A stall is never "done" — say so, so nobody reads the output as an answer.

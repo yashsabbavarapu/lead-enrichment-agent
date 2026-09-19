@@ -1189,7 +1189,16 @@ def test_loop_pushes_back_on_searching_instead_of_reading(wired):
 def test_search_guard_is_bounded_so_an_insistent_model_proceeds(wired):
     from lea.agent.policy import MAX_SEARCH_PUSHBACKS
 
-    search = FakeTool(ToolName.WEB_SEARCH)  # default obs always surfaces a source
+    # sources must plausibly relate to the target, or the guard correctly stays
+    # silent (that is the junk-results case, covered separately)
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[
+        Observation(
+            tool=ToolName.WEB_SEARCH, ok=True, summary=f"hit {i}",
+            data={"results": [{"title": "Vanta", "url": f"https://vanta.com/p{i}", "snippet": "x"}]},
+            sources=[f"https://vanta.com/p{i}"],
+        )
+        for i in range(6)
+    ])
     # keeps asking to search, never takes the hint
     llm = FakeLLM([
         act(ToolName.WEB_SEARCH, "a", query="vanta company overview"),
@@ -1801,3 +1810,115 @@ def test_no_fallback_reports_the_provider_plainly(wired):
     result = loop_mod.run_agent("acme", make_settings())
     assert result.stats.search_provider == "scrappa"
     assert "fell back" not in result.stats.search_provider
+
+
+# --------------------------------------------------------------------------
+# The guards must not defend junk
+# --------------------------------------------------------------------------
+
+
+_JUNK_URL = "https://theworkspaceforchildren.com/about"   # the real live offender
+_GOOD_URL = "https://notion.so/about"
+
+
+def test_relevant_unread_urls_separates_junk_from_the_target():
+    from lea.agent.policy import relevant_unread_urls
+
+    history = [_search_step(1, "Notion workspace software company", _JUNK_URL, _GOOD_URL,
+                            "https://www.crunchbase.com/organization/notion")]
+
+    rel = relevant_unread_urls(history, "Notion")
+    assert _GOOD_URL in rel
+    assert "https://www.crunchbase.com/organization/notion" in rel
+    assert _JUNK_URL not in rel
+
+    # with no target nothing can be judged, so nothing is filtered
+    from lea.agent.policy import unread_urls
+
+    assert relevant_unread_urls(history, "") == unread_urls(history)
+
+
+def test_search_guard_stays_silent_when_every_unread_link_is_junk():
+    """The live Notion bug: three correct re-anchors blocked to defend a
+    children's play consultancy."""
+    from lea.agent.policy import search_without_reading_reason
+
+    history = [_search_step(1, "Notion workspace software company", _JUNK_URL)]
+
+    # re-anchoring on the domain, and on a site: query, are exactly right here
+    for q in ("notion.so", "site:notion.com about"):
+        assert search_without_reading_reason(
+            act(ToolName.WEB_SEARCH, query=q), history, target="Notion"
+        ) is None, f"guard must not block the re-anchor {q!r}"
+
+    # ...but once something relevant IS sitting unread, it fires again
+    history.append(_search_step(2, "site:notion.so about", _GOOD_URL))
+    reason = search_without_reading_reason(
+        act(ToolName.WEB_SEARCH, query="notion pricing"), history, target="Notion"
+    )
+    assert reason and _GOOD_URL in reason
+
+
+def test_stall_grace_is_not_extended_for_junk_links():
+    """Extending the leash to 'go read junk' is not a rescue."""
+    rec = CompanyRecord(input="Notion")
+    budget = Budget(max_steps=12, max_searches=5, max_fetches=6, total_timeout_s=60)
+    dead = [TraceStep(n=i, tool=ToolName.WEB_SEARCH, ok=False, error="boom")
+            for i in range(2, 5)]
+
+    junk = [_search_step(1, "q", _JUNK_URL), *dead]
+    assert should_stop(rec, budget, junk, "Notion") is not None, "junk is not a rescue"
+
+    good = [_search_step(1, "q", _GOOD_URL), *dead]
+    assert should_stop(rec, budget, good, "Notion") is None, "a real lead earns the grace"
+
+
+def test_redundancy_relaxes_while_the_agent_is_stuck_in_junk():
+    """Escaping a hole is not circling in one."""
+    from lea.agent.policy import (
+        QUERY_SIMILARITY_THRESHOLD, STUCK_SIMILARITY_THRESHOLD, is_redundant, query_similarity,
+    )
+
+    assert STUCK_SIMILARITY_THRESHOLD > QUERY_SIMILARITY_THRESHOLD
+
+    first = "notion workspace software docs"
+    junk_only = [_search_step(1, first, _JUNK_URL)]
+    reword = act(ToolName.WEB_SEARCH, query="notion workspace software docs wiki")
+    # similar enough to be blocked normally...
+    sim = query_similarity("notion workspace software docs wiki", first)
+    assert QUERY_SIMILARITY_THRESHOLD <= sim < STUCK_SIMILARITY_THRESHOLD
+    # ...but allowed while nothing relevant has been found
+    assert is_redundant(reword, junk_only, "Notion") is None
+
+    # an exact repeat is still blocked: same query, same junk
+    exact = act(ToolName.WEB_SEARCH, query=first)
+    blocked = is_redundant(exact, junk_only, "Notion")
+    assert blocked and "re-anchor" in blocked.lower()
+
+    # and once something relevant is found, the normal threshold returns
+    found = [*junk_only, _search_step(2, "site:notion.so", _GOOD_URL)]
+    assert is_redundant(reword, found, "Notion") is not None
+
+
+def test_loop_lets_a_re_anchor_through_after_junk(wired):
+    """End to end: search returns junk, the agent re-anchors, nothing is bounced."""
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[
+        Observation(tool=ToolName.WEB_SEARCH, ok=True, summary="junk",
+                    data={"results": [{"title": "Kids workspace", "url": _JUNK_URL, "snippet": "play"}]},
+                    sources=[_JUNK_URL]),
+        Observation(tool=ToolName.WEB_SEARCH, ok=True, summary="good",
+                    data={"results": [{"title": "Notion", "url": _GOOD_URL, "snippet": "workspace"}]},
+                    sources=[_GOOD_URL]),
+    ])
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "broad", query="Notion workspace software company"),
+        act(ToolName.WEB_SEARCH, "re-anchor on the domain", query="site:notion.so about"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search, FakeTool(ToolName.FETCH_PAGE)))
+
+    result = loop_mod.run_agent("Notion", make_settings())
+
+    bounced = [s for s in result.trace if s.error in ("unread sources", "redundant")]
+    assert not bounced, f"the re-anchor was blocked: {[s.observation for s in bounced]}"
+    assert len(search.calls) == 2
