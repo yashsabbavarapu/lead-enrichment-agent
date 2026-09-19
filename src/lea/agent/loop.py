@@ -34,10 +34,13 @@ from lea.agent.policy import (
     llm_failure_stop_reason,
     looks_like_stale_model,
     premature_finish_reason,
+    search_without_reading_reason,
+    seen_urls,
     should_stop,
     stop_class,
     transient_failure_hint,
     truncate_words,
+    unread_urls,
 )
 from lea.config import Settings
 from lea.models import (
@@ -350,6 +353,23 @@ def provider_label(llm: Any, settings: Settings) -> str:
     return f"{name}:{model} ({rung})" if model else f"{name} ({rung})"
 
 
+def budget_view(budget: Budget, trace: list[TraceStep]) -> dict[str, Any]:
+    """What the prompt is told about resources: remaining, spent, and unexploited.
+
+    The unread-URL set is the one that matters and is trace-derived, so the loop is
+    the only place that knows it. Showing "12 found, 2 read" is usually enough on
+    its own to send a model to open one instead of searching a fifth time.
+    """
+    view: dict[str, Any] = dict(budget.remaining())
+    view.update(budget.used())
+    unread = unread_urls(trace)
+    view["urls_found"] = len(seen_urls(trace))
+    view["urls_unread"] = len(unread)
+    # Capped: this renders into every prompt, and a long list is just noise.
+    view["unread_urls"] = unread[:8]
+    return view
+
+
 def _steering_view(record: CompanyRecord, tentative_domain: str) -> CompanyRecord:
     """What the model is shown: the record plus the loop's working guesses.
 
@@ -405,6 +425,7 @@ def run_agent(
 
     stop_reason = ""
     pushbacks = 0  # times we've refused an empty-handed FINISH
+    search_pushbacks = 0  # times we've asked it to read before searching again
     tentative_domain = ""  # a guess, for steering only — never written to the record
     llm_errors: list[str] = []  # failed LLM calls, for diagnosing a dead endpoint
     registry: dict[ToolName, Any] = {}
@@ -462,7 +483,9 @@ def run_agent(
         specs = allowed_tools(budget, registry)
 
         try:
-            context = build_context(target, steering, trace, budget.remaining(), gap_labels(gaps))  # type: ignore[misc]
+            context = build_context(  # type: ignore[misc]
+                target, steering, trace, budget_view(budget, trace), gap_labels(gaps)
+            )
             action, usage = llm.decide(system, context, specs)
             tokens_in, tokens_out = int(usage.tokens_in), int(usage.tokens_out)
         except Exception as exc:
@@ -546,6 +569,27 @@ def run_agent(
                 TraceStep(
                     n=len(trace) + 1, tool=action.tool, args=action.args, ok=False,
                     thought=action.thought, observation=redundant, error="redundant",
+                    tokens_in=tokens_in, tokens_out=tokens_out,
+                ),
+                trace, on_step,
+            )
+            continue
+
+        # Balance guard, same shape as the redundancy one: report, never rewrite.
+        # Searching twice in a row while your own results sit unopened is nearly
+        # always wrong — snippets do not carry HQ, founding year or headcount. But
+        # it is only *nearly* always, so this pushes back and lets the model insist.
+        unread_objection = search_without_reading_reason(
+            action, trace, search_pushbacks, can_fetch=budget.allows(ToolName.FETCH_PAGE)
+        )
+        if unread_objection:
+            search_pushbacks += 1
+            budget.consume(None)  # costs a step, not a search
+            _emit(
+                TraceStep(
+                    n=len(trace) + 1, tool=action.tool, args=action.args, ok=False,
+                    thought=action.thought, observation=unread_objection,
+                    error="unread sources",
                     tokens_in=tokens_in, tokens_out=tokens_out,
                 ),
                 trace, on_step,

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -59,6 +60,10 @@ __all__ = [
     "resolve_model",
     "rank_models",
     "Capability",
+    "AuthStyle",
+    "AUTH_STYLE_ENV",
+    "auth_transport",
+    "pinned_auth_style",
     "reset_capability_cache",
     "reset_provider_state",
     "classify_auth_failure",
@@ -102,12 +107,78 @@ _AUTH_FAILURES: dict[str, int] = {}
 #: go stale; one lookup per run repairs it instead of failing every call.
 _MODEL_RESOLUTION: dict[tuple[str, str], str] = {}
 
+#: base_url -> the auth transport that endpoint actually accepts.
+_AUTH_STYLE_CACHE: dict[str, str] = {}
+
+
+class AuthStyle:
+    """How to present the credential. Negotiated like the capability rung.
+
+    Providers disagree, and change their minds: Google's OpenAI-compat endpoint
+    rejects `x-goog-api-key` and `?key=` with a 400 *before it ever looks at the
+    key*, while its native endpoint accepts both. Rather than encode a belief
+    about which is right this month, try them in order and remember what worked.
+    """
+
+    BEARER = "bearer"   # Authorization: Bearer <key>   (OpenAI standard)
+    HEADER = "header"   # x-goog-api-key: <key>         (Google native)
+    QUERY = "query"     # ?key=<key>                    (Google legacy)
+
+    ORDER = (BEARER, HEADER, QUERY)
+
+
+#: Pin a transport and skip negotiation entirely.
+AUTH_STYLE_ENV = "LEA_LLM_AUTH_STYLE"
+_AUTH_STYLE_ALIASES = {
+    "bearer": AuthStyle.BEARER, "authorization": AuthStyle.BEARER, "auth": AuthStyle.BEARER,
+    "header": AuthStyle.HEADER, "x-goog-api-key": AuthStyle.HEADER, "goog": AuthStyle.HEADER,
+    "google": AuthStyle.HEADER, "api-key": AuthStyle.HEADER,
+    "query": AuthStyle.QUERY, "param": AuthStyle.QUERY, "key": AuthStyle.QUERY, "url": AuthStyle.QUERY,
+}
+
 
 def reset_provider_state() -> None:
-    """Forget probed capabilities, auth counters and resolved models."""
+    """Forget probed capabilities, auth counters, resolved models and transport."""
     _CAPABILITY_CACHE.clear()
     _AUTH_FAILURES.clear()
     _MODEL_RESOLUTION.clear()
+    _AUTH_STYLE_CACHE.clear()
+
+
+def pinned_auth_style() -> Optional[str]:
+    """The operator's explicit choice via ``LEA_LLM_AUTH_STYLE``, if any."""
+    raw = (os.environ.get(AUTH_STYLE_ENV) or "").strip().lower()
+    if not raw:
+        return None
+    style = _AUTH_STYLE_ALIASES.get(raw)
+    if style is None:
+        logger.warning(
+            "%s=%r is not one of %s; negotiating the auth transport instead.",
+            AUTH_STYLE_ENV, raw, "/".join(AuthStyle.ORDER),
+        )
+    return style
+
+
+def auth_transport(base_url: str, api_key: Optional[str], style: Optional[str] = None) -> tuple[dict[str, str], dict[str, str]]:
+    """``(headers, query_params)`` carrying the credential exactly once.
+
+    The key is never placed in two transports at the same time: a request that
+    carries both a header and a query param makes a 400 impossible to attribute.
+    """
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    params: dict[str, str] = {}
+    if not api_key:
+        # Ollama is local and keyless; an empty bearer makes some servers 401.
+        return headers, params
+
+    chosen = style or pinned_auth_style() or _AUTH_STYLE_CACHE.get(base_url, AuthStyle.BEARER)
+    if chosen == AuthStyle.HEADER:
+        headers["x-goog-api-key"] = api_key
+    elif chosen == AuthStyle.QUERY:
+        params["key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers, params
 
 
 #: Backwards-compatible alias: the cache reset has always cleared everything
@@ -357,6 +428,42 @@ def _replacement_from_error(body: str, exclude: str = "") -> Optional[str]:
     return None
 
 
+#: Errors that mean "you presented the credential the wrong way", as distinct
+#: from "your credential is bad". Google's compat endpoint 400s with
+#: "Missing or invalid Authorization header" for x-goog-api-key / ?key=, and
+#: 401s with "Expected OAuth 2 access token" when it wants a different
+#: credential *type* — both are transport complaints, not key complaints.
+_WRONG_TRANSPORT_MARKERS = (
+    "missing or invalid authorization header",
+    "authorization header",
+    "expected oauth 2 access token",
+    "expected oauth2 access token",
+    "expects a bearer token",
+    "missing authentication",
+    "no credentials",
+    "credential type",
+    "authentication method",
+    "api key not provided",
+    "missing api key",
+    "must be authenticated",
+)
+
+
+def _looks_wrong_auth_transport(status: int, body: str) -> bool:
+    """True when switching transports could plausibly help.
+
+    Deliberately yields to `_TERMINAL_AUTH_MARKERS`: cycling three transports
+    against a revoked key just triples the cost of an inevitable failure.
+    """
+    if status not in (400, 401, 403):
+        return False
+    lowered = (body or "").lower()
+    if not any(marker in lowered for marker in _WRONG_TRANSPORT_MARKERS):
+        return False
+    # A dead key is a dead key however you present it.
+    return not any(marker in lowered for marker in _TERMINAL_AUTH_MARKERS)
+
+
 class _Unsupported(Exception):
     """The endpoint rejected this rung of the ladder."""
 
@@ -411,15 +518,46 @@ def _auth_breaker_open(base_url: str) -> bool:
     return _AUTH_FAILURES.get(base_url, 0) >= AUTH_BREAKER_THRESHOLD
 
 
-def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
+#: Google sends no `Retry-After` header on a 429 — the delay is in the JSON
+#: body, as `RetryInfo.retryDelay` and in prose ("Please retry in 30.98s").
+_RETRY_INFO_RE = re.compile(r'"retryDelay"\s*:\s*"?(\d+(?:\.\d+)?)s?"?', re.IGNORECASE)
+_RETRY_PROSE_RE = re.compile(r"retry in (\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+
+#: A *per-day* quota cannot recover inside this run. Retrying it four times on
+#: each of ~12 steps turns a spent quota into minutes of pointless backoff.
+_DAILY_QUOTA_MARKERS = ("perday", "requestsperday", "dailylimit", "quotaperday")
+
+
+class _QuotaExhausted(Exception):
+    """A quota that cannot recover within this run."""
+
+
+def _retry_delay_from_body(body: str) -> Optional[float]:
+    """Seconds the provider asked us to wait, read out of the response body."""
+    for pattern in (_RETRY_INFO_RE, _RETRY_PROSE_RE):
+        m = pattern.search(body or "")
+        if m:
+            try:
+                return max(0.0, min(float(m.group(1)), MAX_RETRY_AFTER_S))
+            except ValueError:  # pragma: no cover - regex guarantees a number
+                continue
+    return None
+
+
+def _is_daily_quota(body: str) -> bool:
+    """True when a 429 names a per-day quota rather than a per-minute one."""
+    squashed = re.sub(r"[^a-z]", "", (body or "").lower())
+    return any(marker in squashed for marker in _DAILY_QUOTA_MARKERS)
+
+
+def _retry_after_seconds(response: httpx.Response, body: str = "") -> Optional[float]:
     raw = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset-after")
-    if not raw:
-        return None
-    try:
-        return max(0.0, min(float(raw), MAX_RETRY_AFTER_S))
-    except (TypeError, ValueError):
-        logger.debug("Unparseable Retry-After header: %r", raw)
-        return None
+    if raw:
+        try:
+            return max(0.0, min(float(raw), MAX_RETRY_AFTER_S))
+        except (TypeError, ValueError):
+            logger.debug("Unparseable Retry-After header: %r", raw)
+    return _retry_delay_from_body(body)
 
 
 # ---------------------------------------------------------------------------
@@ -517,13 +655,32 @@ class OpenAICompatClient:
         )
         return nxt
 
+    @property
+    def auth_style(self) -> str:
+        """The transport in use: pinned, previously negotiated, or the default."""
+        return pinned_auth_style() or _AUTH_STYLE_CACHE.get(self.base_url, AuthStyle.BEARER)
+
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        # Ollama is local and keyless: sending an empty bearer token makes some
-        # servers 401 on a request that would otherwise have worked.
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        return headers
+        return auth_transport(self.base_url, self.api_key, self.auth_style)[0]
+
+    def _demote_auth_style(self, reason: str) -> Optional[str]:
+        """Move to the next transport. ``None`` when they are all exhausted."""
+        if pinned_auth_style():
+            return None  # the operator chose; do not second-guess them
+        current = self.auth_style
+        try:
+            nxt = AuthStyle.ORDER[AuthStyle.ORDER.index(current) + 1]
+        except (ValueError, IndexError):
+            return None
+        _AUTH_STYLE_CACHE[self.base_url] = nxt
+        logger.debug("%s: auth transport %s rejected (%s); trying %s", self.name, current, reason, nxt)
+        return nxt
+
+    def _redact(self, text: str) -> str:
+        """Never let the credential reach a log line or the agent trace."""
+        if self.api_key and self.api_key in text:
+            text = text.replace(self.api_key, "<redacted>")
+        return _redact_query_key(text)
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST /chat/completions with bounded jittered retry.
@@ -538,13 +695,19 @@ class OpenAICompatClient:
         """
         url = f"{self.base_url}/chat/completions"
         last_exc: Optional[Exception] = None
+        # Probing an auth transport is negotiation, not a retry, so it does not
+        # spend the retry budget — but it is bounded by the number of styles.
+        transport_probes = 0
+        attempt = 0
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        while attempt < MAX_ATTEMPTS:
+            attempt += 1
+            headers, params = auth_transport(self.base_url, self.api_key, self.auth_style)
             try:
-                response = self._client.post(url, headers=self._headers(), json=payload)
+                response = self._client.post(url, headers=headers, params=params, json=payload)
             except httpx.HTTPError as exc:
                 last_exc = exc
-                logger.debug("%s: transport error on attempt %d/%d: %s", self.name, attempt, MAX_ATTEMPTS, exc)
+                logger.debug("%s: transport error on attempt %d/%d: %s", self.name, attempt, MAX_ATTEMPTS, self._redact(str(exc)))
                 if attempt == MAX_ATTEMPTS:
                     break
                 self._sleep(attempt, None)
@@ -556,16 +719,30 @@ class OpenAICompatClient:
                     data = response.json()
                 except (json.JSONDecodeError, ValueError) as exc:
                     last_exc = exc
-                    logger.debug("%s: non-JSON body on a %d response: %s", self.name, status, exc)
+                    logger.debug("%s: non-JSON body on a %d response: %s", self.name, status, self._redact(str(exc)))
                     if attempt == MAX_ATTEMPTS:
                         break
                     self._sleep(attempt, None)
                     continue
                 _AUTH_FAILURES.pop(self.base_url, None)  # the credential works
+                if _AUTH_STYLE_CACHE.get(self.base_url) != self.auth_style:
+                    _AUTH_STYLE_CACHE[self.base_url] = self.auth_style
+                    if self.auth_style != AuthStyle.BEARER:
+                        logger.info("%s: authenticating with the %s transport", self.name, self.auth_style)
                 return data
 
             body = _safe_body(response)
-            message = _error_message(body)
+            message = self._redact(_error_message(body))
+            body = self._redact(body)
+
+            # Before anything else: did we present the credential the wrong way?
+            # A 400 "Missing or invalid Authorization header" says nothing about
+            # whether the key is good, so switching transports is free of charge.
+            if _looks_wrong_auth_transport(status, body) and transport_probes < len(AuthStyle.ORDER):
+                if self._demote_auth_style(message) is not None:
+                    transport_probes += 1
+                    attempt -= 1  # negotiation, not a retry
+                    continue
 
             # Checked BEFORE the capability probe: Google's dead-model 404 says
             # "... or is not supported for generateContent", which would
@@ -593,8 +770,16 @@ class OpenAICompatClient:
                     "%s: HTTP %d looks transient on attempt %d/%d: %s",
                     self.name, status, attempt, MAX_ATTEMPTS, message,
                 )
-                self._sleep(attempt, _retry_after_seconds(response))
+                self._sleep(attempt, _retry_after_seconds(response, body))
                 continue
+
+            if status == 429 and _is_daily_quota(body):
+                # A per-day quota will not come back before this run ends.
+                raise _QuotaExhausted(
+                    f"{self.name} daily free-tier quota is exhausted for {self.model} — "
+                    f"retrying will not help today. Set LEA_MODEL to another model "
+                    f"(`lea doctor --models`) or wait for the quota to reset: {message}"
+                )
 
             if status == 429 or status >= 500:
                 last_exc = httpx.HTTPStatusError(
@@ -602,7 +787,7 @@ class OpenAICompatClient:
                 )
                 if attempt == MAX_ATTEMPTS:
                     break
-                wait = _retry_after_seconds(response)
+                wait = _retry_after_seconds(response, body)
                 logger.debug(
                     "%s: HTTP %d on attempt %d/%d%s",
                     self.name, status, attempt, MAX_ATTEMPTS,
@@ -616,7 +801,7 @@ class OpenAICompatClient:
 
         # The caller logs one WARNING for the failed step; logging here too would
         # double every failure in the rendered trace.
-        logger.debug("%s: request failed after %d attempts: %s", self.name, MAX_ATTEMPTS, last_exc)
+        logger.debug("%s: request failed after %d attempts: %s", self.name, MAX_ATTEMPTS, self._redact(str(last_exc)))
         raise last_exc or RuntimeError(f"{self.name}: request failed after {MAX_ATTEMPTS} attempts")
 
     def _resolve_dead_model(self, body: str) -> Optional[str]:
@@ -900,7 +1085,7 @@ class OpenAICompatClient:
             )
             return parsed, usage
         except Exception as exc:  # noqa: BLE001 - repair is best-effort by definition
-            logger.warning("%s: repair retry failed: %s", self.name, _describe_exception(exc))
+            logger.warning("%s: repair retry failed: %s", self.name, self._redact(_describe_exception(exc)))
             return None, LLMUsage(model=self.model)
 
     # -- LLMClient -------------------------------------------------------
@@ -935,7 +1120,7 @@ class OpenAICompatClient:
                 max_tokens=1024,
             )
         except Exception as exc:  # noqa: BLE001 - must never raise into the loop
-            detail = _describe_exception(exc)
+            detail = self._redact(_describe_exception(exc))
             logger.warning("decide(): %s call failed: %s", self.name, detail)
             return (
                 AgentAction(tool=ToolName.FINISH, thought=f"LLM error: {detail}"),
@@ -981,7 +1166,7 @@ class OpenAICompatClient:
                 max_tokens=4096,
             )
         except Exception as exc:  # noqa: BLE001 - must never raise into the loop
-            logger.warning("extract(): %s call failed: %s", self.name, _describe_exception(exc))
+            logger.warning("extract(): %s call failed: %s", self.name, self._redact(_describe_exception(exc)))
             return best_effort_instance(schema_model), LLMUsage(model=self.model)
 
         total = usage
@@ -1072,6 +1257,15 @@ def _action_from_payload(
         return AgentAction(tool=ToolName.FINISH, thought="LLM error: invalid action."), usage
 
 
+#: `?key=<secret>` can surface in an httpx error's URL. Strip it regardless of
+#: which key it is — this must not depend on knowing the credential.
+_QUERY_KEY_RE = re.compile(r"([?&](?:key|api_key|access_token)=)[^&\s\"']+", re.IGNORECASE)
+
+
+def _redact_query_key(text: str) -> str:
+    return _QUERY_KEY_RE.sub(r"\1<redacted>", text or "")
+
+
 def _describe_exception(exc: BaseException) -> str:
     """A single clean line for the agent trace — no JSON braces, no newlines."""
     if isinstance(exc, (_AuthFailure, _Unsupported)):
@@ -1082,7 +1276,7 @@ def _describe_exception(exc: BaseException) -> str:
         text = f"network error: {exc}"
     else:
         text = f"{type(exc).__name__}: {exc}"
-    flat = " ".join(str(text).split())
+    flat = " ".join(_redact_query_key(str(text)).split())
     return flat[:299] + "…" if len(flat) > 300 else flat
 
 
@@ -1145,22 +1339,24 @@ def list_models(settings: Settings, provider: Optional[str] = None) -> list[str]
     if not base_url:
         return []
 
-    headers = {"Accept": "application/json"}
-    key = settings.key_for(name)
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    # Use whatever transport this endpoint already accepted, so discovery does
+    # not fail on an endpoint the chat path has successfully negotiated.
+    base = base_url.rstrip("/")
+    headers, params = auth_transport(base, settings.key_for(name))
+    headers["Accept"] = "application/json"
 
     try:
         response = httpx.get(
-            f"{base_url.rstrip('/')}/models",
+            f"{base}/models",
             headers=headers,
+            params=params,
             timeout=max(10.0, settings.http_timeout_s),
             follow_redirects=True,
         )
         response.raise_for_status()
         data = response.json()
     except Exception as exc:  # noqa: BLE001 - any failure is just "no list"
-        logger.debug("list_models(%s): %s: %s", name, type(exc).__name__, exc)
+        logger.debug("list_models(%s): %s: %s", name, type(exc).__name__, _redact_query_key(str(exc)))
         return []
 
     rows = data.get("data") if isinstance(data, dict) else data

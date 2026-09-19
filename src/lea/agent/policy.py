@@ -143,6 +143,19 @@ class Budget:
             "seconds": max(0.0, round(self.total_timeout_s - self.elapsed_s(), 1)),
         }
 
+    def used(self) -> dict[str, Any]:
+        """Spend so far, as x/y pairs.
+
+        Separate from `remaining()` because the *balance* is what steers: "4 of 5
+        searches, 2 of 6 pages" tells a model it is over-searching in a way that
+        "1 search left" does not.
+        """
+        return {
+            "steps_used": f"{self.steps}/{self.max_steps}",
+            "searches_used": f"{self.searches}/{self.max_searches}",
+            "fetches_used": f"{self.fetches}/{self.max_fetches}",
+        }
+
     def exhausted_reason(self) -> Optional[str]:
         """A human-readable reason the run must stop, or None."""
         if self.deadline_passed():
@@ -321,6 +334,103 @@ def is_redundant(action: AgentAction, history: Iterable[TraceStep]) -> Optional[
 
 
 # --------------------------------------------------------------------------
+# Search/fetch balance
+#
+# The failure this exists for: the agent searches, reads the snippets, searches
+# again. Snippets do not contain HQ, founding year or headcount — page bodies do.
+# A run that spends 4 of 5 searches and 2 of 6 fetches has usually left the answer
+# sitting unopened in its own search results.
+# --------------------------------------------------------------------------
+
+# How many times the loop may push back on searching while sources sit unread.
+MAX_SEARCH_PUSHBACKS = 2
+
+# Extra dead steps tolerated when there IS still a rescue available (unread URLs
+# plus fetch budget). Stopping there would cut the run off exactly when redirecting
+# it would have saved it.
+STALL_GRACE_WITH_UNREAD = 2
+
+
+def seen_urls(history: Iterable[TraceStep]) -> list[str]:
+    """Every URL search results have surfaced, in order of first appearance."""
+    out: list[str] = []
+    for s in history:
+        if s.tool != ToolName.WEB_SEARCH or not s.ok:
+            continue
+        for u in s.sources:
+            if u and u not in out:
+                out.append(u)
+    return out
+
+
+def fetched_urls(history: Iterable[TraceStep]) -> set[str]:
+    """Normalized URLs some fetch/detect step has already opened."""
+    read: set[str] = set()
+    for s in history:
+        if s.tool not in _FETCHING_TOOLS:
+            continue
+        norm = normalize_url(_arg(s.args, "url", "page", "link", "domain"))
+        if norm:
+            read.add(norm)
+    return read
+
+
+def unread_urls(history: Iterable[TraceStep]) -> list[str]:
+    """Search hits nobody has opened yet — the agent's own unexploited evidence."""
+    steps = list(history)
+    read = fetched_urls(steps)
+    return [u for u in seen_urls(steps) if normalize_url(u) not in read]
+
+
+def search_without_reading_reason(
+    action: AgentAction,
+    history: Iterable[TraceStep],
+    pushbacks: int = 0,
+    can_fetch: bool = True,
+) -> Optional[str]:
+    """Reason to reconsider a back-to-back search, or None.
+
+    Fires only when all of these hold, so it cannot punish a legitimate re-search:
+      - this action is a search,
+      - the previous research step was ALSO a search (no fetch in between),
+      - that search left URLs nobody has opened,
+      - and there is fetch budget to open one.
+    A second search after an empty first one is exactly right, produces no unread
+    URLs, and stays quiet. So does one made with no fetch budget left: advising a
+    fetch the agent cannot afford would just burn its remaining steps.
+    """
+    if action.tool != ToolName.WEB_SEARCH:
+        return None
+    if pushbacks >= MAX_SEARCH_PUSHBACKS or not can_fetch:
+        return None
+
+    steps = list(history)
+    # The last real research step — guard feedback is the loop talking, not a move.
+    prior = None
+    for s in reversed(steps):
+        if s.error in GUARD_ERRORS:
+            continue
+        if s.tool in (ToolName.WEB_SEARCH, *_FETCHING_TOOLS):
+            prior = s
+            break
+    if prior is None or prior.tool != ToolName.WEB_SEARCH:
+        return None
+
+    unread = unread_urls(steps)
+    if not unread:
+        return None
+
+    sample = ", ".join(unread[:3])
+    more = f" (+{len(unread) - 3} more)" if len(unread) > 3 else ""
+    return (
+        f"you searched last step and have not opened anything since, but {len(unread)} URL(s) "
+        f"from your own results are still unread: {sample}{more}. Snippets rarely carry "
+        "headquarters, founding year or headcount — page bodies do. Fetch one of these "
+        "before searching again, unless none of them could possibly help."
+    )
+
+
+# --------------------------------------------------------------------------
 # Gaps and stop conditions
 # --------------------------------------------------------------------------
 
@@ -360,7 +470,7 @@ def gap_labels(gaps: Iterable[str]) -> list[str]:
 
 # Steps the loop generated to talk to the model (redundancy guard, finish pushback)
 # rather than results from the outside world.
-GUARD_ERRORS = {"redundant", "premature finish"}
+GUARD_ERRORS = {"redundant", "premature finish", "unread sources"}
 
 
 def _consecutive_dead_steps(history: list[TraceStep]) -> int:
@@ -415,8 +525,16 @@ _AUTH_MARKERS = (
     "invalid_api_key", "permission denied", "credential", "forbidden",
 )
 
+# Free tiers rate-limit constantly, and "every LLM call failed" reads like a broken
+# setup when the real answer is "wait a minute, or use another free provider".
+_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit", "quota", "too many requests", "resource_exhausted")
+
 MODELS_HINT = "run `lea doctor --models` to see what your provider actually serves, then set LEA_MODEL"
 KEY_HINT = "check the key for that provider (`lea doctor` shows which one is in use)"
+RATE_HINT = (
+    "wait for the window to reset, or switch provider (`lea doctor` lists the free ones) — "
+    "nothing is wrong with your setup"
+)
 
 
 def truncate_words(text: str, limit: int, ellipsis: str = "…") -> str:
@@ -448,8 +566,17 @@ def llm_error_detail(action: AgentAction) -> Optional[str]:
     return thought if thought.lower().startswith(_LLM_ERROR_PREFIX) else None
 
 
+def looks_like_rate_limit(text: str) -> bool:
+    return any(m in (text or "").lower() for m in _RATE_LIMIT_MARKERS)
+
+
 def looks_like_auth_failure(text: str) -> bool:
-    return any(m in (text or "").lower() for m in _AUTH_MARKERS)
+    t = (text or "").lower()
+    # A quota message often mentions "plan and billing details", which is not an
+    # auth problem — the key is fine, it is just spent.
+    if looks_like_rate_limit(t):
+        return False
+    return any(m in t for m in _AUTH_MARKERS)
 
 
 def looks_like_stale_model(text: str) -> bool:
@@ -469,6 +596,11 @@ def llm_failure_stop_reason(details: list[str], provider: str = "", model: str =
     """
     first = truncate_words((details[0] if details else "").strip(), 180)
     where = "/".join(p for p in (provider, model) if p) or "the configured LLM"
+    if looks_like_rate_limit(first):
+        return (
+            f"{STOP_ERROR}: {where} rate-limited every request ({first}). "
+            f"That is a quota problem, not a research one — {RATE_HINT}."
+        )
     if looks_like_auth_failure(first):
         return (
             f"{STOP_ERROR}: {where} rejected every request ({first}). "
@@ -555,7 +687,13 @@ def should_stop(
         return f"{STOP_COMPLETE}: all priority fields resolved"
 
     dead = _consecutive_dead_steps(history)
-    if dead >= MAX_CONSECUTIVE_DEAD_STEPS:
+    # A rescue is available when the agent's own search results contain something it
+    # has never opened and there is fetch budget to open it. Stopping at the normal
+    # threshold there ends the run at the exact moment a redirect would have saved
+    # it, so the leash gets a bounded extension. max_steps still caps the run.
+    rescuable = bool(unread_urls(history)) and budget.allows(ToolName.FETCH_PAGE)
+    limit = MAX_CONSECUTIVE_DEAD_STEPS + (STALL_GRACE_WITH_UNREAD if rescuable else 0)
+    if dead >= limit:
         # A stall is never "done" — say so, so nobody reads the output as an answer.
         if not learned_anything(history):
             return f"{STOP_BLOCKED}: {dead} consecutive failed steps, nothing learned"

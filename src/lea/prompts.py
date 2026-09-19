@@ -40,15 +40,38 @@ irreversible thing you can do here, so spend it like it is yours.
 - Never repeat a search you already ran or fetch a URL you already fetched. The trace \
 below shows you exactly what you have already done and what it gave you.
 
-WHERE FACTS LIVE (use the cheapest source that can answer the question)
-- Firmographics — what the company does, industry, HQ, founding year, size, positioning: \
-the company's OWN site (homepage, /about, /company). Treat directory aggregators as a \
-hint, never as the source of record.
-- Signals — funding, launches, leadership changes, partnerships: news, press releases, \
-the company blog. Prefer dated items; an undated claim is weak evidence.
-- Hiring signals: the careers/jobs page. Open roles and their departments say more about \
-where a company is investing than any press release.
-- Technology: the rendered homepage and its scripts, via the tech-detection tool.
+TWO TOOLS, TWO DIFFERENT JOBS — this is the thing agents get wrong
+- `web_search` LOCATES documents. It gives you titles, URLs and ~150-character snippets. \
+A snippet is an index card: it tells you which page is worth opening. It is NOT evidence, \
+and it is not where facts live.
+- `fetch_page` READS a document. This is where facts live. Nearly everything you are asked \
+for is page-shaped, not snippet-shaped:
+    headquarters city · founding year · employee count · what the company actually sells ·
+    funding amount and round name · number of open roles · the date of an announcement
+- Searching again for a page-shaped fact does not work. It returns the same kind of snippet \
+you already have. If you catch yourself thinking "I still need the HQ / founding year / \
+headcount / the funding details", that is a FETCH instruction, not a search instruction — \
+open the company's /about or /company page, or open the article you already found.
+- A run that ends with more searches than page reads has almost certainly failed: it \
+collected links and never opened them.
+
+DEFAULT RHYTHM (a strong default, not a script)
+- After a search returns plausible URLs, your next step should normally be to OPEN one of them.
+- Two searches in a row are justified only when (a) the previous search returned nothing \
+usable, or (b) you are starting a genuinely new line of enquiry — e.g. firmographics are \
+done and you are now hunting funding or hiring news.
+- You may override this default. If you do, say why in your `thought`.
+
+WHERE EACH KIND OF FACT LIVES
+- Firmographics — what they sell, industry, HQ, founding year, size: the company's OWN site \
+(homepage, /about, /company, /contact, the footer). Read the page. Directory profiles \
+(Crunchbase, LinkedIn) are a usable fallback, but still only when you OPEN them.
+- Signals — funding, launches, leadership changes, partnerships: news articles, press \
+releases, the company blog. Open the article; a headline in a snippet gives you the event \
+but not the amount, the round, the investors or the date.
+- Hiring: the careers/jobs page. Open roles and their departments say more about where a \
+company is investing than any press release.
+- Technology: run `detect_tech` on the homepage once you have fetched it.
 
 EVIDENCE DISCIPLINE
 - Never invent a fact. If the web did not say it, it is unknown, and "unknown" is a \
@@ -74,12 +97,42 @@ EXTRACTION_SYSTEM = """\
 You are an information extraction engine for a GTM research pipeline. You are given \
 numbered evidence blocks, each with its source URL, and a schema to fill.
 
+READ THE WHOLE BLOCK BEFORE DECLARING ANYTHING UNKNOWN
+Evidence blocks are raw page text, not summaries. The fact you need is usually mid-\
+paragraph, in a footer address line, in an "our story" aside or in a headline. Scan the \
+whole block. Under-reading is as damaging as inventing: a field left null when the \
+evidence plainly states it is a bug, not caution.
+These are all sufficient evidence, and you should extract from them:
+- "Headquartered in San Francisco, California"  -> hq_city "San Francisco", hq_country "United States"
+- "228 Park Ave S, New York, NY 10003"          -> hq_city "New York", hq_country "United States"
+- "Founded in 2018" / "since 2018" / "est. 2018" -> founded_year 2018
+- "our team of 1,200 people" / "1,200 employees" -> employee_estimate 1200
+- "Vanta raises $150M Series C led by Sequoia"   -> a funding Signal: amount $150M, round Series C
+- "We have 140 open roles"                       -> a hiring Signal
+- "compliance automation platform for SOC 2 and ISO 27001" -> industry from what they SELL
+
+INDUSTRY MUST BE SPECIFIC
+`industry` names the category the company SELLS INTO, in the words its own site uses.
+"Software", "Technology", "SaaS", "B2B" and "Software & Technology" are umbrellas, not
+industries — they describe almost every company in this pipeline and are useless to a
+sales team segmenting accounts. Name the actual category:
+  Security & Compliance · Fintech · Developer Tools · Data & Analytics · HR & Payroll ·
+  Martech · Healthtech · Logistics · E-commerce · Insurtech · Legaltech
+Use `sub_industry` for the sharper specialisation ("Compliance Automation", "Spend
+Management"). If the evidence only supports an umbrella term, prefer leaving `industry`
+null over recording one.
+A US state or a postal code implies the country. A headline that names an event IS a \
+signal, even if the article body is not in the evidence — record it with whatever detail \
+the text does carry and cite the block.
+
 RULES
-- Fill a field ONLY when an evidence block supports it. Every non-obvious field must be \
+- Fill a field when an evidence block supports it. Every non-obvious field must be \
 traceable to a specific block — if asked for reasoning or evidence, cite the source URL \
 of the block you used.
-- If the evidence does not establish a field, leave it null / empty. Do not guess, do not \
-round a "feels about right" number, do not infer a headquarters from a top-level domain.
+- If the evidence genuinely does not establish a field, leave it null / empty. Do not \
+guess, do not round a "feels about right" number, do not infer a headquarters from a \
+top-level domain. "Not stated anywhere in the blocks" is unknown; "stated in different \
+words than the field name" is not.
 - Where the schema has an `unknowns` list, name the fields you could not establish.
 - Where the schema has a `sources` list, include the URLs of the blocks you actually used.
 - Prefer the company's own pages over third-party summaries when they disagree, and say \
@@ -179,6 +232,30 @@ than inventing material. Two grounded hooks beat three with one fabrication.
 
 _SKIP_WHEN_EMPTY = ("", None, [], {})
 
+#: Where each unknown actually lives. An unknown that is page-shaped should read
+#: as a fetch instruction, not as an invitation to search again — the observed
+#: failure was a model thinking "I need HQ, founded year, headcount" and issuing
+#: another search, none of which can carry those facts.
+_GAP_GUIDANCE = {
+    "company_name": "the homepage <title> or /about — confirm it on the page",
+    "domain": "the search results themselves carry this",
+    "description": "the homepage hero text or /about — read the page, not the snippet",
+    "industry": "how the company describes what it SELLS on its own homepage/about page",
+    "sub_industry": "the product or solutions pages",
+    "employee_range": "an /about, /company or careers page, or an opened directory profile — never a snippet",
+    "employee_estimate": "an /about, /company or careers page, or an opened directory profile — never a snippet",
+    "hq_city": "/about, /contact, or the page footer — a search snippet almost never carries this",
+    "hq_country": "/about, /contact, or the page footer — a search snippet almost never carries this",
+    "founded_year": "the 'our story' text on /about or /company, or an opened directory profile — you must open the page",
+    "signals": "open a dated news article, press release or blog post — a headline alone gives you no amount, round or date",
+    "tech_stack": "run detect_tech on the fetched homepage",
+    "hooks": "derived later from the signals you gather — no step needed",
+    "icp_fit": "scored later from the record — no step needed",
+}
+
+#: Gaps nothing can research directly; never nag the model about these.
+_DERIVED_GAPS = frozenset({"hooks", "icp_fit", "unknowns", "sources", "input"})
+
 # Fields worth showing the agent as "known / still unknown".
 _INTERESTING_FIELDS = (
     "company_name",
@@ -224,6 +301,44 @@ def _fmt_args(args: Any) -> str:
     return ", ".join(parts)
 
 
+def _tool_usage(steps: Sequence[Any]) -> dict[str, int]:
+    """How many times each tool has actually run."""
+    counts = {"web_search": 0, "fetch_page": 0, "detect_tech": 0, "finish": 0}
+    for raw in steps:
+        s = _as_dict(raw)
+        tool = s.get("tool")
+        name = str(getattr(tool, "value", tool) or "")
+        if name in counts:
+            counts[name] += 1
+    return counts
+
+
+def _unread_urls(steps: Sequence[Any]) -> list[str]:
+    """Links the agent has been handed but never opened, in discovery order."""
+    seen: list[str] = []
+    opened: set[str] = set()
+    for raw in steps:
+        s = _as_dict(raw)
+        tool = str(getattr(s.get("tool"), "value", s.get("tool")) or "")
+        args = _as_dict(s.get("args"))
+        if tool in ("fetch_page", "detect_tech"):
+            for value in args.values():
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    opened.add(value.rstrip("/"))
+        for url in s.get("sources") or []:
+            url = str(url)
+            if url.startswith(("http://", "https://")) and url not in seen:
+                seen.append(url)
+    return [u for u in seen if u.rstrip("/") not in opened]
+
+
+def _last_tool(steps: Sequence[Any]) -> str:
+    if not steps:
+        return ""
+    tool = _as_dict(steps[-1]).get("tool")
+    return str(getattr(tool, "value", tool) or "")
+
+
 def build_agent_context(
     target: str,
     record_so_far: Any = None,
@@ -267,10 +382,15 @@ def build_agent_context(
     lines.extend(known or ["  (nothing yet)"])
 
     lines.append("")
-    lines.append("STILL UNKNOWN:")
+    lines.append("STILL UNKNOWN — and where each one actually lives:")
     gaps = [g for g in (known_gaps or []) if g]
-    gap_list = list(dict.fromkeys([*gaps, *missing]))
-    lines.extend([f"  - {g}" for g in gap_list] or ["  (nothing outstanding)"])
+    gap_list = [g for g in dict.fromkeys([*gaps, *missing]) if g not in _DERIVED_GAPS]
+    if gap_list:
+        for gap in gap_list:
+            hint = _GAP_GUIDANCE.get(gap)
+            lines.append(f"  - {gap}" + (f" — {hint}" if hint else ""))
+    else:
+        lines.append("  (nothing outstanding)")
 
     # --- what has already been tried ------------------------------------
     lines.append("")
@@ -293,18 +413,50 @@ def build_agent_context(
     else:
         lines.append("STEPS ALREADY TAKEN (0): this is your first move.")
 
-    # --- budget ----------------------------------------------------------
+    # --- how the effort has actually been spent --------------------------
+    used = _tool_usage(steps)
+    n_searched, n_read = used["web_search"], used["fetch_page"]
+    unread = _unread_urls(steps)
+
     lines.append("")
-    lines.append("REMAINING BUDGET:")
+    lines.append("EVIDENCE POSITION:")
     steps_left = budget.get("steps", budget.get("max_steps", "?"))
     searches_left = budget.get("searches", budget.get("max_searches", "?"))
     fetches_left = budget.get("fetches", budget.get("max_fetches", "?"))
+    lines.append(f"  searches: {n_searched} used / {searches_left} left")
+    lines.append(f"  pages read: {n_read} / {fetches_left} left")
     lines.append(f"  steps={steps_left}  searches={searches_left}  fetches={fetches_left}")
     for key, value in budget.items():
         if key not in ("steps", "searches", "fetches", "max_steps", "max_searches", "max_fetches"):
             lines.append(f"  {key}={value}")
+
+    # The single most useful thing to put in front of the model: the links it
+    # has collected and never opened.
+    lines.append("")
+    if unread:
+        lines.append(f"URLS FOUND BUT NOT YET READ ({len(unread)}) — these are your cheapest source of facts:")
+        lines.extend(f"  - {url}" for url in unread[:12])
+        if len(unread) > 12:
+            lines.append(f"  … and {len(unread) - 12} more")
+    else:
+        lines.append("URLS FOUND BUT NOT YET READ (0): every link you have found has been opened.")
+
+    # --- the nudge -------------------------------------------------------
+    lines.append("")
     if isinstance(steps_left, int) and steps_left <= 1:
-        lines.append("  NOTE: budget is nearly spent — call finish unless one step clearly matters more.")
+        lines.append("BUDGET IS NEARLY SPENT — call finish unless one step clearly matters more.")
+    elif unread and n_searched > n_read:
+        lines.append(
+            f"NOTE: you have run {n_searched} search(es) and opened {n_read} page(s), with "
+            f"{len(unread)} link(s) still unread. Searching again will return more snippets, not "
+            "more facts. Unless every unread link above is irrelevant, open one now — and if you "
+            "search instead, say in your thought why none of them is worth opening."
+        )
+    elif unread and _last_tool(steps) == "web_search":
+        lines.append(
+            "NOTE: your last step was a search and it returned links you have not opened. "
+            "Reading one is normally the right next move."
+        )
 
     lines.append("")
     lines.append("Choose the single next action that closes the most valuable gap above.")

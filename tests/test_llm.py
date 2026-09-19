@@ -2060,6 +2060,322 @@ def test_reset_provider_state_clears_the_model_cache():
     assert _MODEL_RESOLUTION == {}
 
 
+# --- auth transport negotiation ---------------------------------------------
+#
+# Measured against Google's live endpoint: the OpenAI-compat path 400s
+# x-goog-api-key and ?key= with "Missing or invalid Authorization header"
+# *before* it evaluates the key, while the native path accepts both. Rather
+# than encode a belief about which is right this month, negotiate it.
+
+WRONG_TRANSPORT_400 = httpx.Response(
+    400, json={"error": {"code": 400, "message": "Missing or invalid Authorization header", "status": "INVALID_ARGUMENT"}}
+)
+WRONG_CREDENTIAL_TYPE_401 = httpx.Response(
+    401, json={"error": {"code": 401, "message": "Expected OAuth 2 access token", "status": "UNAUTHENTICATED"}}
+)
+BAD_KEY_401 = httpx.Response(
+    401, json={"error": {"code": 401, "message": "API key not valid. Please pass a valid API key.", "status": "UNAUTHENTICATED"}}
+)
+
+SECRET = "AQ.Ab8RN6super-secret-value"
+
+
+def _keyed_google_client(key: str = SECRET) -> OpenAICompatClient:
+    return OpenAICompatClient(
+        Settings(llm_provider="google", llm_api_key=key, model="gemini-3.5-flash"), provider="google"
+    )
+
+
+def _auth_of(request) -> tuple[str, str, str]:
+    """(bearer, x-goog-api-key, ?key=) as actually seen on the wire."""
+    return (
+        request.headers.get("authorization", ""),
+        request.headers.get("x-goog-api-key", ""),
+        httpx.URL(str(request.url)).params.get("key", ""),
+    )
+
+
+@respx.mock
+def test_bearer_is_tried_first_and_kept_when_accepted():
+    route = respx.post(GOOGLE_URL).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    client = _keyed_google_client()
+    for _ in range(3):
+        assert client.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+
+    assert route.call_count == 3, "a working transport must never be re-probed"
+    for call in route.calls:
+        assert _auth_of(call.request) == (f"Bearer {SECRET}", "", "")
+    assert client.auth_style == "bearer"
+
+
+@respx.mock
+def test_bearer_rejected_by_transport_demotes_to_the_google_header():
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[WRONG_TRANSPORT_400, httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS))]
+    )
+    client = _keyed_google_client()
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 2
+    assert _auth_of(route.calls[0].request) == (f"Bearer {SECRET}", "", "")
+    assert _auth_of(route.calls[1].request) == ("", SECRET, "")
+    assert client.auth_style == "header"
+
+
+@respx.mock
+def test_both_header_transports_rejected_falls_through_to_the_query_param():
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            WRONG_TRANSPORT_400,
+            WRONG_CREDENTIAL_TYPE_401,
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _keyed_google_client()
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 3
+    assert [_auth_of(c.request) for c in route.calls] == [
+        (f"Bearer {SECRET}", "", ""),
+        ("", SECRET, ""),
+        ("", "", SECRET),
+    ]
+    assert client.auth_style == "query"
+
+
+@respx.mock
+def test_the_key_is_never_sent_in_two_places_at_once():
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            WRONG_TRANSPORT_400,
+            WRONG_CREDENTIAL_TYPE_401,
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    _keyed_google_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    for call in route.calls:
+        carriers = [v for v in _auth_of(call.request) if v]
+        assert len(carriers) == 1, f"the credential must travel exactly once, saw {len(carriers)}"
+
+
+@respx.mock
+def test_an_invalid_key_does_not_cycle_transports():
+    """Three transports against a revoked key just triples an inevitable failure."""
+    route = respx.post(GOOGLE_URL).mock(return_value=BAD_KEY_401)
+    client = _keyed_google_client()
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert route.call_count == 1, "fail fast on a bad key, do not negotiate"
+    assert "API key" in action.thought
+    assert client.auth_style == "bearer", "a bad key must not poison the transport cache"
+
+
+@respx.mock
+def test_a_bad_key_that_also_names_a_transport_does_not_cycle():
+    """The real live 401: 'Request had invalid authentication credentials.
+    Expected OAuth 2 access token.' names a credential TYPE and also says the
+    credential is invalid. The bad-key reading must win over negotiation."""
+    route = respx.post(GOOGLE_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={
+                "error": {
+                    "code": 401,
+                    "message": (
+                        "Request had invalid authentication credentials. Expected OAuth 2 "
+                        "access token, login cookie or other valid authentication credential."
+                    ),
+                    "status": "UNAUTHENTICATED",
+                }
+            },
+        )
+    )
+    client = _keyed_google_client()
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert route.call_count == 1, "an invalid credential must not be re-presented three ways"
+    assert client.auth_style == "bearer"
+
+
+@respx.mock
+def test_the_negotiated_transport_is_cached_across_a_whole_run():
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[WRONG_TRANSPORT_400] + [httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS))] * 10
+    )
+    client = _keyed_google_client()
+    for _ in range(10):
+        assert client.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+
+    assert route.call_count == 11, "one negotiation, then ten clean calls"
+    for call in route.calls[1:]:
+        assert _auth_of(call.request) == ("", SECRET, "")
+
+
+@respx.mock
+def test_a_fresh_client_reuses_the_negotiated_transport():
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[WRONG_TRANSPORT_400] + [httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS))] * 3
+    )
+    _keyed_google_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    fresh = _keyed_google_client()
+    assert fresh.auth_style == "header"
+    assert fresh.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+    assert route.call_count == 3  # 2 for the first client, 1 for the second
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "pin,expected",
+    [("query", ("", "", SECRET)), ("header", ("", SECRET, "")), ("bearer", (f"Bearer {SECRET}", "", ""))],
+)
+def test_auth_style_can_be_pinned_and_skips_negotiation(monkeypatch, pin, expected):
+    monkeypatch.setenv("LEA_LLM_AUTH_STYLE", pin)
+    route = respx.post(GOOGLE_URL).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    client = _keyed_google_client()
+
+    assert client.auth_style == pin
+    assert client.decide("sys", "TARGET: Acme", TOOL_SPECS)[0].tool is ToolName.WEB_SEARCH
+    assert route.call_count == 1
+    assert _auth_of(route.calls[0].request) == expected
+
+
+@respx.mock
+def test_a_pinned_style_is_never_demoted(monkeypatch):
+    """If the operator pinned it, respect it rather than second-guessing."""
+    monkeypatch.setenv("LEA_LLM_AUTH_STYLE", "bearer")
+    route = respx.post(GOOGLE_URL).mock(return_value=WRONG_TRANSPORT_400)
+    client = _keyed_google_client()
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert client.auth_style == "bearer"
+    assert route.call_count == 1, "a pinned transport must not be probed around"
+    assert _auth_of(route.calls[0].request) == (f"Bearer {SECRET}", "", "")
+
+
+def test_an_unknown_pin_falls_back_to_negotiation(monkeypatch, caplog):
+    from lea.llm.openai_compat import pinned_auth_style
+
+    monkeypatch.setenv("LEA_LLM_AUTH_STYLE", "carrier-pigeon")
+    with caplog.at_level("WARNING", logger="lea.llm.openai_compat"):
+        assert pinned_auth_style() is None
+    assert any("LEA_LLM_AUTH_STYLE" in r.getMessage() for r in caplog.records)
+
+
+@respx.mock
+def test_the_key_never_appears_in_logs_or_the_trace(caplog):
+    """Providers sometimes echo the credential back inside the error body."""
+    respx.post(GOOGLE_URL).mock(
+        return_value=httpx.Response(401, json={"error": {"code": 401, "message": f"API key not valid: {SECRET}"}})
+    )
+    with caplog.at_level("DEBUG", logger="lea.llm.openai_compat"):
+        action, _ = _keyed_google_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert SECRET not in action.thought
+    assert "<redacted>" in action.thought
+    for record in caplog.records:
+        assert SECRET not in record.getMessage()
+
+
+@respx.mock
+def test_a_query_param_key_is_redacted_from_error_text(caplog):
+    respx.post(GOOGLE_URL).mock(side_effect=httpx.ConnectError(f"failed connecting to {GOOGLE_URL}?key={SECRET}"))
+    with caplog.at_level("DEBUG", logger="lea.llm.openai_compat"):
+        action, _ = _keyed_google_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert SECRET not in action.thought
+    for record in caplog.records:
+        assert SECRET not in record.getMessage()
+
+
+@respx.mock
+def test_a_keyless_endpoint_sends_no_credential_in_any_transport():
+    url = "http://localhost:11434/v1/chat/completions"
+    route = respx.post(url).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    OpenAICompatClient(Settings(llm_provider="ollama"), provider="ollama").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert _auth_of(route.calls[0].request) == ("", "", "")
+
+
+@respx.mock
+def test_transport_negotiation_does_not_consume_the_retry_budget():
+    """Probing is negotiation, not a retry: a 429 after it must still get retries."""
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            WRONG_TRANSPORT_400,
+            *[httpx.Response(429, headers={"Retry-After": "1"}, json={"error": {"message": "slow down"}})] * 3,
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    action, _ = _keyed_google_client().decide("sys", "TARGET: Acme", TOOL_SPECS)
+    # One probe + a full MAX_ATTEMPTS budget of real retries. If the probe were
+    # counted as a retry, the run would die on the last 429 instead.
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 1 + MAX_ATTEMPTS
+
+
+@respx.mock
+def test_model_discovery_uses_the_negotiated_transport():
+    """`list_models` must not re-fail on an endpoint the chat path already solved."""
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[WRONG_TRANSPORT_400, httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS))]
+    )
+    models = respx.get(GOOGLE_MODELS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "models/gemini-3.5-flash"}]})
+    )
+    settings = Settings(llm_provider="google", llm_api_key=SECRET, model="gemini-3.5-flash")
+    OpenAICompatClient(settings, provider="google").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert list_models(settings, provider="google") == ["gemini-3.5-flash"]
+    assert _auth_of(models.calls[0].request) == ("", SECRET, ""), "discovery must reuse the negotiated transport"
+
+
+@respx.mock
+def test_model_discovery_defaults_to_bearer_before_any_negotiation():
+    models = respx.get(GOOGLE_MODELS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "models/gemini-3.5-flash"}]})
+    )
+    settings = Settings(llm_provider="google", llm_api_key=SECRET, model="gemini-3.5-flash")
+    assert list_models(settings, provider="google") == ["gemini-3.5-flash"]
+    assert _auth_of(models.calls[0].request) == (f"Bearer {SECRET}", "", "")
+
+
+def test_reset_provider_state_clears_the_transport_cache():
+    from lea.llm.openai_compat import _AUTH_STYLE_CACHE
+
+    _AUTH_STYLE_CACHE["https://x/v1"] = "query"
+    reset_provider_state()
+    assert _AUTH_STYLE_CACHE == {}
+
+
+def test_no_key_format_validation_exists_anywhere_in_scope():
+    """Key formats are the provider's business. Google shipped an `AQ.` format
+    that a naive `startswith("AIza")` check would have rejected outright."""
+    import pathlib
+    import re as _re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "src" / "lea"
+    owned = [
+        root / "llm" / "openai_compat.py",
+        root / "llm" / "factory.py",
+        root / "llm" / "anthropic_client.py",
+        root / "llm" / "stub.py",
+        root / "llm" / "json_utils.py",
+        root / "prompts.py",
+    ]
+    banned = _re.compile(r"AIza|startswith\s*\(\s*['\"](?:AIza|sk-|AQ)", _re.IGNORECASE)
+    for path in owned:
+        source = path.read_text()
+        assert not banned.search(source), f"{path.name} must not validate key formats"
+        assert "len(api_key)" not in source and "len(key)" not in source
+
+
 # --- model discovery --------------------------------------------------------
 
 

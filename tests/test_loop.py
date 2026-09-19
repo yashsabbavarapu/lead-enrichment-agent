@@ -311,7 +311,13 @@ def test_loop_terminates_on_finish(wired):
 
 def test_loop_terminates_on_budget_exhaustion(wired):
     """A model that never finishes must still be stopped, with an honest reason."""
-    search = FakeTool(ToolName.WEB_SEARCH)
+    # Sourceless results on purpose: this test is about the step budget, and a
+    # search that surfaced unread URLs would (correctly) trip the balance guard
+    # instead, which is covered separately.
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[
+        Observation(tool=ToolName.WEB_SEARCH, ok=True, summary="no usable hits", data={})
+        for _ in range(4)
+    ])
     llm = FakeLLM([
         act(ToolName.WEB_SEARCH, "q1", query="acme revenue"),
         act(ToolName.WEB_SEARCH, "q2", query="acme headquarters address"),
@@ -1006,3 +1012,208 @@ def test_auth_failure_is_not_misdiagnosed_as_a_stale_model(wired):
 
     # a genuine model-not-found still routes to --models
     assert looks_like_stale_model("HTTP 404: model 'x' does not exist")
+
+
+# --------------------------------------------------------------------------
+# Search/fetch balance: the "searched 4 times, read 2 pages" failure
+# --------------------------------------------------------------------------
+
+
+def _search_step(n: int, query: str, *urls: str) -> TraceStep:
+    return TraceStep(n=n, tool=ToolName.WEB_SEARCH, args={"query": query}, ok=True,
+                     sources=list(urls))
+
+
+def _fetch_step(n: int, url: str, ok: bool = True) -> TraceStep:
+    return TraceStep(n=n, tool=ToolName.FETCH_PAGE, args={"url": url}, ok=ok)
+
+
+def test_unread_urls_tracks_what_search_surfaced_but_nobody_opened():
+    from lea.agent.policy import fetched_urls, seen_urls, unread_urls
+
+    history = [
+        _search_step(1, "vanta overview", "https://vanta.com", "https://techcrunch.com/vanta-c"),
+        _fetch_step(2, "https://www.vanta.com/"),          # www + slash: same page
+        _search_step(3, "vanta funding", "https://techcrunch.com/vanta-c", "https://crunchbase.com/vanta"),
+    ]
+
+    assert seen_urls(history) == [
+        "https://vanta.com", "https://techcrunch.com/vanta-c", "https://crunchbase.com/vanta",
+    ]
+    assert "vanta.com" in fetched_urls(history)
+    # the fetched one drops out despite the www/trailing-slash difference
+    assert unread_urls(history) == [
+        "https://techcrunch.com/vanta-c", "https://crunchbase.com/vanta",
+    ]
+
+
+def test_budget_used_reports_the_balance():
+    b = Budget(max_steps=12, max_searches=5, max_fetches=6, total_timeout_s=60)
+    for _ in range(4):
+        b.consume(ToolName.WEB_SEARCH)
+    for _ in range(2):
+        b.consume(ToolName.FETCH_PAGE)
+    used = b.used()
+    assert used["searches_used"] == "4/5"
+    assert used["fetches_used"] == "2/6"
+    assert used["steps_used"] == "6/12"
+
+
+def test_budget_view_exposes_unread_urls_to_the_prompt():
+    b = Budget(max_steps=12, max_searches=5, max_fetches=6, total_timeout_s=60)
+    b.consume(ToolName.WEB_SEARCH)
+    trace = [_search_step(1, "q", "https://a.example", "https://b.example")]
+
+    view = loop_mod.budget_view(b, trace)
+
+    assert view["urls_found"] == 2
+    assert view["urls_unread"] == 2
+    assert view["unread_urls"] == ["https://a.example", "https://b.example"]
+    # the plain budget keys survive for whoever already reads them
+    assert view["searches"] == 4 and view["fetches"] == 6
+    assert view["searches_used"] == "1/5"
+
+
+def test_budget_view_caps_the_url_list():
+    b = Budget(total_timeout_s=60)
+    urls = [f"https://e{i}.example" for i in range(20)]
+    view = loop_mod.budget_view(b, [_search_step(1, "q", *urls)])
+    assert view["urls_unread"] == 20
+    assert len(view["unread_urls"]) == 8
+
+
+def test_search_guard_fires_on_back_to_back_searches_with_unread_urls():
+    from lea.agent.policy import search_without_reading_reason
+
+    history = [_search_step(1, "vanta overview", "https://techcrunch.com/vanta-series-c")]
+    reason = search_without_reading_reason(act(ToolName.WEB_SEARCH, query="vanta hq"), history)
+
+    assert reason
+    assert "techcrunch.com/vanta-series-c" in reason
+    assert "unread" in reason
+    assert "headquarters, founding year or headcount" in reason
+
+
+def test_search_guard_stays_quiet_when_it_would_be_wrong():
+    from lea.agent.policy import MAX_SEARCH_PUSHBACKS, search_without_reading_reason
+
+    search_again = act(ToolName.WEB_SEARCH, query="vanta hq")
+
+    # a second search after one that returned NOTHING is exactly right
+    assert search_without_reading_reason(search_again, [_search_step(1, "q")]) is None
+
+    # ...as is searching after actually reading the hit
+    read_it = [
+        _search_step(1, "q", "https://vanta.com"),
+        _fetch_step(2, "https://vanta.com"),
+    ]
+    assert search_without_reading_reason(search_again, read_it) is None
+
+    unread = [_search_step(1, "q", "https://vanta.com")]
+    # ...and fetching is not being second-guessed
+    assert search_without_reading_reason(act(ToolName.FETCH_PAGE, url="https://x.example"), unread) is None
+    # ...nor is a search when no fetch budget remains to act on the advice
+    assert search_without_reading_reason(search_again, unread, can_fetch=False) is None
+    # ...and it is bounded, so an insistent model still gets through
+    assert search_without_reading_reason(search_again, unread, pushbacks=MAX_SEARCH_PUSHBACKS) is None
+
+
+def test_loop_pushes_back_on_searching_instead_of_reading(wired):
+    """The live failure: search, read snippets, search again, never open the page."""
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[
+        Observation(
+            tool=ToolName.WEB_SEARCH, ok=True, summary="3 hits",
+            data={"results": [{"title": "Vanta raises $150M", "url": "https://tc.example/vanta"}]},
+            sources=["https://tc.example/vanta"],
+        ),
+    ])
+    fetch = FakeTool(ToolName.FETCH_PAGE)
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "look it up", query="vanta company overview"),
+        act(ToolName.WEB_SEARCH, "search again", query="vanta headquarters founded"),
+        act(ToolName.FETCH_PAGE, "fine, read it", url="https://tc.example/vanta"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search, fetch))
+
+    result = loop_mod.run_agent("Vanta", make_settings())
+
+    bounced = result.trace[1]
+    assert bounced.ok is False and bounced.error == "unread sources"
+    assert "https://tc.example/vanta" in bounced.observation
+    # the second search never executed, and the page did get read
+    assert len(search.calls) == 1
+    assert len(fetch.calls) == 1
+    # a guard bounce costs a step but not a search
+    assert result.stats.searches == 1
+    assert stop_class(result.stats.stop_reason) == "complete"
+
+
+def test_search_guard_is_bounded_so_an_insistent_model_proceeds(wired):
+    from lea.agent.policy import MAX_SEARCH_PUSHBACKS
+
+    search = FakeTool(ToolName.WEB_SEARCH)  # default obs always surfaces a source
+    # keeps asking to search, never takes the hint
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "a", query="vanta company overview"),
+        act(ToolName.WEB_SEARCH, "b", query="vanta headquarters founded year"),
+        act(ToolName.WEB_SEARCH, "c", query="vanta employee headcount linkedin"),
+        act(ToolName.WEB_SEARCH, "d", query="vanta pricing customers reviews"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search, FakeTool(ToolName.FETCH_PAGE)))
+
+    result = loop_mod.run_agent("Vanta", make_settings(max_steps=12, max_searches=6))
+
+    bounces = [s for s in result.trace if s.error == "unread sources"]
+    assert len(bounces) == MAX_SEARCH_PUSHBACKS, "the guard must stop nagging"
+    # it was never hard-blocked: once the bound is hit, searches go through again
+    assert len(search.calls) >= 2
+    assert stop_class(result.stats.stop_reason) == "complete"
+
+
+def test_stall_is_extended_while_a_rescue_is_available():
+    """The reported cut-off: 3 dead steps ended the run with 4 fetches of budget
+    left and an unopened URL sitting in its own search results."""
+    from lea.agent.policy import MAX_CONSECUTIVE_DEAD_STEPS, STALL_GRACE_WITH_UNREAD
+
+    rec = CompanyRecord(input="Vanta")
+    budget = Budget(max_steps=12, max_searches=5, max_fetches=6, total_timeout_s=60)
+
+    found = _search_step(1, "vanta", "https://tc.example/vanta")
+    dead = [TraceStep(n=i, tool=ToolName.FETCH_PAGE, ok=False, error="403")
+            for i in range(2, 2 + MAX_CONSECUTIVE_DEAD_STEPS)]
+
+    # unread URL + fetch budget -> keep going, the redirect can still rescue it
+    assert should_stop(rec, budget, [found, *dead]) is None
+
+    # but the grace is bounded
+    more = dead + [TraceStep(n=90 + i, tool=ToolName.FETCH_PAGE, ok=False, error="403")
+                   for i in range(STALL_GRACE_WITH_UNREAD)]
+    assert should_stop(rec, budget, [found, *more]) is not None
+
+    # with nothing left to read, the original threshold stands
+    nothing_found = _search_step(1, "vanta")
+    assert should_stop(rec, budget, [nothing_found, *dead]) is not None
+
+    # ...and so it does when there is no fetch budget to rescue with
+    spent = Budget(max_steps=12, max_searches=5, max_fetches=0, total_timeout_s=60)
+    assert should_stop(rec, spent, [found, *dead]) is not None
+
+
+def test_rate_limit_is_not_reported_as_a_broken_setup(wired):
+    """Free tiers 429 constantly; 'every LLM call failed' reads like a broken key."""
+    from lea.agent.policy import looks_like_auth_failure, looks_like_rate_limit
+
+    msg = ("LLM error: HTTP 429: You exceeded your current quota, please check your "
+           "plan and billing details.")
+    assert looks_like_rate_limit(msg)
+    assert not looks_like_auth_failure(msg)  # "billing" must not read as auth
+
+    llm = FakeCompatLLM([llm_error(msg)])
+    wired(llm, registry_of(FakeTool(ToolName.WEB_SEARCH)))
+    reason = loop_mod.run_agent("Vanta", make_settings(max_steps=8)).stats.stop_reason
+
+    assert "quota problem" in reason
+    assert "nothing is wrong with your setup" in reason
+    assert "authentication" not in reason
