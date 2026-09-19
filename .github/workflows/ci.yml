@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  demo:
+    # The unit tests never touch the network. This proves the shipped demo also
+    # runs on a clean machine with no API keys at all -- which is the claim the
+    # README opens with, so CI should be the thing that keeps it honest.
+    name: keyless demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e .
+      - name: doctor reports a usable keyless setup
+        run: lea doctor
+      - name: enrich a company with no keys and no network
+        env:
+          LEA_LLM_PROVIDER: stub
+        run: lea enrich "Vanta" --offline
+      - name: batch run produces a spreadsheet
+        env:
+          LEA_LLM_PROVIDER: stub
+        run: |
+          lea batch examples/offline-demo.csv --offline
+          test -s out/results.csv
+      - name: a saved run replays
+        run: lea replay out/vanta.json --delay 0
