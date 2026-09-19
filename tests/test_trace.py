@@ -426,3 +426,27 @@ def test_plain_providers_get_no_rung_note():
         out = buf.getvalue()
         assert f"llm={label}" in out
         assert "neither tool-calling nor JSON mode" not in out
+
+
+def test_footer_flags_a_search_provider_fallback():
+    """Degraded results must not read as normal ones."""
+    console, buf = cap()
+    r = full_result()
+    r.stats.search_provider = "duckduckgo (fell back from scrappa)"
+    trace_mod.render_result(r, console)
+    out = buf.getvalue()
+
+    flat = " ".join(out.split())   # rich wraps; assert on words, not line breaks
+    assert "search=duckduckgo (fell back from scrappa)" in flat
+    assert "primary search provider failed" in flat
+    assert "quality is lower than usual" in flat
+
+
+def test_footer_is_quiet_when_no_fallback_happened():
+    console, buf = cap()
+    r = full_result()
+    r.stats.search_provider = "scrappa"
+    trace_mod.render_result(r, console)
+    out = buf.getvalue()
+    assert "search=scrappa" in out
+    assert "primary search provider failed" not in out

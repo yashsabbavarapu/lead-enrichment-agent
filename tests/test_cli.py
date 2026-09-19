@@ -419,3 +419,89 @@ def test_doctor_notes_fixtures_when_offline(monkeypatch):
     monkeypatch.setenv("LEA_OFFLINE", "1")
     out = flat(run("doctor").output)
     assert "every search is served from fixtures" in out
+
+
+# --------------------------------------------------------------------------
+# Scrappa credit balance
+# --------------------------------------------------------------------------
+
+
+def _mock_balance(monkeypatch, value):
+    import lea.tools.search as search_mod
+
+    monkeypatch.setattr(search_mod, "scrappa_balance", lambda settings: value)
+
+
+def test_doctor_shows_the_scrappa_balance(monkeypatch):
+    """Someone about to run a 50-company batch should see whether they can."""
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-test")
+    _mock_balance(monkeypatch, {"balance": 475, "used_this_month": 25, "used_last_24h": 25})
+
+    out = flat(run("doctor").output)
+    assert "credits: 475 of 500 left this month" in out
+    assert "25 in last 24h" in out
+
+
+def test_doctor_makes_no_balance_call_when_unkeyed_or_offline(monkeypatch):
+    """`doctor` must stay a local command when there is nothing to ask."""
+    import lea.tools.search as search_mod
+
+    monkeypatch.setattr(search_mod, "scrappa_balance", _boom)
+
+    assert run("doctor").exit_code == 0          # no key at all
+
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-test")
+    monkeypatch.setenv("LEA_OFFLINE", "1")
+    result = run("doctor")                        # keyed, but offline
+    assert result.exit_code == 0
+    assert "credits:" not in flat(result.output)
+
+
+def test_doctor_is_quiet_when_the_balance_is_unavailable(monkeypatch):
+    """An unreachable balance endpoint is not worth a warning."""
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-test")
+    _mock_balance(monkeypatch, None)
+
+    result = run("doctor")
+    assert result.exit_code == 0
+    out = flat(result.output)
+    assert "credits:" not in out
+    assert "1. scrappa" in out          # the row itself is still there
+    for noisy in ("error", "failed", "warning", "unreachable"):
+        assert noisy not in out.lower()
+
+
+def test_doctor_survives_a_raising_balance_helper(monkeypatch):
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-test")
+    import lea.tools.search as search_mod
+
+    monkeypatch.setattr(search_mod, "scrappa_balance", _boom)
+    assert run("doctor").exit_code == 0
+
+
+def test_balance_lookup_cannot_hang_doctor(monkeypatch):
+    import lea.tools.search as search_mod
+
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-test")
+    monkeypatch.setattr(cli_mod, "BALANCE_TIMEOUT_S", 0.2)
+
+    def never_returns(settings):
+        import time
+
+        time.sleep(30)
+        return {"balance": 1}
+
+    monkeypatch.setattr(search_mod, "scrappa_balance", never_returns)
+
+    result = run("doctor")
+    assert result.exit_code == 0
+    assert "credits:" not in flat(result.output)
+
+
+def test_low_balance_is_flagged(monkeypatch):
+    """Under a batch's worth, the number stops being trivia."""
+    monkeypatch.setenv("SCRAPPA_API_KEY", "sk-test")
+    _mock_balance(monkeypatch, {"balance": 12, "used_this_month": 488, "used_last_24h": 0})
+    out = flat(run("doctor").output)
+    assert "credits: 12 of 500 left this month" in out
+    assert "last 24h" not in out, "a zero should not be printed as news"

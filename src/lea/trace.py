@@ -453,6 +453,16 @@ def _stats_line(result: EnrichmentResult) -> Text:
     # The class is spelled out so "finished" is never confused with "gave up".
     t.append(label, style=f"bold {color}")
     t.append(f" — {s.stop_reason}", style="dim italic")
+    if "fell back from" in (s.search_provider or ""):
+        # Same argument as the capability rung: degraded results must not read as
+        # normal ones. Someone seeing thin search output should know their primary
+        # provider was down, not conclude the agent is bad at searching.
+        t.append(
+            "\nnote: the primary search provider failed and results came from the fallback — "
+            "quality is lower than usual. Re-run once it recovers; `lea doctor` shows which "
+            "providers are configured.",
+            style="yellow",
+        )
     if "(prose)" in (s.llm_provider or ""):
         # Bottom rung: the endpoint honoured neither tool-calling nor JSON mode, so
         # every structured field was scraped back out of free text. Flat ICP

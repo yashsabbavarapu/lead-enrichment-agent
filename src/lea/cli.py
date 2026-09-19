@@ -51,6 +51,10 @@ EXIT_UNGROUNDED = 2
 # black hole can outlast it and doctor must never hang.
 MODELS_TIMEOUT_S = 12.0
 
+# Same backstop for the Scrappa credit lookup. Shorter: it is a small call on a
+# bare `doctor`, so it must never be the reason the command feels slow.
+BALANCE_TIMEOUT_S = 4.0
+
 
 # --------------------------------------------------------------------------
 # .env + settings
@@ -526,6 +530,58 @@ def search_provider_order() -> list[str]:
     return order
 
 
+def fetch_scrappa_balance(settings: Settings) -> Optional[dict[str, Any]]:
+    """Scrappa's remaining credits, or None.
+
+    Only called when a key exists and we are online, so an offline or unkeyed
+    `doctor` stays a purely local command at ~0.2s. The daemon-thread cap is the
+    same discipline as `--models`: the helper has its own timeout, this is the
+    backstop for a DNS black hole that outlasts it. Failure is silent — an
+    unreachable balance endpoint is not worth a warning.
+    """
+    if settings.offline or not getattr(settings, "scrappa_api_key", None):
+        return None
+
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def _lookup() -> None:
+        try:
+            from lea.tools.search import scrappa_balance
+
+            box["balance"] = scrappa_balance(settings)
+        except Exception:
+            box["balance"] = None
+
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(timeout=BALANCE_TIMEOUT_S)
+    got = box.get("balance")
+    return got if isinstance(got, dict) else None
+
+
+def _format_balance(bal: dict[str, Any]) -> Text:
+    """`475 of 500 left this month` — enough context to plan a batch against."""
+    balance = bal.get("balance")
+    used_month = bal.get("used_this_month")
+    used_24h = bal.get("used_last_24h")
+
+    out = Text("       credits: ", style="dim")
+    if isinstance(balance, int) and not isinstance(balance, bool):
+        total = balance + used_month if isinstance(used_month, int) else None
+        # Below roughly one batch's worth this stops being trivia and becomes the
+        # reason a 50-company run is about to stop halfway.
+        out.append(str(balance), style="bold red" if balance < 50 else "bold green")
+        out.append(f" of {total} left this month" if total else " left", style="dim")
+    else:
+        out.append("unknown", style="dim")
+    if isinstance(used_24h, int) and used_24h:
+        out.append(f" · {used_24h} in last 24h", style="dim")
+    out.append(" · ~1 per search", style="dim")
+    return out
+
+
 def _print_search_providers(settings: Settings) -> None:
     """Search providers in true priority order, with the active one marked."""
     active = settings.resolved_search()
@@ -549,6 +605,11 @@ def _print_search_providers(settings: Settings) -> None:
         line.append(f"{status:<8}", style=style)
         line.append(note, style="dim")
         console.print(line)
+
+        if name == "scrappa" and status == "present":
+            bal = fetch_scrappa_balance(settings)
+            if bal:
+                console.print(_format_balance(bal))
 
     if settings.offline:
         console.print(Text("  (offline: every search is served from fixtures)", style="dim"))

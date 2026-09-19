@@ -869,9 +869,13 @@ def test_scrappa_does_not_retry_a_fault_that_took_too_long_to_arrive(
 
     This is not hypothetical: it is what blocked the first live run.
     """
+    import itertools
+
     _scrappa_settings(settings)
-    clock = iter([0.0, 40.0, 40.0, 80.0])
+    # The fault "takes" 40s to arrive; the fallback chain is a separate concern.
+    clock = itertools.chain([0.0, 40.0], itertools.count(80.0))
     monkeypatch.setattr(lea_search.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(lea_search, "FALLBACK_PROVIDERS", {})
     route = respx.get(lea_search.SCRAPPA_URL).mock(
         return_value=httpx.Response(
             503, json={"error": "Google Search Advanced is temporarily unable to return a valid SERP."}
@@ -905,6 +909,116 @@ def test_scrappa_burns_at_most_two_credits_even_when_it_keeps_failing(settings: 
     route = respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(500, text="boom"))
     WebSearchTool().run({"query": "Datadog"}, settings)
     assert route.call_count == lea_search.SCRAPPA_SERVER_RETRIES + 1 == 2
+
+
+@respx.mock
+def test_a_slow_scrappa_503_falls_through_to_duckduckgo(settings: Settings):
+    """A 43s 503 costs no credits but costs the agent a step it cannot get back.
+
+    Five of nine measured calls 503'd in one window, so failing the step outright
+    would have thrown away most of a run.
+    """
+    _scrappa_settings(settings)
+    scrappa = respx.get(lea_search.SCRAPPA_URL).mock(
+        return_value=httpx.Response(503, json={"error": "temporarily unable"})
+    )
+    ddg = respx.post(DDG_HTML_URL).mock(return_value=httpx.Response(200, text=DDG_PAGE))
+
+    obs = WebSearchTool().run({"query": "Ramp"}, settings)
+
+    assert scrappa.called and ddg.called
+    assert obs.ok is True
+    assert obs.data["provider"] == "duckduckgo"
+    assert obs.data["provider_chain"] == ["scrappa", "duckduckgo"]
+    assert obs.data["results"][0]["url"] == "https://ramp.com/"
+
+
+@respx.mock
+def test_a_configuration_fault_does_not_fall_through(settings: Settings):
+    """A rejected key fails the same way forever; hiding it behind DDG is worse."""
+    _scrappa_settings(settings)
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(401, text="nope"))
+    ddg = respx.post(DDG_HTML_URL).mock(return_value=httpx.Response(200, text=DDG_PAGE))
+
+    obs = WebSearchTool().run({"query": "Ramp"}, settings)
+
+    assert not ddg.called, "a bad API key was papered over by the fallback"
+    assert obs.ok is False and "SCRAPPA_API_KEY" in (obs.error or "")
+
+
+@pytest.mark.parametrize(
+    "error,transient",
+    [
+        ("scrappa: HTTP 503 upstream error", True),
+        ("scrappa: no response within 45s", True),
+        ("scrappa: HTTP 429 — rate limited or out of monthly credits", True),
+        ("scrappa: key rejected (HTTP 401) — check SCRAPPA_API_KEY", False),
+        ("scrappa: HTTP 422 — the API rejected the request parameters", False),
+        ("scrappa selected but SCRAPPA_API_KEY is not set", False),
+        (None, False),
+    ],
+)
+def test_transient_classification_separates_bad_minutes_from_bad_config(error, transient):
+    assert lea_search.is_transient_search_error(error) is transient
+
+
+@respx.mock
+def test_fallback_still_ends_at_the_recorded_fixture(settings: Settings):
+    """Both providers down is exactly when the cache has to carry the demo."""
+    _scrappa_settings(settings)
+    _write_fixture(settings, DDG_HTML_URL, {"q": "Ramp", "kl": "us-en"}, DDG_PAGE, query="ramp")
+    respx.get(lea_search.SCRAPPA_URL).mock(return_value=httpx.Response(503, text="temporarily unable"))
+    respx.post(DDG_HTML_URL).mock(return_value=httpx.Response(202, text="anomaly"))
+    respx.post(DDG_LITE_URL).mock(return_value=httpx.Response(202, text="anomaly"))
+
+    obs = WebSearchTool().run({"query": "Ramp"}, settings)
+
+    assert obs.ok is True
+    assert obs.data["degraded"] is True and obs.data["served_from"] == "fixture"
+    assert obs.data["provider_chain"] == ["scrappa", "duckduckgo"]
+
+
+@respx.mock
+def test_scrappa_balance_reads_the_account_endpoint(settings: Settings):
+    """Shape copied from the live response; free to call and never charged."""
+    settings.scrappa_api_key = "test-key"
+    route = respx.get(lea_search.SCRAPPA_USAGE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "balance": 475,
+                "credits": {"usable": 475, "free_remaining": 475, "free_used_this_month": 25},
+                "usage": {"current_month": 25, "last_24_hours": 25},
+                "generated_at": "2026-09-19T15:18:22+00:00",
+            },
+        )
+    )
+    assert lea_search.scrappa_balance(settings) == {
+        "balance": 475,
+        "used_this_month": 25,
+        "used_last_24h": 25,
+    }
+    assert route.calls[0].request.headers["x-api-key"] == "test-key"
+
+
+def test_scrappa_balance_is_quiet_when_it_cannot_answer(settings: Settings):
+    assert lea_search.scrappa_balance(settings) is None, "no key configured"
+    settings.scrappa_api_key = "k"
+    settings.offline = True
+    assert lea_search.scrappa_balance(settings) is None, "offline must not call out"
+
+
+@respx.mock
+def test_scrappa_balance_never_raises_on_a_bad_response(settings: Settings):
+    settings.scrappa_api_key = "k"
+    for response in (
+        httpx.Response(500, text="boom"),
+        httpx.Response(200, text="not json"),
+        httpx.Response(200, json={"unexpected": True}),
+        httpx.Response(200, json={"balance": "lots"}),
+    ):
+        respx.get(lea_search.SCRAPPA_USAGE_URL).mock(return_value=response)
+        assert lea_search.scrappa_balance(settings) is None
 
 
 def test_scrappa_reports_a_missing_key(settings: Settings):

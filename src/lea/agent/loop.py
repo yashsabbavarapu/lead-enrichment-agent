@@ -373,6 +373,22 @@ def _update_record(record: CompanyRecord, action: AgentAction, obs: Observation)
                 record.tech_stack.append(entry)
 
 
+def search_provider_label(chain: list[str], configured: str) -> str:
+    """What to show as the search provider in the footer stats.
+
+    Names who actually served the results, and says so when that was not the
+    first choice. Someone looking at DuckDuckGo-quality results needs to know
+    their primary provider was down rather than assuming that is normal — the
+    same argument as surfacing the LLM capability rung.
+    """
+    served = chain[-1] if chain else ""
+    if not served:
+        return configured
+    if len(chain) > 1:
+        return f"{served} (fell back from {chain[0]})"
+    return served
+
+
 def provider_label(llm: Any, settings: Settings) -> str:
     """What to show as the LLM in the footer stats.
 
@@ -463,6 +479,7 @@ def run_agent(
     search_pushbacks = 0  # times we've asked it to read before searching again
     tentative_domain = ""  # a guess, for steering only — never written to the record
     read_urls: set[str] = set()  # normalized URLs this run actually opened
+    search_chain: list[str] = []  # who actually served the searches, in order tried
     llm_errors: list[str] = []  # failed LLM calls, for diagnosing a dead endpoint
     registry: dict[ToolName, Any] = {}
     llm: Any = None
@@ -695,6 +712,13 @@ def run_agent(
                 if text and text.strip():
                     evidence.append((src, text))
             _update_record(record, action, obs)
+            if action.tool == ToolName.WEB_SEARCH:
+                chain = (obs.data or {}).get("provider_chain")
+                served = (obs.data or {}).get("provider")
+                if isinstance(chain, list) and chain:
+                    search_chain = [str(c) for c in chain if c]
+                elif served:
+                    search_chain = [str(served)]
             if action.tool in READING_TOOLS:
                 read_urls.update(normalize_url(u) for u in obs.sources if u)
                 requested = str(action.args.get("url") or action.args.get("company_or_url") or "")
@@ -800,7 +824,7 @@ def run_agent(
         wall_ms=wall_ms,
         stop_reason=reason,
         llm_provider=provider_label(llm, settings),
-        search_provider=settings.resolved_search(),
+        search_provider=search_provider_label(search_chain, settings.resolved_search()),
     )
 
     return EnrichmentResult(

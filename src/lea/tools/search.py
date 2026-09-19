@@ -31,21 +31,93 @@ SCRAPPA_URL = "https://scrappa.co/api/search"
 # every page fetch sluggish, so this provider carries its own budget.
 SCRAPPA_TIMEOUT_S = 45.0
 
-# Credits are finite — 500/month, one per request — and nothing in the response
-# headers exposes the remaining balance, so retries have to be spent carefully.
+# Credits are finite — 500/month, one per SUCCESSFUL request. Measured against
+# the account endpoint: nine calls returning four 200s and five 503s cost exactly
+# four credits, matching Scrappa's documented "failed responses including 503 are
+# never charged". So a failure costs TIME, not money — which is what the retry
+# and fallback policy below is actually optimising against.
+#
 # A 200 carrying zero results IS an answer; asking again buys the same answer for
 # another credit, so that case is never retried. A 5xx or a timeout returned no
-# answer at all (a cold 503 followed immediately by a clean 200 is a thing that
-# happens here), and that alone is worth exactly one more try.
+# answer at all, and that alone is worth exactly one more try.
 SCRAPPA_SERVER_RETRIES = 1
 SCRAPPA_RETRY_BACKOFF_S = 2.0
 
-# ...but only when the fault arrived quickly. Measured: a healthy call answers in
-# 5-9s, while the unhealthy one ("Google Search Advanced is temporarily unable to
-# return a valid SERP") takes ~40s to admit it. Retrying a fault that slow turned
-# a single search step into 91s and consumed an entire 180s run budget in two
-# steps. A slow fault will be slow again; failing over to the cache beats waiting.
+# ...but only when the fault arrived quickly. Latency here is sharply bimodal:
+# every success measured landed in 5.8-6.9s, every 503 in 41-46s. Retrying a
+# fault that slow turned a single search step into 91s and consumed an entire
+# 180s run budget in two steps. Past ~12s the call is almost certainly a 503
+# already; waiting for a second one beats nothing.
 SCRAPPA_FAST_FAULT_S = 12.0
+
+# Account balance. Free to call, never charged, and exact.
+SCRAPPA_USAGE_URL = "https://scrappa.co/api/account/usage"
+
+# When the primary provider fails transiently, try these rather than lose the
+# step. Keyless only, deliberately: silently failing over to another *paid*
+# provider would spend a budget nobody authorised for this query.
+#
+# Worth it because Scrappa's 503s are slow and, in a bad window, common — five of
+# nine in one measured run, uncorrelated with query shape or request rate.
+# Without this the agent burns a step and 43 seconds and learns nothing.
+FALLBACK_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "scrappa": ("duckduckgo",),
+}
+
+_PROVIDERS = frozenset({"scrappa", "duckduckgo", "tavily", "serper", "brave", "fixture"})
+
+# Failures worth trying another provider for: the upstream had a bad moment.
+# A 401/422/missing-key is a configuration fault — the same query will fail the
+# same way forever, and quietly succeeding elsewhere only hides the real problem.
+_TRANSIENT_MARKERS: tuple[str, ...] = (
+    "no response within", "upstream error", "rate limited", "out of monthly credits",
+    "http 5", "timed out", "temporarily", "returned no results",
+)
+
+
+def is_transient_search_error(error: Optional[str]) -> bool:
+    """Is this failure the provider having a bad moment, or a broken setup?"""
+    low = (error or "").lower()
+    if not low:
+        return False
+    if "api_key" in low or "422" in low or "key rejected" in low:
+        return False
+    return any(marker in low for marker in _TRANSIENT_MARKERS)
+
+
+def scrappa_balance(settings: Settings) -> Optional[dict[str, Any]]:
+    """Remaining Scrappa credits, or None if they cannot be read. Never raises.
+
+    Free to call and never charged, so it is safe to show before a batch run.
+    Reports `used_this_month` alongside the balance, because "479 left" means
+    more once you know only 21 went this month.
+    """
+    if settings.offline or not settings.scrappa_api_key:
+        return None
+    res = _http.request(
+        settings,
+        "GET",
+        SCRAPPA_USAGE_URL,
+        headers={"x-api-key": settings.scrappa_api_key, "Accept": "application/json"},
+        use_cache=False,
+        record=False,
+        timeout=15.0,
+    )
+    payload = _json(res.text) if res.ok else None
+    if not payload:
+        return None
+    credits = payload.get("credits") if isinstance(payload.get("credits"), dict) else {}
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    balance = payload.get("balance")
+    if not isinstance(balance, (int, float)):
+        balance = credits.get("usable")
+    if not isinstance(balance, (int, float)) or isinstance(balance, bool):
+        return None
+    return {
+        "balance": int(balance),
+        "used_this_month": int(usage.get("current_month") or credits.get("free_used_this_month") or 0),
+        "used_last_24h": int(usage.get("last_24_hours") or 0),
+    }
 
 # Google's panel keys, in the order they are worth reading, mapped to labels for
 # the observation text. Everything else the panel carries (*_links companions,
@@ -470,20 +542,23 @@ class WebSearchTool:
             # provider's signature alone.
             extras: dict[str, Any] = {}
 
-            if provider == "scrappa":
-                results, err = self._scrappa(query, num, settings, extras)
-            elif provider == "duckduckgo":
-                results, err = self._duckduckgo(query, num, settings)
-            elif provider == "tavily":
-                results, err = self._tavily(query, num, settings)
-            elif provider == "serper":
-                results, err = self._serper(query, num, settings)
-            elif provider == "brave":
-                results, err = self._brave(query, num, settings)
-            elif provider == "fixture":
-                results, err = self._fixture(query, num, settings, extras)
-            else:
+            if provider not in _PROVIDERS:
                 return self._fail(f"unknown search provider '{provider}'", started, {"provider": provider})
+
+            results, err = self._dispatch(provider, query, num, settings, extras)
+            chain = [provider]
+
+            # A slow-failing primary with a keyless alternative available is the
+            # one place a second attempt clearly pays: the agent only gets so many
+            # steps, and losing one to somebody else's bad minute is pure waste.
+            if (err or not results) and is_transient_search_error(err) and not settings.offline:
+                for alternate in FALLBACK_PROVIDERS.get(provider, ()):
+                    alt_results, alt_err = self._dispatch(alternate, query, num, settings, extras)
+                    chain.append(alternate)
+                    if alt_results:
+                        results, err, provider = alt_results, None, alternate
+                        break
+                    err = err or alt_err
 
             results = _dedupe(results, num) if results else []
 
@@ -511,6 +586,7 @@ class WebSearchTool:
                             "provider": provider,
                             "query": query,
                             "results": [r.model_dump() for r in cached],
+                            "provider_chain": chain,
                             "degraded": True,
                             "degraded_reason": reason,
                             "served_from": "fixture",
@@ -539,6 +615,7 @@ class WebSearchTool:
                 summary=body,
                 data={
                     "provider": provider,
+                    "provider_chain": chain,
                     "query": query,
                     "results": [r.model_dump() for r in results],
                     "degraded": False,
@@ -551,6 +628,24 @@ class WebSearchTool:
             return self._fail(f"{type(exc).__name__}: {exc}", started, {"provider": provider})
 
     # -- providers -------------------------------------------------------
+
+    def _dispatch(
+        self, provider: str, query: str, num: int, settings: Settings, extras: dict[str, Any]
+    ) -> tuple[list[SearchResult], Optional[str]]:
+        """Route to one provider. Separate so the fallback chain can reuse it."""
+        if provider == "scrappa":
+            return self._scrappa(query, num, settings, extras)
+        if provider == "duckduckgo":
+            return self._duckduckgo(query, num, settings)
+        if provider == "tavily":
+            return self._tavily(query, num, settings)
+        if provider == "serper":
+            return self._serper(query, num, settings)
+        if provider == "brave":
+            return self._brave(query, num, settings)
+        if provider == "fixture":
+            return self._fixture(query, num, settings, extras)
+        return [], f"unknown search provider '{provider}'"
 
     def _duckduckgo(
         self, query: str, num: int, settings: Settings

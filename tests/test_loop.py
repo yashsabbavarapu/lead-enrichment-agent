@@ -1748,3 +1748,56 @@ def test_a_url_invented_downstream_cannot_become_a_citation(wired):
     result = loop_mod.run_agent("Acme", make_settings())
 
     assert result.record.sources == ["https://acme.com"]
+
+
+# --------------------------------------------------------------------------
+# Search provider fallback, surfaced like the capability rung
+# --------------------------------------------------------------------------
+
+
+def test_search_provider_label_names_who_actually_served():
+    from lea.agent.loop import search_provider_label
+
+    assert search_provider_label(["scrappa"], "scrappa") == "scrappa"
+    assert search_provider_label(["scrappa", "duckduckgo"], "scrappa") == \
+        "duckduckgo (fell back from scrappa)"
+    assert search_provider_label(["scrappa", "duckduckgo", "fixture"], "scrappa") == \
+        "fixture (fell back from scrappa)"
+    # nothing observed -> report what was configured
+    assert search_provider_label([], "tavily") == "tavily"
+
+
+def _search_obs(provider: str, chain: list[str]) -> Observation:
+    return Observation(
+        tool=ToolName.WEB_SEARCH, ok=True, summary="1 hit",
+        data={"provider": provider, "provider_chain": chain,
+              "results": [{"title": "Acme", "url": "https://acme.com", "snippet": "payments"}]},
+        sources=["https://acme.com"],
+    )
+
+
+def test_a_fallback_is_recorded_in_the_stats(wired):
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[
+        _search_obs("duckduckgo", ["scrappa", "duckduckgo"]),
+    ])
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "s", query="acme corp overview"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("acme", make_settings())
+    assert result.stats.search_provider == "duckduckgo (fell back from scrappa)"
+
+
+def test_no_fallback_reports_the_provider_plainly(wired):
+    search = FakeTool(ToolName.WEB_SEARCH, observations=[_search_obs("scrappa", ["scrappa"])])
+    llm = FakeLLM([
+        act(ToolName.WEB_SEARCH, "s", query="acme corp overview"),
+        act(ToolName.FINISH, "done", reason="ok"),
+    ])
+    wired(llm, registry_of(search))
+
+    result = loop_mod.run_agent("acme", make_settings())
+    assert result.stats.search_provider == "scrappa"
+    assert "fell back" not in result.stats.search_provider
