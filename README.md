@@ -136,7 +136,7 @@ researching Ramp   [llm=stub search=fixture offline]
       finish()
 
   8 * synth   ok  10ms   | resolved 4 core field(s); 5 signal(s), 4 tech entries.
-  9 * synth   ok   5ms   | tier B - 67/100 across 6 criteria.
+  9 * synth   ok   5ms   | tier B - 64/100 across 6 criteria.
  10 * synth   ok   6ms   | 2 hook(s) kept.
 
 10 steps - 2 searches - 4 pages - 0.2s - llm=stub search=fixture
@@ -156,22 +156,26 @@ The per-criterion scoring from that same run — this reasoning is generated fro
                                  consistent with a B2B product.
   gtm_segment        5.0     2   The company is actively hiring - "See open
                                  positions".
-  company_size       5.0   1.5   Headcount could not be established from public
-                                 sources, so this is scored mid rather than
-                                 penalised. It is a gap, not a negative.
+  company_size       5.0   1.5   Neither a headcount band nor a public job
+                                 board could be found, so size is genuinely
+                                 unknown and scored mid rather than penalised.
   tech_maturity      6.6   1.5   Detected 3 technologies across 3 categories;
                                  cloud-native infrastructure (Cloudflare and
                                  Vercel).
-  growth_signals     7.0   1.5   Trigger events found - hiring: "See open
-                                 positions"; 3 product launches; 1
-                                 leadership/partnership signal.
+  growth_signals     5.2   1.5   Trigger events - hiring: "See open
+                                 positions" (1.3 years old); product:
+                                 "Introducing Stack by Ramp." (undated).
+                                 Signals are weighted by age, so older
+                                 events count for less.
   geo               10.0     1   Headquartered in New York, United States - a
                                  core market we sell into today.
 
-  -> tier B - 67.3/100 - confidence 0.85 - unknowns: employee_range
+  -> tier B - 64.4/100 - confidence 0.85 - unknowns: employee_range
 ```
 
-Note `company_size` scoring 5.0 with the reason stated rather than 0. An unknown is not a negative, and `confidence` is where missing evidence is accounted for.
+Two things to notice. `company_size` scores 5.0 with the reason stated rather than 0 — an unknown is not a negative, and `confidence` is where missing evidence is accounted for. And `growth_signals` is **weighted by age**: the hiring line here is 1.3 years old, so it contributes a fraction of what a signal from last week would. A two-year-old funding round is history; a nine-day-old launch is a reason to call this week, and the score says so.
+
+When the agent reaches a company's public ATS board (Ashby, Greenhouse, Lever, Workable), `company_size` stops guessing entirely and grades on the open-role count as a *stage* proxy — "93 open roles on their Ashby board, 36 of them in GTM functions" — while still refusing to invent an `employee_range` it never read. That is also the best hook material in the record: what someone is hiring for this quarter says more about budget than a round they closed two years ago.
 
 With no model key these scores come from the deterministic rubric described above, which grades each criterion off the record. It is not model reasoning and the summary line says so — but two different companies get two different explainable scores instead of a constant.
 
@@ -213,10 +217,10 @@ The record from that same `--offline` run (`out/ramp.json`, trimmed):
     { "category": "infra",     "name": "Cloudflare", "evidence": "header 'server: cloudflare'", "confidence": 0.95 }
   ],
   "icp_fit": {
-    "score": 67.3,
+    "score": 64.4,
     "tier": "B",
     "confidence": 0.85,
-    "summary": "Tier B (67/100). Strongest: company_type 8/10, growth_signals 7/10. Graded by the deterministic rubric (no LLM judgement available) - set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
+    "summary": "Tier B (64/100). Strongest: company_type 8/10, gtm_segment 5/10. Graded by the deterministic rubric (no LLM judgement available) - set ANTHROPIC_API_KEY for reasoned per-criterion scoring."
   },
   "hooks": [
     {

@@ -2373,7 +2373,220 @@ def test_no_key_format_validation_exists_anywhere_in_scope():
     for path in owned:
         source = path.read_text()
         assert not banned.search(source), f"{path.name} must not validate key formats"
-        assert "len(api_key)" not in source and "len(key)" not in source
+        # A key's LENGTH must never gate a request either. The one legitimate
+        # use is the redaction floor, which rejects nothing — it only stops a
+        # 1-char test stub from substring-shredding log text.
+        for lineno, line in enumerate(source.splitlines(), 1):
+            if _re.search(r"len\(\s*(?:api_)?key\s*\)", line):
+                assert "MIN_REDACTABLE_KEY_LEN" in line, (
+                    f"{path.name}:{lineno} checks key length outside redaction: {line.strip()}"
+                )
+
+
+# --- HTTP 200 that carries nothing -------------------------------------------
+#
+# `gemini-3.6-flash` returns 200 on every call and yields nothing: a whole run
+# reports `4 steps · 0 searches · 0 pages · 0+0 tokens`. It is the preset
+# default AND what Google's 404 names as the successor for retired ids, so the
+# resolver can substitute *into* it. Treating 200-with-nothing as success is
+# what makes that failure silent.
+
+
+def _empty_response(finish_reason: str = "length", **message_extra) -> dict:
+    message = {"role": "assistant", "content": None}
+    message.update(message_extra)
+    return {
+        "model": "gemini-3.6-flash",
+        "choices": [{"message": message, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 800, "completion_tokens": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    "data,expected",
+    [
+        ({}, True),
+        ({"choices": []}, True),
+        ({"choices": [{"message": {"content": None}, "finish_reason": "length"}]}, True),
+        ({"choices": [{"message": {"content": "   "}}]}, True),
+        ({"choices": [{"message": {"content": "hello"}}]}, False),
+        ({"choices": [{"message": {"content": None, "reasoning": "thinking out loud"}}]}, False),
+        ({"choices": [{"message": {"content": "", "reasoning_content": "ok"}}]}, False),
+        (
+            {"choices": [{"message": {"content": None, "tool_calls": [{"function": {"name": "x", "arguments": "{}"}}]}}]},
+            False,
+        ),
+    ],
+)
+def test_is_empty_completion_matrix(data, expected):
+    from lea.llm.openai_compat import is_empty_completion
+
+    assert is_empty_completion(data) is expected
+
+
+@respx.mock
+def test_a_normal_response_never_triggers_the_empty_path():
+    route = respx.post(GOOGLE_URL).mock(return_value=httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)))
+    action, _ = _google_client("gemini-3.5-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+    assert route.call_count == 1, "a working model must not pay for this defence"
+
+
+@respx.mock
+def test_empty_content_with_finish_reason_length_retries_with_a_bigger_budget():
+    """A thinking model can spend the whole budget before writing an answer."""
+    from lea.llm.openai_compat import EMPTY_RETRY_MAX_TOKENS
+
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_empty_response("length")),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    action, _ = _google_client("gemini-3.6-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH, "200-with-nothing must not become a lost step"
+    assert route.call_count == 2
+    first, second = (json.loads(c.request.content) for c in route.calls)
+    assert second["max_tokens"] == EMPTY_RETRY_MAX_TOKENS
+    assert second["max_tokens"] > first["max_tokens"]
+
+
+@respx.mock
+def test_a_persistently_empty_model_is_swapped_out():
+    models = _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_empty_response("length")),   # first budget
+            httpx.Response(200, json=_empty_response("length")),   # escalated budget
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),  # new model
+        ]
+    )
+    client = _google_client("gemini-3.6-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.model == "gemini-3.5-flash", "must route off the model that returns nothing"
+    assert json.loads(route.calls[2].request.content)["model"] == "gemini-3.5-flash"
+    assert models.call_count == 1
+
+
+@respx.mock
+def test_an_empty_model_with_no_alternative_degrades_with_the_doctor_hint():
+    _models_route(["gemini-3.6-flash"])  # the broken model is the only one offered
+    respx.post(GOOGLE_URL).mock(return_value=httpx.Response(200, json=_empty_response("length")))
+    action, _ = _google_client("gemini-3.6-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.FINISH
+    assert "lea doctor --models" in action.thought
+    assert "LEA_MODEL" in action.thought
+    assert "no content" in action.thought
+
+
+@respx.mock
+def test_the_resolver_never_substitutes_into_a_model_proven_empty():
+    """Google's 404 names gemini-3.6-flash as the successor — but if 3.6 has
+    already proven unusable, the resolver must pick something else."""
+    from lea.llm.openai_compat import mark_model_unusable
+
+    base = "https://generativelanguage.googleapis.com/v1beta/openai"
+    mark_model_unusable(base, "gemini-3.6-flash")
+    _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404(
+                "models/gemini-2.0-flash is not found for API version v1beta, "
+                "please update to models/gemini-3.6-flash"
+            ),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.model == "gemini-3.5-flash", "the named successor is known-broken"
+    assert json.loads(route.calls[1].request.content)["model"] == "gemini-3.5-flash"
+
+
+@respx.mock
+def test_an_answer_hiding_in_a_reasoning_field_is_read():
+    """Provider-dependent: reasoning models surface text under varying names."""
+    payload = json.dumps(DECIDE_ARGS)
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "tool_choice is not supported"}}),
+            httpx.Response(200, json=_empty_response("stop", reasoning_content=payload)),
+        ]
+    )
+    action, _ = _google_client("gemini-3.6-flash").decide("sys", "TARGET: Acme", TOOL_SPECS)
+    assert action.tool is ToolName.WEB_SEARCH
+    assert action.args == {"query": "Acme Robotics"}
+
+
+@respx.mock
+def test_extract_also_survives_an_empty_model():
+    models = _models_route()
+    payload = {"input": "Vanta", "company_name": "Vanta", "industry": "Security & Compliance"}
+    respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_empty_response("length")),
+            httpx.Response(200, json=_empty_response("length")),
+            httpx.Response(200, json=_tool_response("record_companyrecord", payload)),
+        ]
+    )
+    record, _ = _google_client("gemini-3.6-flash").extract("sys", "ctx", CompanyRecord)
+    assert record.company_name == "Vanta"
+    assert record.industry == "Security & Compliance"
+    assert models.call_count == 1
+
+
+@respx.mock
+def test_the_ranked_fallback_also_skips_unusable_models():
+    """No named successor this time — the ranking itself must skip a known-bad id."""
+    from lea.llm.openai_compat import mark_model_unusable
+
+    base = "https://generativelanguage.googleapis.com/v1beta/openai"
+    mark_model_unusable(base, "gemini-3.5-flash")  # the model ranking would pick
+    _models_route()
+    route = respx.post(GOOGLE_URL).mock(
+        side_effect=[
+            _dead_model_404("models/gemini-2.0-flash is not found for API version v1beta"),
+            httpx.Response(200, json=_tool_response("next_action", DECIDE_ARGS)),
+        ]
+    )
+    client = _google_client("gemini-2.0-flash")
+    action, _ = client.decide("sys", "TARGET: Acme", TOOL_SPECS)
+
+    assert action.tool is ToolName.WEB_SEARCH
+    assert client.model == "gemini-2.5-flash", "skip the unusable top pick, take the next"
+    assert json.loads(route.calls[1].request.content)["model"] == "gemini-2.5-flash"
+
+
+def test_redaction_does_not_shred_text_for_a_short_stub_key():
+    """A 1-char test key must not substring-match its way through the message."""
+    from lea.llm.openai_compat import OpenAICompatClient
+
+    client = OpenAICompatClient(Settings(llm_provider="google", llm_api_key="k"), provider="google")
+    assert client._redact("max_tokens=16384 — pick another") == "max_tokens=16384 — pick another"
+
+
+def test_redaction_still_removes_a_realistic_key():
+    from lea.llm.openai_compat import OpenAICompatClient
+
+    client = OpenAICompatClient(Settings(llm_provider="google", llm_api_key=SECRET), provider="google")
+    out = client._redact(f"API key not valid: {SECRET}")
+    assert SECRET not in out and "<redacted>" in out
+
+
+def test_reset_provider_state_clears_the_unusable_set():
+    from lea.llm.openai_compat import _UNUSABLE_MODELS, is_model_usable, mark_model_unusable
+
+    mark_model_unusable("https://x/v1", "broken")
+    assert not is_model_usable("https://x/v1", "broken")
+    reset_provider_state()
+    assert _UNUSABLE_MODELS == set()
+    assert is_model_usable("https://x/v1", "broken")
 
 
 # --- model discovery --------------------------------------------------------

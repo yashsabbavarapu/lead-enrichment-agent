@@ -1621,3 +1621,20 @@ def test_counted_board_also_absorbs_the_models_restatement(settings):
     assert hiring[0].startswith("47 open roles (")        # ours, with the breakdown
     # a hiring signal about something else survives
     assert "Hiring 3 principal engineers in Dublin" in hiring
+
+
+def test_scoring_context_hands_the_model_the_date_and_signal_ages():
+    """The model must not do date arithmetic: live Gemini called June 2025
+    'well within the 90-day recency window' on a run dated September 2026."""
+    from lea.enrich.icp import _build_scoring_context
+
+    rec = CompanyRecord(
+        input="Ramp", company_name="Ramp",
+        signals=[Signal(kind="funding", headline="Ramp valued at $13B", date="2025-03-01")],
+    )
+    ctx = _build_scoring_context(rec, _icp_4(), [])
+    assert "TODAY'S DATE:" in ctx
+    assert "SIGNAL AGES" in ctx
+    assert "do not recalculate" in ctx
+    assert "Ramp valued at $13B" in ctx
+    assert "months old" in ctx or "years old" in ctx

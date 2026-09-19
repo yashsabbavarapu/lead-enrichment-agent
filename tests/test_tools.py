@@ -7,6 +7,7 @@ Two isolation strategies are used: `respx` mocks for the HTTP paths, and
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from urllib.parse import quote
 
@@ -2062,6 +2063,52 @@ def test_offline_demo_resolves_a_board_from_a_bare_company_name(demo_settings: S
     )
     assert obs.ok is True, obs.error
     assert obs.data["slug"] == "ramp" and obs.data["open_roles"] > 0
+
+
+def test_strip_inline_assets_keeps_everything_the_tools_read():
+    """The record-time trim for heavy pages must be lossless where it matters."""
+    html = (
+        "<html><head><title>T</title>"
+        '<script src="https://cdn.segment.com/analytics.js/v1/k/analytics.min.js"></script>'
+        "<script>window.__HUGE__=" + '"' + "x" * 50_000 + '";</script>'
+        "<style>" + "y" * 20_000 + "</style>"
+        "</head><body><main><p>Acme raised $150 million.</p></main></body></html>"
+    )
+    trimmed = lea_http.strip_inline_assets(html)
+
+    assert len(trimmed) < len(html) / 5
+    assert extract_text(trimmed) == extract_text(html)
+    # the src is the tech-detect fingerprint and has to survive
+    assert "cdn.segment.com" in trimmed
+    assert {t.name for t in detect_from_html(trimmed, {})} == {t.name for t in detect_from_html(html, {})}
+    assert "__HUGE__" not in trimmed
+    assert lea_http.strip_inline_assets("") == ""
+
+
+def test_every_url_the_search_fixtures_advertise_has_a_page_fixture():
+    """An offline run must never be told about a URL it then cannot open.
+
+    A search result pointing at a page with no fixture reads to the agent as a
+    dead source, and to a reviewer as a broken agent.
+    """
+    from urllib.parse import unquote
+
+    d = Path(Settings().fixture_dir)
+    if not d.is_dir():
+        pytest.skip("no fixtures committed to the repo")
+
+    recorded, advertised = set(), set()
+    for p in d.glob("*.json"):
+        payload = json.loads(p.read_text())
+        url = payload.get("url", "")
+        recorded.add(lea_http.canonical_url(url))
+        if "duckduckgo.com" in url:
+            advertised |= {
+                unquote(m) for m in re.findall(r"uddg=([^&\"']+)", payload.get("text", ""))
+            }
+
+    missing = sorted(u for u in advertised if lea_http.canonical_url(u) not in recorded)
+    assert not missing, f"search fixtures advertise URLs with no page fixture: {missing}"
 
 
 def test_committed_board_fixtures_carry_no_job_descriptions():

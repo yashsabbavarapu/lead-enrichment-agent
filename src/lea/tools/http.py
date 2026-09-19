@@ -391,6 +391,34 @@ def _same_url(a: str, b: str) -> bool:
 MAX_FIXTURE_TEXT_CHARS = 300_000
 
 
+def strip_inline_assets(html: str) -> str:
+    """Drop inline <script>/<style>/<svg>/<noscript> bodies, keep everything else.
+
+    An opt-in `record_transform` for recording heavyweight third-party pages: a
+    news article is typically 240KB of which 140KB is inlined framework JSON and
+    vector icons. What the tool layer actually reads survives untouched —
+    `extract_text` already discards these tags, and `<script src=...>` elements
+    are kept so tech detection still fingerprints the page.
+
+    Not used automatically: an ordinary page fixture must keep its inline
+    scripts, because half the tech-detect signatures match on them.
+    """
+    if not html:
+        return html
+    try:
+        from selectolax.parser import HTMLParser
+
+        tree = HTMLParser(html)
+        for tag in ("script", "style", "noscript", "svg"):
+            for node in tree.css(tag):
+                if tag == "script" and node.attributes.get("src"):
+                    continue  # the src is the fingerprint; the body is not
+                node.decompose()
+        return tree.html or html
+    except Exception:
+        return html
+
+
 def write_fixture(settings: Settings, url: str, body: Any, result: HttpResult) -> None:
     try:
         d = Path(settings.fixture_dir)

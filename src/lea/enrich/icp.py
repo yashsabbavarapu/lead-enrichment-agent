@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1013,6 +1013,20 @@ def _build_scoring_context(record: CompanyRecord, icp: ICPProfile, evidence: lis
         lines.append("DISQUALIFIERS (report only ones you can positively confirm):")
         for d in icp.disqualifiers:
             lines.append(f"- {d}")
+
+    # Give the model the date and the pre-computed signal ages. Asking it to do
+    # date arithmetic produced "June 2025 ... well within the 90-day recency
+    # window" on a run dated September 2026. Same principle as never letting it
+    # total the score: compute it here, hand it the answer.
+    from lea.enrich.extract import describe_age, signal_age_days
+
+    today = datetime.now(timezone.utc)
+    lines += ["", f"TODAY'S DATE: {today.date().isoformat()}"]
+    if record.signals:
+        lines.append("SIGNAL AGES (already computed - do not recalculate):")
+        for sig in record.signals:
+            age = signal_age_days(sig, today)
+            lines.append(f'- "{(sig.headline or "")[:70]}" -> {describe_age(age)}')
 
     lines += ["", "COMPANY RECORD:", record.model_dump_json(
         indent=2,

@@ -1248,8 +1248,16 @@ def test_rate_limit_is_not_reported_as_a_broken_setup(wired):
         # Re-pinned when growth_signals gained recency weighting (Agent D): the
         # fixtures' signals are undated or >1y old, so they now count for less.
         # Tiers are unchanged; only the weighted scores moved.
+        #
+        # Ramp re-pinned again, 64.4 -> 63.9 (Agent A), when the invented TechCrunch
+        # result in the Ramp search fixture was replaced by the real article (the
+        # made-up URL 404s live). The real headline reads "nearly doubles valuation
+        # ... secondary share sale" and never says "raised", so it classifies as a
+        # product signal rather than funding and growth_signals loses ~0.5 weighted
+        # points. The fixture is now honest; the gap is in the funding-language
+        # patterns, not here.
         ("Vanta", "A", 87.9, "Security & Compliance"),
-        ("Ramp", "B", 64.4, "Fintech"),
+        ("Ramp", "B", 63.9, "Fintech"),
     ],
 )
 def test_stub_pipeline_on_fixtures_does_not_regress(target, tier, score, industry):

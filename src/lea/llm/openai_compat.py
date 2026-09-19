@@ -67,6 +67,9 @@ __all__ = [
     "reset_capability_cache",
     "reset_provider_state",
     "classify_auth_failure",
+    "is_empty_completion",
+    "mark_model_unusable",
+    "is_model_usable",
 ]
 
 DECIDE_TOOL_NAME = "next_action"
@@ -82,6 +85,8 @@ MAX_RETRY_AFTER_S = 30.0
 #: them. A half-provisioned key deserves patience; a dead one must not turn a
 #: 12-step run into minutes of backoff.
 AUTH_BREAKER_THRESHOLD = 2
+#: Below this length a "key" is a test stub, not a secret worth shredding text over.
+MIN_REDACTABLE_KEY_LEN = 8
 
 
 class Capability:
@@ -143,6 +148,7 @@ def reset_provider_state() -> None:
     _AUTH_FAILURES.clear()
     _MODEL_RESOLUTION.clear()
     _AUTH_STYLE_CACHE.clear()
+    _UNUSABLE_MODELS.clear()
 
 
 def pinned_auth_style() -> Optional[str]:
@@ -532,6 +538,96 @@ class _QuotaExhausted(Exception):
     """A quota that cannot recover within this run."""
 
 
+class _EmptyCompletion(Exception):
+    """HTTP 200 carrying no usable answer — the worst kind of failure."""
+
+
+#: Where an answer might live on a chat message. `content` is the documented
+#: OpenAI-compat field and is always preferred. The rest are provider-dependent:
+#: reasoning models surface their chain-of-thought under varying names
+#: (`reasoning_content` on DeepSeek-style APIs, `reasoning` on others), and when
+#: the token budget is spent on reasoning the answer can end up there instead of
+#: in `content`. Reading them is a salvage path, never the primary one.
+_MESSAGE_TEXT_FIELDS = ("content", "reasoning_content", "reasoning", "text", "output_text")
+
+#: Models that returned 200-with-nothing this process. Never route back to them.
+_UNUSABLE_MODELS: set[tuple[str, str]] = set()
+
+#: A thinking model can spend the whole budget before writing a single answer
+#: token. Escalate once, generously, before declaring it unusable.
+EMPTY_RETRY_MAX_TOKENS = 16384
+
+
+def _content_to_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    # Some gateways return the multimodal content-part array.
+    if isinstance(value, list):
+        parts = []
+        for part in value:
+            if isinstance(part, dict) and part.get("type") in (None, "text"):
+                parts.append(str(part.get("text") or ""))
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    """The answer text, from whichever field this provider actually used."""
+    if not isinstance(message, dict):
+        return ""
+    for field in _MESSAGE_TEXT_FIELDS:
+        text = _content_to_text(message.get(field))
+        if text.strip():
+            return text
+    return ""
+
+
+def _finish_reason(data: dict[str, Any]) -> str:
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return str(choices[0].get("finish_reason") or choices[0].get("stop_reason") or "")
+    return ""
+
+
+def _has_tool_calls(data: dict[str, Any]) -> bool:
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return False
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return False
+    calls = message.get("tool_calls")
+    return bool(isinstance(calls, list) and calls)
+
+
+def is_empty_completion(data: dict[str, Any]) -> bool:
+    """A 200 that carries neither a tool call nor any answer text.
+
+    `gemini-3.6-flash` returns exactly this — every call "succeeds", every call
+    yields nothing, and a whole run reports `0 searches · 0 pages · 0 tokens`.
+    Treating it as success is what makes that failure silent.
+    """
+    if not isinstance(data, dict):
+        return True
+    if _has_tool_calls(data):
+        return False
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    return not _message_text(message if isinstance(message, dict) else {}).strip()
+
+
+def mark_model_unusable(base_url: str, model: str) -> None:
+    _UNUSABLE_MODELS.add((base_url.rstrip("/"), model))
+
+
+def is_model_usable(base_url: str, model: str) -> bool:
+    return (base_url.rstrip("/"), model) not in _UNUSABLE_MODELS
+
+
 def _retry_delay_from_body(body: str) -> Optional[float]:
     """Seconds the provider asked us to wait, read out of the response body."""
     for pattern in (_RETRY_INFO_RE, _RETRY_PROSE_RE):
@@ -677,9 +773,17 @@ class OpenAICompatClient:
         return nxt
 
     def _redact(self, text: str) -> str:
-        """Never let the credential reach a log line or the agent trace."""
-        if self.api_key and self.api_key in text:
-            text = text.replace(self.api_key, "<redacted>")
+        """Never let the credential reach a log line or the agent trace.
+
+        Guarded by a minimum length: a one-character stub of a key would
+        otherwise substring-match everywhere and shred the message
+        ("max_tokens" -> "max_to<redacted>ens"). This is NOT key-format
+        validation — nothing is rejected or required, and any real credential
+        is far longer than the floor.
+        """
+        key = self.api_key or ""
+        if len(key) >= MIN_REDACTABLE_KEY_LEN and key in text:
+            text = text.replace(key, "<redacted>")
         return _redact_query_key(text)
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -698,6 +802,8 @@ class OpenAICompatClient:
         # Probing an auth transport is negotiation, not a retry, so it does not
         # spend the retry budget — but it is bounded by the number of styles.
         transport_probes = 0
+        budget_escalated = False
+        model_switched = False
         attempt = 0
 
         while attempt < MAX_ATTEMPTS:
@@ -724,6 +830,42 @@ class OpenAICompatClient:
                         break
                     self._sleep(attempt, None)
                     continue
+                if is_empty_completion(data):
+                    # HTTP 200 with nothing in it. Never let this count as
+                    # success: the step silently produces no research at all.
+                    reason = _finish_reason(data)
+                    current = int(payload.get("max_tokens") or 0)
+
+                    # A thinking model can burn the whole budget on reasoning
+                    # and never reach an answer token. Give it room once.
+                    if not budget_escalated and (reason in ("length", "max_tokens") or current < EMPTY_RETRY_MAX_TOKENS):
+                        budget_escalated = True
+                        payload = {**payload, "max_tokens": EMPTY_RETRY_MAX_TOKENS}
+                        logger.debug(
+                            "%s/%s: 200 with empty content (finish_reason=%r); retrying with max_tokens=%d",
+                            self.name, self.model, reason, EMPTY_RETRY_MAX_TOKENS,
+                        )
+                        attempt -= 1  # a budget correction, not a retry
+                        continue
+
+                    # Still nothing with a generous budget: this model does not
+                    # work here. Move off it rather than failing every step.
+                    if not model_switched:
+                        model_switched = True
+                        replacement = self._switch_away_from_unusable()
+                        if replacement:
+                            payload = {**payload, "model": replacement}
+                            attempt -= 1
+                            continue
+
+                    mark_model_unusable(self.base_url, self.model)
+                    raise _EmptyCompletion(
+                        f"{self.name} model {self.model!r} returns HTTP 200 with no content "
+                        f"(finish_reason={reason or 'none'}) even at max_tokens={EMPTY_RETRY_MAX_TOKENS} — "
+                        f"it cannot drive the agent. Pick another with `lea doctor --models` "
+                        f"and set LEA_MODEL."
+                    )
+
                 _AUTH_FAILURES.pop(self.base_url, None)  # the credential works
                 if _AUTH_STYLE_CACHE.get(self.base_url) != self.auth_style:
                     _AUTH_STYLE_CACHE[self.base_url] = self.auth_style
@@ -819,11 +961,17 @@ class OpenAICompatClient:
             return None if cached == self.model else cached
 
         suggested = _replacement_from_error(body, exclude=self.model)
+        if suggested and not is_model_usable(self.base_url, suggested):
+            logger.debug("Ignoring suggested replacement %r: it already proved unusable", suggested)
+            suggested = None
         source = "named by the provider"
         if not suggested:
             available = list_models(self.settings, provider=self.name)
-            ranked = [m for m in rank_models(available, provider=self.name, configured=self._configured_model)
-                      if m != self.model]
+            ranked = [
+                m
+                for m in rank_models(available, provider=self.name, configured=self._configured_model)
+                if m != self.model and is_model_usable(self.base_url, m)
+            ]
             suggested = ranked[0] if ranked else None
             source = f"best of {len(available)} models offered by the endpoint"
 
@@ -839,6 +987,36 @@ class OpenAICompatClient:
         )
         self.model = suggested
         return suggested
+
+    def _switch_away_from_unusable(self) -> Optional[str]:
+        """Route off a model that returns 200-with-nothing. Bounded and sticky.
+
+        The resolver can substitute *into* a broken model — Google's 404 for a
+        retired id names `gemini-3.6-flash` as the successor — so a model that
+        proves empty is recorded and never chosen again this process.
+        """
+        mark_model_unusable(self.base_url, self.model)
+        _MODEL_RESOLUTION.pop((self.base_url, self._configured_model), None)
+
+        available = list_models(self.settings, provider=self.name)
+        ranked = [
+            m
+            for m in rank_models(available, provider=self.name, configured=self._configured_model)
+            if m != self.model and is_model_usable(self.base_url, m)
+        ]
+        if not ranked:
+            logger.debug("%s: no usable alternative to %r", self.name, self.model)
+            return None
+
+        best = ranked[0]
+        _MODEL_RESOLUTION[(self.base_url, self._configured_model)] = best
+        logger.warning(
+            "%s: model %r returned HTTP 200 with no content; switching to %r for the rest "
+            "of this run. Set LEA_MODEL to pin a different one.",
+            self.name, self.model, best,
+        )
+        self.model = best
+        return best
 
     def _auth_outcome(
         self, status: int, body: str, message: str, attempt: int
@@ -929,16 +1107,7 @@ class OpenAICompatClient:
 
     @classmethod
     def _text(cls, data: dict[str, Any]) -> str:
-        message = cls._message(data)
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        # Some gateways return the multimodal content-part array.
-        if isinstance(content, list):
-            return "\n".join(
-                part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
-            )
-        return ""
+        return _message_text(cls._message(data))
 
     def _payload(
         self,
@@ -1316,7 +1485,8 @@ def resolve_model(settings: Settings, provider: Optional[str] = None) -> Optiona
         return _MODEL_RESOLUTION[key]
 
     available = list_models(settings, provider=name)
-    ranked = rank_models(available, provider=name, configured=configured)
+    ranked = [m for m in rank_models(available, provider=name, configured=configured)
+              if is_model_usable(key[0], m)]
     if not ranked:
         return None
     _MODEL_RESOLUTION[key] = ranked[0]
