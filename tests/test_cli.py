@@ -6,6 +6,7 @@ scrubbed per test, because `doctor`'s whole job is reporting the environment.
 
 from __future__ import annotations
 
+import re
 import pytest
 from typer.testing import CliRunner
 
@@ -35,16 +36,26 @@ def clean_env(monkeypatch):
 
 
 def run(*args):
-    return runner.invoke(cli_mod.app, list(args))
+    # Pin the width: rich wraps help text to the terminal, and CI's default is
+    # narrower than a dev machine's, which splits phrases mid-assertion.
+    return runner.invoke(cli_mod.app, list(args), env={"COLUMNS": "200"})
 
 
 def _boom(*a, **k):
     raise AssertionError("no network lookup should happen here")
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def flat(text: str) -> str:
-    """Collapse rich's wrapping so assertions are about words, not line breaks."""
-    return " ".join(text.split())
+    """Collapse rich's wrapping and colour so assertions are about words.
+
+    Stripping ANSI matters as much as the whitespace: when rich wraps a line
+    it emits reset/set sequences at the break, which land inside the phrase
+    under test and defeat a plain substring check.
+    """
+    return " ".join(_ANSI.sub("", text).split())
 
 
 # --------------------------------------------------------------------------
