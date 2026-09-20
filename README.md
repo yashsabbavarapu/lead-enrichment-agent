@@ -1,6 +1,6 @@
 # lead-enrichment-agent
 
-[![CI](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml?query=branch%3Amain)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-884-brightgreen.svg)](tests/)
