@@ -8,7 +8,7 @@ rather than about model behavior.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import pytest
@@ -1519,6 +1519,18 @@ def test_reading_a_job_board_raises_confidence(settings):
 TODAY = datetime(2026, 9, 19, tzinfo=timezone.utc)
 
 
+def _days_ago(days: int) -> str:
+    """A date string ``days`` before the real today.
+
+    Code paths that take an explicit ``today`` (``signal_age_days``,
+    ``_freshest_signal_phrase``) can be pinned to :data:`TODAY` and stay
+    deterministic.  ``score_icp`` reads the real clock, so any fixture that
+    flows through it must be relative — a hardcoded date passes on the day
+    it is written and fails every day after.
+    """
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 @pytest.mark.parametrize(
     "date,expected_days",
     [
@@ -1555,9 +1567,9 @@ def test_fresh_signals_outscore_stale_ones(settings):
         input="Linear", company_name="Linear", domain="linear.app", industry="SaaS",
         sources=["https://linear.app/changelog"],
         signals=[
-            Signal(kind="product", headline="Linear ships Agents", date="2026-09-10",
+            Signal(kind="product", headline="Linear ships Agents", date=_days_ago(9),
                    source_url="https://linear.app/changelog"),
-            Signal(kind="product", headline="Customer Requests GA", date="2026-09-03",
+            Signal(kind="product", headline="Customer Requests GA", date=_days_ago(16),
                    source_url="https://linear.app/changelog"),
         ],
     )
@@ -1565,7 +1577,7 @@ def test_fresh_signals_outscore_stale_ones(settings):
         input="Oldco", company_name="Oldco", domain="oldco.com", industry="SaaS",
         sources=["https://oldco.com/news"],
         signals=[
-            Signal(kind="funding", headline="Oldco raises $40M Series B", date="2024-07-24",
+            Signal(kind="funding", headline="Oldco raises $40M Series B", date=_days_ago(787),
                    source_url="https://oldco.com/news"),
         ],
     )
@@ -1760,7 +1772,7 @@ def test_secondary_scores_below_an_equivalent_primary_round(settings):
         rec = CompanyRecord(
             input="Co", company_name="Co", domain="co.com", industry="SaaS",
             sources=["https://news.example"],
-            signals=[Signal(kind="funding", headline=headline, date="2026-09-10",
+            signals=[Signal(kind="funding", headline=headline, date=_days_ago(9),
                             source_url="https://news.example")],
         )
         from lea.enrich.extract import reclassify_signals
@@ -1780,7 +1792,7 @@ def test_a_secondary_hook_does_not_congratulate_them_on_a_raise(settings):
     rec = CompanyRecord(
         input="Ramp", company_name="Ramp", domain="ramp.com",
         sources=["https://techcrunch.com/ramp"],
-        signals=[Signal(kind="funding", date="2026-09-10",
+        signals=[Signal(kind="funding", date=_days_ago(9),
                         headline="Ramp nearly doubles valuation to $32B in secondary share sale",
                         source_url="https://techcrunch.com/ramp")],
     )

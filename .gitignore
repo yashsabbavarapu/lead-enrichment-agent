@@ -7,3 +7,6 @@ out/
 .pytest_cache/
 *.egg-info/
 icp.yaml
+
+# macOS
+.DS_Store
