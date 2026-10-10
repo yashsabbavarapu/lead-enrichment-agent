@@ -1,7 +1,7 @@
 # lead-enrichment-agent
 
 [![CI](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/yashsabbavarapu/lead-enrichment-agent/actions/workflows/ci.yml?query=branch%3Amain)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-884-brightgreen.svg)](tests/)
 
@@ -281,7 +281,7 @@ Every step is recorded, so a finished run replays with `lea replay`.
 
 ```
 src/lea/
-  models.py          Pydantic contracts. Imports nothing from lea.* — the leaf of the graph.
+  models.py          Pydantic contracts. Imports nothing from lea.*, the leaf of the graph.
   config.py          Settings; resolves providers from env. Keys upgrade, never gate.
   tools/             web_search, fetch_page, detect_tech. Return Observations, never raise.
   llm/               LLMClient protocol + anthropic and stub providers. decide() and extract().
