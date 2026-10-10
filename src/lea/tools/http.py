@@ -426,7 +426,7 @@ def strip_inline_assets(html: str) -> str:
     if not html:
         return html
     try:
-        from selectolax.parser import HTMLParser
+        from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
         tree = HTMLParser(html)
         for tag in ("script", "style", "noscript", "svg"):

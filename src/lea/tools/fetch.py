@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any, Optional
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from lea.config import Settings
 from lea.models import Observation, ToolName

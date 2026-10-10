@@ -9,7 +9,7 @@ import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from lea.config import Settings
 from lea.models import Observation, SearchResult, ToolName

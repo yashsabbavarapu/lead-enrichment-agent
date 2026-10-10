@@ -55,7 +55,7 @@ from lea.tools.tech_detect import (
     recall_ats_boards,
 )
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 DDG_HTML_URL = "https://html.duckduckgo.com/html/"
 DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"

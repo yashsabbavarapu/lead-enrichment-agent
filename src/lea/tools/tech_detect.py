@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 from urllib.parse import urlparse
 
-from selectolax.parser import HTMLParser
+from selectolax.lexbor import LexborHTMLParser as HTMLParser
 
 from lea.config import Settings
 from lea.models import Observation, TechStack, ToolName
